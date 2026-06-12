@@ -1,0 +1,11 @@
+.DS_Store
+
+# Local build output and packaged release artifacts.
+build/
+dist/
+*.pkg
+*.zip
+
+# Historical local note for the packaged 2.0 build. The GitHub share project
+# intentionally tracks the latest root SubFix.lua instead.
+SubFix-2.0-更新说明.md
