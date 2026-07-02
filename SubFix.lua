@@ -1038,12 +1038,6 @@ BACKUP_SELECTOR_PLACEHOLDER_TEXT = "选择历史备份..."
 PREVIEW_SOURCE_TIMELINE = "timeline"
 PREVIEW_SOURCE_HISTORY = "history"
 current_preview_source = PREVIEW_SOURCE_TIMELINE
-preview_editor_state = {
-    row_id = nil,
-    original_text = "",
-    dirty = false,
-    suppress_text_changed = false
-}
 current_history_entry_filename = ""
 local MINI_SUBTITLE_PLACEHOLDER_INDEX = 0
 local MINI_SUBTITLE_TREE_INDEX = 1
@@ -4105,123 +4099,22 @@ local function sync_current_preview_tree(target_window, dirty_row_ids)
     return apply_tree_node_text_updates(window, tree, update_entries)
 end
 
-function set_preview_editor_dirty(target_window, dirty)
+function save_preview_edit_dialog_changes(target_window, row_id, new_text)
     local window = resolve_window(target_window)
-    preview_editor_state.dirty = dirty == true
-
-    local save_btn = find_window_item(window, "PreviewEditSaveBtn", "MiniPreviewEditSaveBtn")
-    local reset_btn = find_window_item(window, "PreviewEditResetBtn", "MiniPreviewEditResetBtn")
-    local has_row = trim_text(preview_editor_state.row_id) ~= ""
-
-    if save_btn then
-        pcall(function() save_btn.Enabled = has_row and preview_editor_state.dirty end)
-    end
-    if reset_btn then
-        pcall(function() reset_btn.Enabled = has_row end)
-    end
-end
-
-function set_preview_editor_title(target_window, row)
-    local window = resolve_window(target_window)
-    local label = find_window_item(window, "PreviewEditTitle", "MiniPreviewEditTitle")
-    if not label then return end
-
-    if type(row) ~= "table" then
-        pcall(function() label.Text = "未选择字幕" end)
-        return
-    end
-
-    local tc_start, tc_end = get_row_timecodes(row)
-    local title = string.format("编辑 #%s", tostring(row.index or "?"))
-    if tc_start and tc_end then
-        title = string.format("%s  %s → %s", title, tostring(tc_start), tostring(tc_end))
-    end
-    pcall(function() label.Text = title end)
-end
-
-function clear_preview_editor(target_window)
-    local window = resolve_window(target_window)
-    local editor = find_window_item(window, "PreviewEditText", "MiniPreviewEditText")
-
-    preview_editor_state.row_id = nil
-    preview_editor_state.original_text = ""
-    preview_editor_state.dirty = false
-    preview_editor_state.suppress_text_changed = true
-    if editor then
-        pcall(function() editor.Text = "" end)
-    end
-    preview_editor_state.suppress_text_changed = false
-    set_preview_editor_title(window, nil)
-    set_preview_editor_dirty(window, false)
-end
-
-function load_preview_editor_row(target_window, row)
-    local window = resolve_window(target_window)
-    local editor = find_window_item(window, "PreviewEditText", "MiniPreviewEditText")
-    if type(row) ~= "table" then
-        clear_preview_editor(window)
-        return false
-    end
-
-    local row_id = trim_text(row.id)
-    preview_editor_state.row_id = row_id
-    preview_editor_state.original_text = tostring(row.text or "")
-    preview_editor_state.dirty = false
-
-    preview_editor_state.suppress_text_changed = true
-    if editor then
-        pcall(function() editor.Text = preview_editor_state.original_text end)
-    end
-    preview_editor_state.suppress_text_changed = false
-
-    current_selected_row_id = row_id
-    set_preview_editor_title(window, row)
-    set_preview_editor_dirty(window, false)
-    return true
-end
-
-function sync_preview_editor_to_window(target_window)
-    local window = resolve_window(target_window)
-    local row = find_row_by_id(preview_editor_state.row_id or current_selected_row_id)
-    if row then
-        load_preview_editor_row(window, row)
-    else
-        clear_preview_editor(window)
-    end
-end
-
-function save_preview_editor_changes(target_window, options)
-    local window = resolve_window(target_window)
-    options = options or {}
-
-    local row_id = trim_text(preview_editor_state.row_id)
-    if row_id == "" then
-        return false
-    end
-    if preview_editor_state.dirty ~= true and options.force ~= true then
-        return false
-    end
-
     local row = find_row_by_id(row_id)
     if not row then
-        clear_preview_editor(window)
-        if options.silent ~= true then
-            update_shared_status(window, "预览编辑失败：字幕行已不存在")
-        end
+        update_shared_status(window, "预览编辑失败：字幕行已不存在")
         return false
     end
 
-    local editor = find_window_item(window, "PreviewEditText", "MiniPreviewEditText")
-    local new_text = editor and tostring(editor.Text or "") or ""
+    local next_text = tostring(new_text or "")
     local old_text = tostring(row.text or "")
-    if new_text == old_text then
-        preview_editor_state.original_text = new_text
-        set_preview_editor_dirty(window, false)
+    if next_text == old_text then
         return false
     end
 
     local mutation_snapshot = prepare_mutation_snapshot("预览编辑 #" .. tostring(row.index or "?"))
-    row.text = new_text
+    row.text = next_text
     update_row_preview_display(row)
     if mutation_snapshot then
         commit_mutation_snapshot(mutation_snapshot)
@@ -4229,7 +4122,7 @@ function save_preview_editor_changes(target_window, options)
 
     local dirty_row_ids = {}
     mark_dirty_row(dirty_row_ids, row)
-    invalidate_search_cache("preview_editor_save")
+    invalidate_search_cache("preview_edit_dialog_save")
     if trim_text(current_search_query) ~= "" and SEARCH_VIEW and SEARCH_VIEW.render_current_view then
         SEARCH_VIEW.render_current_view(window, {force_rebuild = true})
     else
@@ -4243,12 +4136,8 @@ function save_preview_editor_changes(target_window, options)
         end
     end
 
-    preview_editor_state.original_text = new_text
-    set_preview_editor_dirty(window, false)
-    set_preview_editor_title(window, row)
-    if options.silent ~= true then
-        update_shared_status(window, "已保存预览编辑 #" .. tostring(row.index or "?") .. "，未写回时间线")
-    end
+    current_selected_row_id = trim_text(row.id)
+    update_shared_status(window, "已保存预览编辑 #" .. tostring(row.index or "?") .. "，未写回时间线")
     return true
 end
 
@@ -4258,8 +4147,6 @@ function handle_preview_tree_item_clicked(target_window, ev)
     local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
     local clicked_row = item and subtitle_data_map and subtitle_data_map[item] or nil
     local clicked_row_id = clicked_row and trim_text(clicked_row.id) or ""
-
-    save_preview_editor_changes(window, {silent = true})
 
     local row = clicked_row_id ~= "" and find_row_by_id(clicked_row_id) or nil
     local live_item = row and row.id and subtitle_row_id_node_map[row.id] or nil
@@ -4273,19 +4160,62 @@ function handle_preview_tree_item_clicked(target_window, ev)
         row = select(1, get_row_from_tree_selection(window))
     end
 
-    load_preview_editor_row(window, row)
+    if row and row.id then
+        current_selected_row_id = row.id
+    end
     return row
 end
 
-function reset_preview_editor_changes(target_window)
+function open_preview_edit_dialog(target_window, ev)
     local window = resolve_window(target_window)
-    local row = find_row_by_id(preview_editor_state.row_id)
+    local row = handle_preview_tree_item_clicked(window, ev)
     if not row then
-        clear_preview_editor(window)
+        update_shared_status(window, "请先选中一条字幕")
         return false
     end
-    load_preview_editor_row(window, row)
-    update_shared_status(window, "已重置预览编辑 #" .. tostring(row.index or "?"))
+
+    local row_id = trim_text(row.id)
+    local tc_start, tc_end = get_row_timecodes(row)
+    local title = string.format("修改字幕 #%s", tostring(row.index or "?"))
+    local time_label = ""
+    if tc_start and tc_end then
+        time_label = string.format("%s → %s", tostring(tc_start), tostring(tc_end))
+    end
+
+    local edit_win = dispatcher:AddWindow({
+        ID = "PreviewEditDialog",
+        WindowTitle = title,
+        Geometry = {460, 220, 520, 260}
+    },
+    ui:VGroup{
+        ContentsMargins = 10,
+        Spacing = 8,
+        ui:Label{ID = "PreviewEditDialogTimeLabel", Text = time_label, Weight = 0, Alignment = {AlignLeft = true, AlignVCenter = true}},
+        ui:TextEdit{ID = "PreviewEditDialogText", Text = tostring(row.text or ""), Weight = 1, MinimumSize = {0, 130}},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:HGap(0, 1),
+            ui:Button{ID = "PreviewEditDialogCancelBtn", Text = "取消", Weight = 0, MinimumSize = {80, 28}},
+            ui:Button{ID = "PreviewEditDialogSaveBtn", Text = "保存", Weight = 0, MinimumSize = {80, 28}}
+        }
+    })
+
+    function edit_win.On.PreviewEditDialog.Close(close_ev)
+        edit_win:Hide()
+    end
+
+    function edit_win.On.PreviewEditDialogCancelBtn.Clicked(click_ev)
+        edit_win:Hide()
+    end
+
+    function edit_win.On.PreviewEditDialogSaveBtn.Clicked(click_ev)
+        local editor = edit_win:Find("PreviewEditDialogText")
+        save_preview_edit_dialog_changes(window, row_id, editor and editor.Text or "")
+        edit_win:Hide()
+    end
+
+    edit_win:Show()
     return true
 end
 
@@ -5765,7 +5695,6 @@ local function clear_tree_for_window(target_window)
         subtitle_data_map = {}
         subtitle_row_id_node_map = {}
     end
-    clear_preview_editor(window)
     if window and SEARCH_VIEW then
         if SEARCH_VIEW.invalidate_rendered_signature then
             SEARCH_VIEW.invalidate_rendered_signature(window)
@@ -5790,7 +5719,6 @@ local function apply_shared_state_to_window(target_window)
 
     if current_rows and #current_rows > 0 then
         SEARCH_VIEW.render_current_view(window)
-        sync_preview_editor_to_window(window)
     else
         clear_tree_for_window(window)
     end
@@ -5810,7 +5738,6 @@ function apply_lightweight_shared_state_to_window(target_window)
         sync_target_track_control()
     end
     sync_work_scope_ui(window)
-    sync_preview_editor_to_window(window)
 
     set_subtitle_loaded_state(is_subtitle_loaded, nil, window)
     update_shared_status(window, shared_status_text)
@@ -12141,9 +12068,6 @@ rebuild_tree_from_rows = function(rows, target_window, options)
     if current_selected_row_id and not find_row_by_id(current_selected_row_id) then
         current_selected_row_id = nil
     end
-    if preview_editor_state and trim_text(preview_editor_state.row_id) ~= "" and not find_row_by_id(preview_editor_state.row_id) then
-        clear_preview_editor(target_window or resolve_window())
-    end
 
     invalidate_search_cache("rebuild_tree")
     SEARCH_VIEW.render_current_view(target_window or resolve_window())
@@ -16599,36 +16523,8 @@ local mini_content = ui:VGroup({
                 ID = "MiniSubtitleTree",
                 Weight = 1,
                 Header = {Text = "字幕预览  ·  双击可跳转"},
-                Events = { ItemClicked = true, ItemDoubleClicked = true }
+                Events = { ItemClicked = true, ItemDoubleClicked = true, ItemRightClicked = true }
             })
-        })
-    }),
-
-    ui:VGroup({
-        ID = "MiniPreviewEditPanel",
-        Weight = 0,
-        Spacing = 4,
-        MinimumSize = {0, 104},
-        ui:Label({
-            ID = "MiniPreviewEditTitle",
-            Text = "未选择字幕",
-            Weight = 0,
-            MinimumSize = {0, 18},
-            Alignment = {AlignLeft = true, AlignVCenter = true}
-        }),
-        ui:TextEdit({
-            ID = "MiniPreviewEditText",
-            Text = "",
-            Weight = 0,
-            MinimumSize = {0, 56},
-            MaximumSize = {16777215, 64}
-        }),
-        ui:HGroup({
-            Weight = 0,
-            Spacing = 6,
-            ui:HGap(0, 1),
-            ui:Button({ID = "MiniPreviewEditResetBtn", Text = "重置", Weight = 0, MinimumSize = {64, 26}, Enabled = false}),
-            ui:Button({ID = "MiniPreviewEditSaveBtn", Text = "保存", Weight = 0, MinimumSize = {64, 26}, Enabled = false})
         })
     })
 })
@@ -16785,35 +16681,7 @@ local main_content = ui:VGroup({
             ID = "SubtitleTree",
             Weight = 1,
             Header = {Text = "字幕预览  ·  双击可跳转"},
-            Events = { ItemClicked = true, ItemDoubleClicked = true }
-        })
-    }),
-
-    ui:VGroup({
-        ID = "PreviewEditPanel",
-        Weight = 0,
-        Spacing = 5,
-        MinimumSize = {0, 132},
-        ui:Label({
-            ID = "PreviewEditTitle",
-            Text = "未选择字幕",
-            Weight = 0,
-            MinimumSize = {0, 20},
-            Alignment = {AlignLeft = true, AlignVCenter = true}
-        }),
-        ui:TextEdit({
-            ID = "PreviewEditText",
-            Text = "",
-            Weight = 0,
-            MinimumSize = {0, 76},
-            MaximumSize = {16777215, 88}
-        }),
-        ui:HGroup({
-            Weight = 0,
-            Spacing = 8,
-            ui:HGap(0, 1),
-            ui:Button({ID = "PreviewEditResetBtn", Text = "重置", Weight = 0, MinimumSize = {76, 28}, Enabled = false}),
-            ui:Button({ID = "PreviewEditSaveBtn", Text = "保存", Weight = 0, MinimumSize = {76, 28}, Enabled = false})
+            Events = { ItemClicked = true, ItemDoubleClicked = true, ItemRightClicked = true }
         })
     }),
     
@@ -17333,27 +17201,15 @@ function mini_win.On.MiniSearchBox.TextChanged(ev)
 end
 
 function mini_win.On.MiniOpenFullBtn.Clicked(ev)
-    save_preview_editor_changes(mini_win, {silent = true})
     open_full_window()
-end
-
-function mini_win.On.MiniPreviewEditText.TextChanged(ev)
-    if preview_editor_state.suppress_text_changed then return end
-    if trim_text(preview_editor_state.row_id) ~= "" then
-        set_preview_editor_dirty(mini_win, true)
-    end
-end
-
-function mini_win.On.MiniPreviewEditSaveBtn.Clicked(ev)
-    save_preview_editor_changes(mini_win, {force = true})
-end
-
-function mini_win.On.MiniPreviewEditResetBtn.Clicked(ev)
-    reset_preview_editor_changes(mini_win)
 end
 
 function mini_win.On.MiniSubtitleTree.ItemClicked(ev)
     handle_preview_tree_item_clicked(mini_win, ev)
+end
+
+function mini_win.On.MiniSubtitleTree.ItemRightClicked(ev)
+    open_preview_edit_dialog(mini_win, ev)
 end
 
 function mini_win.On.MiniSubtitleTree.ItemDoubleClicked(ev)
@@ -20628,23 +20484,12 @@ function win.On.UpdateBtn.Clicked(ev)
     update_timeline()
 end
 
-function win.On.PreviewEditText.TextChanged(ev)
-    if preview_editor_state.suppress_text_changed then return end
-    if trim_text(preview_editor_state.row_id) ~= "" then
-        set_preview_editor_dirty(win, true)
-    end
-end
-
-function win.On.PreviewEditSaveBtn.Clicked(ev)
-    save_preview_editor_changes(win, {force = true})
-end
-
-function win.On.PreviewEditResetBtn.Clicked(ev)
-    reset_preview_editor_changes(win)
-end
-
 function win.On.SubtitleTree.ItemClicked(ev)
     handle_preview_tree_item_clicked(win, ev)
+end
+
+function win.On.SubtitleTree.ItemRightClicked(ev)
+    open_preview_edit_dialog(win, ev)
 end
 
 -- 双击字幕条目跳转
