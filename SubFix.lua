@@ -16492,6 +16492,13 @@ local mini_content = ui:VGroup({
                     MinimumSize = {0, 32},
                     MaximumSize = {16777215, 32}
                 })
+            }),
+            ui:Button({
+                ID = "MiniPreviewEditBtn",
+                Text = "修改选中",
+                Weight = 0,
+                MinimumSize = {84, 32},
+                MaximumSize = {96, 32}
             })
         }),
 
@@ -16523,7 +16530,7 @@ local mini_content = ui:VGroup({
                 ID = "MiniSubtitleTree",
                 Weight = 1,
                 Header = {Text = "字幕预览  ·  双击可跳转"},
-                Events = { ItemClicked = true, ItemDoubleClicked = true, ItemRightClicked = true }
+                Events = { ItemDoubleClicked = true }
             })
         })
     })
@@ -16597,6 +16604,13 @@ local main_content = ui:VGroup({
                     MinimumSize = {0, 30},
                     MaximumSize = {16777215, 30}
                 })
+            }),
+            ui:Button({
+                ID = "PreviewEditBtn",
+                Text = "修改选中",
+                Weight = 0,
+                MinimumSize = {84, 30},
+                MaximumSize = {96, 30}
             })
         }),
         ui:VGap(0)
@@ -16681,7 +16695,7 @@ local main_content = ui:VGroup({
             ID = "SubtitleTree",
             Weight = 1,
             Header = {Text = "字幕预览  ·  双击可跳转"},
-            Events = { ItemClicked = true, ItemDoubleClicked = true, ItemRightClicked = true }
+            Events = { ItemDoubleClicked = true }
         })
     }),
     
@@ -17204,17 +17218,17 @@ function mini_win.On.MiniOpenFullBtn.Clicked(ev)
     open_full_window()
 end
 
-function mini_win.On.MiniSubtitleTree.ItemClicked(ev)
-    handle_preview_tree_item_clicked(mini_win, ev)
-end
-
-function mini_win.On.MiniSubtitleTree.ItemRightClicked(ev)
+function mini_win.On.MiniPreviewEditBtn.Clicked(ev)
     open_preview_edit_dialog(mini_win, ev)
 end
 
 function mini_win.On.MiniSubtitleTree.ItemDoubleClicked(ev)
     print("[Hooper AI 2.0] 极简版字幕列表双击")
-    handle_preview_tree_item_clicked(mini_win, ev)
+    local tree = mini_win:Find("MiniSubtitleTree")
+    local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
+    if tree and item then
+        set_tree_current_item(tree, item)
+    end
     go_to_subtitle(mini_win)
 end
 
@@ -20484,18 +20498,18 @@ function win.On.UpdateBtn.Clicked(ev)
     update_timeline()
 end
 
-function win.On.SubtitleTree.ItemClicked(ev)
-    handle_preview_tree_item_clicked(win, ev)
-end
-
-function win.On.SubtitleTree.ItemRightClicked(ev)
+function win.On.PreviewEditBtn.Clicked(ev)
     open_preview_edit_dialog(win, ev)
 end
 
 -- 双击字幕条目跳转
 function win.On.SubtitleTree.ItemDoubleClicked(ev)
     print("[Hooper AI 2.0] 字幕列表双击")
-    handle_preview_tree_item_clicked(win, ev)
+    local tree = win:Find("SubtitleTree")
+    local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
+    if tree and item then
+        set_tree_current_item(tree, item)
+    end
     go_to_subtitle(win)
 end
 
