@@ -21,6 +21,13 @@ Changes after the 2026-05-15 working copy:
   and the ASR helper files.
 - Allow pre-delivery timeline-audio speech checks to override export padding
   through `options.padding_seconds`.
+- Improve child-plugin In/Out frame normalization for one-hour timeline starts
+  and log raw-to-normalized selection diagnostics.
+- Improve generated-subtitle audio source selection by using
+  `GetSourceStartFrame()`, surfacing linked-channel metadata, deprioritizing
+  muted mappings, and writing a selected-audio-source diagnostic JSON file.
+- Keep generated-subtitle writeback on the stable SRT append path without
+  pre-moving the playhead to the timeline start.
 
 ## Latest working copy - 2026-05-15
 
