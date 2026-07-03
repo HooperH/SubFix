@@ -28,6 +28,9 @@ DEFAULT_MODEL = "small"
 DEFAULT_CTC_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
 HELPER_VERSION = "ctc-align-2026-06-16-v2"
 TRANSCRIBE_BACKENDS = ("mimo_asr", "qwen3_asr", "mlx_whisper", "openai_whisper")
+GENERATED_SUBTITLE_MAX_CHARS = 24
+GENERATED_SUBTITLE_PREFERRED_MIN_CHARS = 12
+GENERATED_SUBTITLE_PREFERRED_MAX_CHARS = 18
 EXTERNAL_TRANSCRIBE_COMMAND_ENV = {
     "mimo_asr": "SUBFIX_MIMO_ASR_CMD",
 }
@@ -88,6 +91,185 @@ def normalize_segments(raw_payload: dict[str, Any]) -> list[dict[str, Any]]:
                 normalized["words"] = words
             segments.append(normalized)
     return segments
+
+
+def generated_subtitle_text_length(text: str) -> int:
+    return len(re.sub(r"\s+", "", str(text or "")))
+
+
+def normalize_generated_subtitle_text(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "").strip())
+    return value
+
+
+def split_generated_subtitle_clause(text: str, max_chars: int = GENERATED_SUBTITLE_MAX_CHARS) -> list[str]:
+    value = normalize_generated_subtitle_text(text)
+    if not value:
+        return []
+
+    chunks: list[str] = []
+    soft_breaks = "，、,：:"
+    preferred_min = GENERATED_SUBTITLE_PREFERRED_MIN_CHARS
+    preferred_max = min(GENERATED_SUBTITLE_PREFERRED_MAX_CHARS, max_chars)
+
+    while generated_subtitle_text_length(value) > max_chars:
+        break_at = 0
+        upper = min(preferred_max, len(value))
+        for index in range(upper, preferred_min - 1, -1):
+            if value[index - 1] in soft_breaks:
+                break_at = index
+                break
+        if break_at == 0:
+            for index in range(min(max_chars, len(value)), preferred_min - 1, -1):
+                if value[index - 1] in soft_breaks:
+                    break_at = index
+                    break
+        if break_at == 0:
+            break_at = min(max_chars, len(value))
+        chunk = value[:break_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        value = value[break_at:].strip()
+
+    if value:
+        chunks.append(value)
+    return chunks
+
+
+def split_generated_subtitle_text(text: str, max_chars: int = GENERATED_SUBTITLE_MAX_CHARS) -> list[str]:
+    value = normalize_generated_subtitle_text(text)
+    if not value:
+        return []
+
+    hard_breaks = "。！？!?；;"
+    clauses: list[str] = []
+    buffer: list[str] = []
+    for char in value:
+        buffer.append(char)
+        if char in hard_breaks:
+            clause = "".join(buffer).strip()
+            if clause:
+                clauses.append(clause)
+            buffer = []
+    tail = "".join(buffer).strip()
+    if tail:
+        clauses.append(tail)
+
+    chunks: list[str] = []
+    for clause in clauses:
+        chunks.extend(split_generated_subtitle_clause(clause, max_chars=max_chars))
+    return chunks
+
+
+def seconds_to_timeline_frame(seconds: float, fps: float, timeline_start_frame: int) -> int:
+    return int(timeline_start_frame + math.floor((float(seconds) * float(fps)) + 0.5))
+
+
+def distribute_generated_subtitle_frames(
+    segment_start_frame: int,
+    segment_end_frame: int,
+    chunks: list[str],
+) -> list[tuple[int, int]]:
+    if not chunks:
+        return []
+
+    start_frame = int(segment_start_frame)
+    end_frame = max(start_frame + len(chunks), int(segment_end_frame))
+    total_frames = max(len(chunks), end_frame - start_frame)
+    weights = [max(1, generated_subtitle_text_length(chunk)) for chunk in chunks]
+    total_weight = max(1, sum(weights))
+    frames: list[tuple[int, int]] = []
+    cursor = start_frame
+    elapsed_weight = 0
+
+    for index, weight in enumerate(weights):
+        remaining_chunks = len(chunks) - index - 1
+        elapsed_weight += weight
+        if index == len(chunks) - 1:
+            chunk_end = end_frame
+        else:
+            proportional = start_frame + int(math.floor((total_frames * elapsed_weight / total_weight) + 0.5))
+            chunk_end = max(cursor + 1, proportional)
+            chunk_end = min(chunk_end, end_frame - remaining_chunks)
+        frames.append((cursor, max(cursor + 1, chunk_end)))
+        cursor = frames[-1][1]
+
+    return frames
+
+
+def generate_subtitle_rows_from_segments(
+    segments: list[dict[str, Any]],
+    fps: float,
+    timeline_start_frame: int = 0,
+    max_chars: int = GENERATED_SUBTITLE_MAX_CHARS,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    rate = float(fps or 30.0)
+    for source_segment_index, segment in enumerate(segments or [], start=1):
+        text = str(segment.get("text") or "").strip()
+        start_seconds = float(segment.get("start") or 0.0)
+        end_seconds = float(segment.get("end") or start_seconds)
+        if not text or end_seconds <= start_seconds:
+            continue
+        chunks = split_generated_subtitle_text(text, max_chars=max_chars)
+        if not chunks:
+            continue
+        segment_start_frame = seconds_to_timeline_frame(start_seconds, rate, int(timeline_start_frame))
+        segment_end_frame = seconds_to_timeline_frame(end_seconds, rate, int(timeline_start_frame))
+        frame_ranges = distribute_generated_subtitle_frames(segment_start_frame, segment_end_frame, chunks)
+        for chunk, (start_frame, end_frame) in zip(chunks, frame_ranges, strict=True):
+            rows.append(
+                {
+                    "index": len(rows) + 1,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "text": chunk,
+                    "source_segment_index": source_segment_index,
+                }
+            )
+    return rows
+
+
+def milliseconds_to_srt_time(milliseconds: int) -> str:
+    value = max(0, int(milliseconds))
+    hours = value // 3_600_000
+    value %= 3_600_000
+    minutes = value // 60_000
+    value %= 60_000
+    seconds = value // 1000
+    millis = value % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def write_subtitle_rows_to_srt(path: Path, rows: list[dict[str, Any]], fps: float, base_frame: int = 0) -> int:
+    rate = float(fps or 30.0)
+    sorted_rows = sorted(rows or [], key=lambda row: int(row.get("start_frame") or 0))
+    lines: list[str] = []
+    written = 0
+    for row in sorted_rows:
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        start_frame = int(row.get("start_frame") or 0)
+        end_frame = int(row.get("end_frame") or start_frame + 1)
+        if end_frame <= start_frame:
+            end_frame = start_frame + 1
+        start_ms = int(math.floor(((start_frame - base_frame) / rate) * 1000 + 0.5))
+        end_ms = int(math.floor(((end_frame - base_frame) / rate) * 1000 + 0.5))
+        if end_ms <= start_ms:
+            end_ms = start_ms + 1
+        written += 1
+        lines.extend(
+            [
+                str(written),
+                f"{milliseconds_to_srt_time(start_ms)} --> {milliseconds_to_srt_time(end_ms)}",
+                text,
+                "",
+            ]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return written
 
 
 def audio_duration_seconds(audio_path: Path) -> float:
@@ -1423,10 +1605,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--windows-json")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--timeline-start-frame", type=int, default=0)
+    parser.add_argument("--srt-output")
+    parser.add_argument("--srt-base-frame", type=int)
     parser.add_argument("--backend", choices=("auto", "mimo_asr", "qwen3_asr", "mlx_whisper", "openai_whisper"), default="auto")
     parser.add_argument(
         "--mode",
-        choices=("align", "align_text", "whisperx_align_text", "ctc_align_text", "ctc_align_text_batches", "transcribe", "onsets"),
+        choices=(
+            "align",
+            "align_text",
+            "whisperx_align_text",
+            "ctc_align_text",
+            "ctc_align_text_batches",
+            "transcribe",
+            "generate_subtitles",
+            "onsets",
+        ),
         default="align",
     )
     parser.add_argument("--fixture-json")
@@ -1505,6 +1698,16 @@ def main(argv: list[str] | None = None) -> int:
                 diagnostic["aligned_count"] = len(raw_payload["aligned_rows"])
             speech_regions = raw_payload.get("speech_regions") or []
             speech_onsets = raw_payload.get("speech_onsets") or [region.get("start") for region in speech_regions if isinstance(region, dict)]
+            if args.mode == "generate_subtitles":
+                segments = normalize_segments(raw_payload)
+                raw_payload = dict(raw_payload)
+                raw_payload["segments"] = segments
+                raw_payload["subtitle_rows"] = generate_subtitle_rows_from_segments(
+                    segments,
+                    args.fps,
+                    args.timeline_start_frame,
+                )
+                diagnostic["generated_subtitle_count"] = len(raw_payload["subtitle_rows"])
             diagnostic["backend"] = "fixture"
         else:
             if not args.audio or not Path(args.audio).exists():
@@ -1647,12 +1850,32 @@ def main(argv: list[str] | None = None) -> int:
                     diagnostic["model"] = raw_payload.get("model") or args.model
                     if raw_payload.get("fallback_errors"):
                         diagnostic["fallback_errors"] = raw_payload.get("fallback_errors")
+                    if args.mode == "generate_subtitles":
+                        segments = normalize_segments(raw_payload)
+                        raw_payload = dict(raw_payload)
+                        raw_payload["segments"] = segments
+                        raw_payload["subtitle_rows"] = generate_subtitle_rows_from_segments(
+                            segments,
+                            args.fps,
+                            args.timeline_start_frame,
+                        )
+                        diagnostic["generated_subtitle_count"] = len(raw_payload["subtitle_rows"])
                 audio_used = str(cut_path)
 
         segments = normalize_segments(raw_payload)
         diagnostic["raw_segment_count"] = len(raw_payload.get("segments") or [])
         diagnostic["segment_count"] = len(segments)
         diagnostic["text_length"] = len(str(raw_payload.get("text") or "").strip())
+        if args.srt_output and args.mode == "generate_subtitles":
+            srt_path = Path(args.srt_output)
+            srt_base_frame = args.srt_base_frame if args.srt_base_frame is not None else args.timeline_start_frame
+            diagnostic["srt_output"] = str(srt_path)
+            diagnostic["srt_row_count"] = write_subtitle_rows_to_srt(
+                srt_path,
+                raw_payload.get("subtitle_rows") or [],
+                args.fps,
+                srt_base_frame,
+            )
         write_progress(progress_path, "write_output", "正在写入对齐结果")
         write_payload(
             output_path,
@@ -1663,6 +1886,7 @@ def main(argv: list[str] | None = None) -> int:
                 "audio": audio_used,
                 "segments": segments,
                 "aligned_rows": raw_payload.get("aligned_rows") or [],
+                "subtitle_rows": raw_payload.get("subtitle_rows") or [],
                 "speech_onsets": speech_onsets,
                 "speech_regions": speech_regions,
                 "text": str(raw_payload.get("text") or "").strip(),

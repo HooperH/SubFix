@@ -8297,7 +8297,12 @@ function SUBFIX_AUDIO_ALIGN.render_timeline_audio_mix_for_speech_check(timeline,
     end
 
     local rate = math.max(1, tonumber(fps) or tonumber(current_fps) or 24)
-    local padding_seconds = math.max(1, tonumber(PRE_DELIVERY_SPEECH_TIMELINE_EXPORT_PADDING_SECONDS) or 1.0)
+    local padding_seconds
+    if options.padding_seconds ~= nil then
+        padding_seconds = math.max(0, tonumber(options.padding_seconds) or 0)
+    else
+        padding_seconds = math.max(1, tonumber(PRE_DELIVERY_SPEECH_TIMELINE_EXPORT_PADDING_SECONDS) or 1.0)
+    end
     local padding_frames = math.floor(padding_seconds * rate + 0.5)
     local render_start = math.max(0, math.floor(range_start - padding_frames))
     local render_end = math.floor(range_end + padding_frames)
