@@ -39,6 +39,8 @@ print(string.format("[Hooper AI 2.0] [STARTUP] Lua 主 chunk 起步: +%d ms", st
 -- ========== 全局状态 ==========
 local subtitle_data_map = {}      -- {node_ptr = {target_abs_frame, fps, row_index, text}}
 local subtitle_row_id_node_map = {} -- {row_id = node_ptr}
+subtitle_data_maps_by_window = {}
+subtitle_row_id_node_maps_by_window = {}
 local current_rows = {}           -- { {index, target_abs_frame, fps, start_frame, end_frame, text, display_text} ... }
 WORK_SCOPE_MODE_FULL = "full"
 WORK_SCOPE_MODE_SELECTION = "selection"
@@ -181,6 +183,39 @@ local function find_window_item(target_window, full_id, mini_id)
     local ok, item = pcall(function() return window:Find(id) end)
     if ok and item then return item end
     return nil
+end
+
+function get_subtitle_data_map_for_window(target_window)
+    local window = resolve_window(target_window)
+    if window and subtitle_data_maps_by_window and subtitle_data_maps_by_window[window] then
+        return subtitle_data_maps_by_window[window]
+    end
+    return subtitle_data_map or {}
+end
+
+function get_subtitle_row_id_node_map_for_window(target_window)
+    local window = resolve_window(target_window)
+    if window and subtitle_row_id_node_maps_by_window and subtitle_row_id_node_maps_by_window[window] then
+        return subtitle_row_id_node_maps_by_window[window]
+    end
+    return subtitle_row_id_node_map or {}
+end
+
+function activate_preview_tree_maps_for_window(target_window)
+    local window = resolve_window(target_window)
+    if not window then return end
+    subtitle_data_map = get_subtitle_data_map_for_window(window)
+    subtitle_row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
+end
+
+function set_preview_tree_maps_for_window(target_window, data_map, row_id_node_map)
+    local window = resolve_window(target_window)
+    if not window then return end
+    subtitle_data_maps_by_window[window] = data_map or {}
+    subtitle_row_id_node_maps_by_window[window] = row_id_node_map or {}
+    if window == active_window then
+        activate_preview_tree_maps_for_window(window)
+    end
 end
 
 local switch_stack_page
@@ -3684,7 +3719,7 @@ local function apply_tree_node_text_updates(target_window, tree, update_entries)
     local ok, err = with_tree_updates_suspended(tree, target_window, function()
         for _, entry in ipairs(update_entries) do
             if entry and entry.node then
-                set_tree_node_display_text(entry.node, entry.text)
+                set_preview_tree_node_display_text(entry.node, entry.text)
             end
         end
     end)
@@ -3697,7 +3732,7 @@ local function apply_tree_node_text_updates(target_window, tree, update_entries)
         end
         for _, entry in ipairs(update_entries) do
             if entry and entry.node then
-                set_tree_node_display_text(entry.node, entry.text)
+                set_preview_tree_node_display_text(entry.node, entry.text)
             end
         end
         pcall(function() tree:Update() end)
@@ -3734,6 +3769,29 @@ set_tree_item_text = function(item, column_index, value)
     local idx = tonumber(column_index) or 0
     local text = tostring(value or "")
     pcall(function() item.Text[idx] = text end)
+end
+
+function apply_preview_tree_layout(tree)
+    if not tree then return end
+    pcall(function() tree.ColumnCount = 2 end)
+    pcall(function() tree.RootIsDecorated = false end)
+    pcall(function() tree.ItemsExpandable = false end)
+    pcall(function() tree.Indentation = 0 end)
+    pcall(function() tree.ColumnWidth[0] = 30 end)
+    pcall(function() tree.ColumnWidth[1] = 900 end)
+end
+
+function set_preview_tree_node_display_text(node, display_text)
+    if not node then return false end
+    local safe_display_text = tostring(display_text or "")
+    set_tree_item_text(node, 0, "  ✎")
+    set_tree_item_text(node, 1, safe_display_text)
+    return true
+end
+
+function is_preview_tree_edit_column_event(ev)
+    local col = get_tree_event_value(ev, {"column", "Column", "col", "Col"})
+    return tonumber(col) == 0
 end
 
 local function get_pending_checkbox_mark(is_approved)
@@ -4070,7 +4128,9 @@ local function sync_current_preview_tree(target_window, dirty_row_ids)
     end
 
     local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
-    if not tree or type(subtitle_data_map) ~= "table" then
+    local data_map = get_subtitle_data_map_for_window(window)
+    local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
+    if not tree or type(data_map) ~= "table" then
         return 0
     end
 
@@ -4082,14 +4142,14 @@ local function sync_current_preview_tree(target_window, dirty_row_ids)
     if type(dirty_row_ids) == "table" then
         for row_id in pairs(dirty_row_ids) do
             local clean_row_id = trim_text(row_id)
-            local node = clean_row_id ~= "" and subtitle_row_id_node_map[clean_row_id] or nil
-            local row = node and subtitle_data_map[node] or nil
+            local node = clean_row_id ~= "" and row_id_node_map[clean_row_id] or nil
+            local row = node and data_map[node] or nil
             if node and type(row) == "table" then
                 queue_tree_node_text_update(update_entries, node, row.display_text or "")
             end
         end
     else
-        for node, row in pairs(subtitle_data_map) do
+        for node, row in pairs(data_map) do
             if node and type(row) == "table" then
                 queue_tree_node_text_update(update_entries, node, row.display_text or "")
             end
@@ -4145,11 +4205,13 @@ function handle_preview_tree_item_clicked(target_window, ev)
     local window = resolve_window(target_window)
     local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
     local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
-    local clicked_row = item and subtitle_data_map and subtitle_data_map[item] or nil
+    local data_map = get_subtitle_data_map_for_window(window)
+    local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
+    local clicked_row = item and data_map and data_map[item] or nil
     local clicked_row_id = clicked_row and trim_text(clicked_row.id) or ""
 
     local row = clicked_row_id ~= "" and find_row_by_id(clicked_row_id) or nil
-    local live_item = row and row.id and subtitle_row_id_node_map[row.id] or nil
+    local live_item = row and row.id and row_id_node_map[row.id] or nil
     if tree and live_item then
         set_tree_current_item(tree, live_item)
     elseif tree and item then
@@ -4166,9 +4228,9 @@ function handle_preview_tree_item_clicked(target_window, ev)
     return row
 end
 
-function open_preview_edit_dialog(target_window, ev)
+function open_preview_edit_dialog(target_window, ev, preset_row)
     local window = resolve_window(target_window)
-    local row = handle_preview_tree_item_clicked(window, ev)
+    local row = preset_row or handle_preview_tree_item_clicked(window, ev)
     if not row then
         update_shared_status(window, "请先选中一条字幕")
         return false
@@ -4185,13 +4247,13 @@ function open_preview_edit_dialog(target_window, ev)
     local edit_win = dispatcher:AddWindow({
         ID = "PreviewEditDialog",
         WindowTitle = title,
-        Geometry = {460, 220, 520, 260}
+        Geometry = {460, 220, 360, 170}
     },
     ui:VGroup{
         ContentsMargins = 10,
         Spacing = 8,
         ui:Label{ID = "PreviewEditDialogTimeLabel", Text = time_label, Weight = 0, Alignment = {AlignLeft = true, AlignVCenter = true}},
-        ui:TextEdit{ID = "PreviewEditDialogText", Text = tostring(row.text or ""), Weight = 1, MinimumSize = {0, 130}},
+        ui:TextEdit{ID = "PreviewEditDialogText", Text = "", Weight = 1, MinimumSize = {0, 70}},
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
@@ -4211,10 +4273,12 @@ function open_preview_edit_dialog(target_window, ev)
 
     function edit_win.On.PreviewEditDialogSaveBtn.Clicked(click_ev)
         local editor = edit_win:Find("PreviewEditDialogText")
-        save_preview_edit_dialog_changes(window, row_id, editor and editor.Text or "")
+        save_preview_edit_dialog_changes(window, row_id, get_textedit_content(editor))
         edit_win:Hide()
     end
 
+    local editor = edit_win:Find("PreviewEditDialogText")
+    set_textedit_content(editor, tostring(row.text or ""))
     edit_win:Show()
     return true
 end
@@ -5390,10 +5454,14 @@ local function get_row_from_tree_selection(target_window)
         return nil, nil
     end
 
-    local data = subtitle_data_map[selected]
+    local data_map = get_subtitle_data_map_for_window(target_window)
+    local data = data_map[selected]
     if not data then
         local t0 = ""
-        local ok_t, tx = pcall(function() return (selected.Text and selected.Text[0]) end)
+        local ok_t, tx = pcall(function() return get_tree_item_text(selected, 1) end)
+        if not ok_t or not tx or tostring(tx) == "" then
+            ok_t, tx = pcall(function() return (selected.Text and selected.Text[0]) end)
+        end
         if ok_t and tx then t0 = tostring(tx) end
         local idx = tonumber(string.match(t0, "^%[(%d+)%]"))
         if idx and current_rows and current_rows[idx] then
@@ -5417,14 +5485,12 @@ render_rows_to_window = function(target_window, rows_override)
     local next_row_id_map = {}
     local selected_node = nil
 
-    if window == active_window then
-        subtitle_data_map = {}
-        subtitle_row_id_node_map = {}
-    end
+    set_preview_tree_maps_for_window(window, {}, {})
 
     if not tree then
         return 0
     end
+    apply_preview_tree_layout(tree)
 
     local function populate_tree()
         pcall(function() tree:Clear() end)
@@ -5432,7 +5498,7 @@ render_rows_to_window = function(target_window, rows_override)
         for _, row in ipairs(rows) do
             local ok_item, item = pcall(function() return tree:NewItem() end)
             if ok_item and item then
-                set_tree_node_display_text(item, row.display_text or "")
+                set_preview_tree_node_display_text(item, row.display_text or "")
                 if pcall(function() tree:AddTopLevelItem(item) end) then
                     next_map[item] = row
                     local row_id = trim_text(row.id)
@@ -5462,10 +5528,7 @@ render_rows_to_window = function(target_window, rows_override)
         populate_tree()
     end
 
-    if window == active_window then
-        subtitle_data_map = next_map
-        subtitle_row_id_node_map = next_row_id_map
-    end
+    set_preview_tree_maps_for_window(window, next_map, next_row_id_map)
 
     -- 直接调用 render_rows_to_window 的路径不一定走 SEARCH_VIEW，这里清掉指纹/基线
     -- 避免后续 SEARCH_VIEW.render_current_view 误判"已渲染相同内容"而跳过重建
@@ -5531,21 +5594,22 @@ end
 -- 返回 true 表示成功应用，false 表示条件不满足或失败需回退。
 function apply_visibility_filter_to_window(window, visible_set, selected_row_id)
     if not window or window ~= active_window then return false end
-    if type(subtitle_row_id_node_map) ~= "table" then return false end
+    local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
+    if type(row_id_node_map) ~= "table" then return false end
     local tree = find_window_item(window, "SubtitleTree", "MiniSubtitleTree")
     if not tree then return false end
 
     local first_visible_node = nil
     local ok = with_tree_updates_suspended(tree, window, function()
-        for row_id, node in pairs(subtitle_row_id_node_map) do
+        for row_id, node in pairs(row_id_node_map) do
             local should_show = visible_set[row_id] == true
             set_tree_node_hidden(node, not should_show)
             if should_show and not first_visible_node then
                 first_visible_node = node
             end
         end
-        if selected_row_id and subtitle_row_id_node_map[selected_row_id] and visible_set[selected_row_id] then
-            pcall(function() tree:SetSelectedNode(subtitle_row_id_node_map[selected_row_id]) end)
+        if selected_row_id and row_id_node_map[selected_row_id] and visible_set[selected_row_id] then
+            pcall(function() tree:SetSelectedNode(row_id_node_map[selected_row_id]) end)
         end
     end)
     return ok == true
@@ -5639,7 +5703,8 @@ SEARCH_VIEW.render_current_view = function(target_window, options)
         -- 探测是否支持 Hidden（一次性，缓存到基线里）
         local hide_supported = false
         local probe_node = nil
-        for _, node in pairs(subtitle_row_id_node_map or {}) do
+        local row_id_node_map = get_subtitle_row_id_node_map_for_window(window)
+        for _, node in pairs(row_id_node_map or {}) do
             probe_node = node
             break
         end
@@ -5691,10 +5756,7 @@ local function clear_tree_for_window(target_window)
     if tree then
         pcall(function() tree:Clear() end)
     end
-    if window == active_window then
-        subtitle_data_map = {}
-        subtitle_row_id_node_map = {}
-    end
+    set_preview_tree_maps_for_window(window, {}, {})
     if window and SEARCH_VIEW then
         if SEARCH_VIEW.invalidate_rendered_signature then
             SEARCH_VIEW.invalidate_rendered_signature(window)
@@ -12238,7 +12300,7 @@ local function do_search(target_window)
 end
 
 -- ========== 定位跳转 ==========
-local function go_to_subtitle(target_window)
+local function go_to_subtitle(target_window, row_override)
     local window = resolve_window(target_window)
     print("[Hooper AI 2.0] 定位跳转触发")
 
@@ -12247,7 +12309,13 @@ local function go_to_subtitle(target_window)
         return
     end
 
-    local data = find_row_by_id(current_selected_row_id)
+    local data = row_override
+    if data and data.id then
+        current_selected_row_id = data.id
+    end
+    if not data then
+        data = find_row_by_id(current_selected_row_id)
+    end
     if not data then
         data = select(1, get_row_from_tree_selection(window))
     end
@@ -12786,6 +12854,36 @@ function write_rows_to_update_srt(srt_path, rows, timeline, base_frame)
     return index > 1, index - 1, index > 1 and nil or "没有可导入的字幕"
 end
 
+function capture_timeline_playhead_timecode(timeline)
+    if not timeline then
+        return nil
+    end
+
+    local ok, timecode = pcall(function() return timeline:GetCurrentTimecode() end)
+    if ok and timecode ~= nil and tostring(timecode) ~= "" then
+        return tostring(timecode)
+    end
+
+    LogMsg("保存更新时间线前播放头失败: " .. tostring(timecode))
+    return nil
+end
+
+function restore_timeline_playhead_timecode(timeline, timecode, context)
+    timecode = trim_text(timecode)
+    if not timeline or timecode == "" then
+        return false
+    end
+
+    local ok, ret = pcall(function() return timeline:SetCurrentTimecode(timecode) end)
+    if ok and ret ~= false then
+        LogMsg(tostring(context or "时间线操作") .. "后已恢复播放头: " .. timecode)
+        return true
+    end
+
+    LogMsg(tostring(context or "时间线操作") .. "后恢复播放头失败: " .. tostring(ret))
+    return false
+end
+
 function update_timeline_selection_scope()
     print("[Hooper AI 2.0] 选区模式更新时间线按钮点击")
     LogMsg("开始选区合成整轨写回，脚本版本 " .. tostring(SUBFIX_SCRIPT_BUILD) .. "，目标字幕轨 " .. tostring(current_subtitle_target_track))
@@ -12913,6 +13011,12 @@ update_timeline = function()
         return update_timeline_selection_scope()
     end
 
+    local original_playhead_timecode = capture_timeline_playhead_timecode(timeline)
+    local function finish_timeline_update(result)
+        restore_timeline_playhead_timecode(timeline, original_playhead_timecode, "更新时间线")
+        return result
+    end
+
     -- 生成绝对唯一的 SRT 文件名（打破 DaVinci 缓存）- 使用 os.time()
     local unique_id = os.time() .. "_" .. math.floor(os.clock() * 1000)
     local srt_filename = "Timeline_Update_" .. unique_id .. ".srt"
@@ -12934,7 +13038,7 @@ update_timeline = function()
         print("[Hooper AI 2.0] 无法创建 SRT 文件")
         LogMsg("无法创建 SRT 文件: " .. tostring(srt_path))
         if status then status:Set("Text", "无法创建更新用 SRT") end
-        return
+        return finish_timeline_update()
     end
 
     -- 获取精确的时间线起始帧
@@ -13009,7 +13113,7 @@ update_timeline = function()
         print("[Hooper AI 2.0] 没有生成任何字幕")
         LogMsg("没有生成任何字幕，已取消更新时间线")
         if status then status:Set("Text", "没有可导入的字幕") end
-        return
+        return finish_timeline_update()
     end
     
     print("[Hooper AI 2.0] 已生成 SRT: " .. srt_path .. "，共 " .. (index - 1) .. " 条")
@@ -13039,7 +13143,7 @@ update_timeline = function()
         print("[Hooper AI 2.0] " .. tostring(ensure_err))
         LogMsg("确保目标字幕轨存在失败: " .. tostring(ensure_err))
         if status then status:Set("Text", "目标字幕轨准备失败") end
-        return
+        return finish_timeline_update()
     end
 
     LogMsg("已确认目标字幕轨存在: 轨道 " .. tostring(current_subtitle_target_track) .. "，当前 " .. tostring(#ensured_items) .. " 条字幕")
@@ -13064,7 +13168,7 @@ update_timeline = function()
         if status then
             status:Set("Text", "无法切换到字幕轨 " .. tostring(current_subtitle_target_track))
         end
-        return
+        return finish_timeline_update()
     end
     print("[Hooper AI 2.0] 已切换字幕启用轨: " .. tostring(isolate_msg))
     LogMsg("已切换字幕启用轨: " .. tostring(isolate_msg))
@@ -13079,7 +13183,7 @@ update_timeline = function()
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
-        return
+        return finish_timeline_update()
     end
 
     local cleared_msg = string.format("已清空轨道 %d 旧字幕 %d 条", current_subtitle_target_track, deleted_count or 0)
@@ -13095,7 +13199,7 @@ update_timeline = function()
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
-        return
+        return finish_timeline_update()
     end
 
     -- 导入 SRT 到媒体池
@@ -13107,17 +13211,13 @@ update_timeline = function()
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
-        return
+        return finish_timeline_update()
     end
     local mediaPoolItem = mediaPoolItems[1]
     print("[Hooper AI 2.0] 字幕已导入媒体池")
     LogMsg("已导入新字幕到媒体池，共 " .. tostring(index - 1) .. " 条")
 
     LogMsg("使用稳定模式追加字幕到时间线，Resolve 将自行决定落轨")
-    if start_tc then
-        timeline:SetCurrentTimecode(start_tc)
-    end
-
     local append_ok, append_result = pcall(function() return mediaPool:AppendToTimeline({mediaPoolItem}) end)
     if not append_ok or append_result == false or append_result == nil then
         print("[Hooper AI 2.0] 插入失败")
@@ -13126,7 +13226,7 @@ update_timeline = function()
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
-        return
+        return finish_timeline_update()
     end
 
     local final_after_snapshot, after_err = snapshot_subtitle_tracks(timeline)
@@ -13137,7 +13237,7 @@ update_timeline = function()
         if fallback_locked then
             unlock_all_subtitle_tracks(timeline)
         end
-        return
+        return finish_timeline_update()
     end
 
     local final_delta = detect_subtitle_track_delta(before_snapshot, final_after_snapshot)
@@ -13178,6 +13278,7 @@ update_timeline = function()
         end
     end
 
+    return finish_timeline_update()
 end
 
 -- ========== AI 处理引擎（黑科技：临时文件 + curl）==========
@@ -16487,18 +16588,11 @@ local mini_content = ui:VGroup({
                 Spacing = 0,
                 ui:LineEdit({
                     ID = "MiniSearchBox",
-                    PlaceholderText = "搜索字幕内容（双击列表行可跳转定位）",
+                    PlaceholderText = "搜索字幕内容（双击跳转）",
                     Weight = 0,
                     MinimumSize = {0, 32},
                     MaximumSize = {16777215, 32}
                 })
-            }),
-            ui:Button({
-                ID = "MiniPreviewEditBtn",
-                Text = "修改选中",
-                Weight = 0,
-                MinimumSize = {84, 32},
-                MaximumSize = {96, 32}
             })
         }),
 
@@ -16529,8 +16623,8 @@ local mini_content = ui:VGroup({
             ui:Tree({
                 ID = "MiniSubtitleTree",
                 Weight = 1,
-                Header = {Text = "字幕预览  ·  双击可跳转"},
-                Events = { ItemDoubleClicked = true }
+                Header = {Text = "字幕预览  ·  双击跳转"},
+                Events = { ItemClicked = true, ItemDoubleClicked = true }
             })
         })
     })
@@ -16599,18 +16693,11 @@ local main_content = ui:VGroup({
                 Spacing = 0,
                 ui:LineEdit({
                     ID = "SearchBox",
-                    PlaceholderText = "搜索字幕内容（双击列表行可跳转定位）",
+                    PlaceholderText = "搜索字幕内容（双击跳转）",
                     Weight = 0,
                     MinimumSize = {0, 30},
                     MaximumSize = {16777215, 30}
                 })
-            }),
-            ui:Button({
-                ID = "PreviewEditBtn",
-                Text = "修改选中",
-                Weight = 0,
-                MinimumSize = {84, 30},
-                MaximumSize = {96, 30}
             })
         }),
         ui:VGap(0)
@@ -16694,8 +16781,8 @@ local main_content = ui:VGroup({
         ui:Tree({
             ID = "SubtitleTree",
             Weight = 1,
-            Header = {Text = "字幕预览  ·  双击可跳转"},
-            Events = { ItemDoubleClicked = true }
+            Header = {Text = "字幕预览  ·  双击跳转"},
+            Events = { ItemClicked = true, ItemDoubleClicked = true }
         })
     }),
     
@@ -17122,6 +17209,7 @@ local function open_full_window()
     end
 
     active_window = win
+    activate_preview_tree_maps_for_window(win)
     pcall(function()
         if win.SetAttrs then
             win:SetAttrs({Geometry = {500, 120, 500, 700}})
@@ -17218,18 +17306,18 @@ function mini_win.On.MiniOpenFullBtn.Clicked(ev)
     open_full_window()
 end
 
-function mini_win.On.MiniPreviewEditBtn.Clicked(ev)
-    open_preview_edit_dialog(mini_win, ev)
+function mini_win.On.MiniSubtitleTree.ItemClicked(ev)
+    local row = handle_preview_tree_item_clicked(mini_win, ev)
+    if is_preview_tree_edit_column_event(ev) then
+        open_preview_edit_dialog(mini_win, ev, row)
+    end
 end
 
 function mini_win.On.MiniSubtitleTree.ItemDoubleClicked(ev)
     print("[Hooper AI 2.0] 极简版字幕列表双击")
-    local tree = mini_win:Find("MiniSubtitleTree")
-    local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
-    if tree and item then
-        set_tree_current_item(tree, item)
-    end
-    go_to_subtitle(mini_win)
+    update_shared_status(mini_win, "检测到双击，正在跳转...")
+    local row = handle_preview_tree_item_clicked(mini_win, ev)
+    go_to_subtitle(mini_win, row)
 end
 
 -- 轨道选择变化（LineEdit + ▲▼，与极简窗口、目标轨控件统一样式）
@@ -20498,19 +20586,19 @@ function win.On.UpdateBtn.Clicked(ev)
     update_timeline()
 end
 
-function win.On.PreviewEditBtn.Clicked(ev)
-    open_preview_edit_dialog(win, ev)
+function win.On.SubtitleTree.ItemClicked(ev)
+    local row = handle_preview_tree_item_clicked(win, ev)
+    if is_preview_tree_edit_column_event(ev) then
+        open_preview_edit_dialog(win, ev, row)
+    end
 end
 
 -- 双击字幕条目跳转
 function win.On.SubtitleTree.ItemDoubleClicked(ev)
     print("[Hooper AI 2.0] 字幕列表双击")
-    local tree = win:Find("SubtitleTree")
-    local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem", "node", "Node"})
-    if tree and item then
-        set_tree_current_item(tree, item)
-    end
-    go_to_subtitle(win)
+    update_shared_status(win, "检测到双击，正在跳转...")
+    local row = handle_preview_tree_item_clicked(win, ev)
+    go_to_subtitle(win, row)
 end
 
 handle_main_window_close = function()
