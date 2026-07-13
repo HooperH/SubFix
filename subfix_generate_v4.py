@@ -274,7 +274,7 @@ def score_aligned_units_from_audio(
         start_sample = max(0, int(round((start_frame - window_start_frame) / fps * sample_rate)))
         end_sample = min(len(samples), max(start_sample + 1, int(round((end_frame - window_start_frame) / fps * sample_rate))))
         unit_level = _rms(array("h", samples[start_sample:end_sample]))
-        snr_db = max(-20.0, min(40.0, 20.0 * math.log10(max(1.0, unit_level) / noise_floor)))
+        snr_db = max(-20.0, min(60.0, 20.0 * math.log10(max(1.0, unit_level) / noise_floor)))
         unit["speaker_score_db"] = round(snr_db, 3)
         unit["source_score"] = round(float(alignment_coverage) * 6.0 + max(0.0, snr_db) * 0.5, 3)
         scored.append(unit)
