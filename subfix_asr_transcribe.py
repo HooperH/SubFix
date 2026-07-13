@@ -231,6 +231,10 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "alignment_window_uncovered_count",
         "canonical_unit_count",
         "forced_aligned_unit_coverage",
+        "cross_mic_echo_region_count",
+        "cross_mic_echo_suppressed_count",
+        "cross_mic_echo_ambiguous_count",
+        "cross_mic_echo_suppressed_unit_count",
         "cross_mic_duplicate_count",
         "short_speaker_flip_suppressed_count",
         "viterbi_source_switch_count",
@@ -4504,6 +4508,10 @@ def run_generate_subtitles_batch_plan_v4(
         "overlap_unit_suppressed_count": 0,
         "window_seam_suppressed_count": 0,
         "cross_mic_boundary_serialized_count": 0,
+        "cross_mic_echo_region_count": 0,
+        "cross_mic_echo_suppressed_count": 0,
+        "cross_mic_echo_ambiguous_count": 0,
+        "cross_mic_echo_suppressed_unit_count": 0,
         "cross_mic_duplicate_count": 0,
         "near_duplicate_suppressed_count": 0,
         "short_speaker_flip_suppressed_count": 0,
@@ -5111,8 +5119,13 @@ def run_generate_subtitles_batch_plan_v4(
             }
             for unit in candidates
         ]
-        canonical_units, exclusive_diagnostic = generate_v4.build_exclusive_unit_stream(
+        echo_filtered_candidates, echo_diagnostic = generate_v4.suppress_cross_mic_echo_regions(
             candidates,
+            float(args.fps or 30.0),
+        )
+        diagnostic.update(echo_diagnostic)
+        canonical_units, exclusive_diagnostic = generate_v4.build_exclusive_unit_stream(
+            echo_filtered_candidates,
             float(args.fps or 30.0),
         )
         diagnostic.update(exclusive_diagnostic)

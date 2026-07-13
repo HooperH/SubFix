@@ -9,6 +9,7 @@ import itertools
 import json
 import math
 import re
+import statistics
 import wave
 from array import array
 from collections import Counter
@@ -30,6 +31,10 @@ CLAUSE_STARTERS = (
 )
 INCOMPLETE_CLAUSE_SUFFIXES = ("我们", "你们", "他们", "我", "你", "他", "会", "要", "能", "的", "把", "让", "给", "跟")
 NON_BREAK_RIGHT_PREFIXES = ("不了", "得了")
+CROSS_MIC_ECHO_TEXT_SIMILARITY = 0.80
+CROSS_MIC_ECHO_MINIMUM_CHARACTERS = 4
+CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES = 5
+CROSS_MIC_ECHO_AMBIGUOUS_DB = 2.0
 
 
 class V4AlignmentError(RuntimeError):
@@ -852,6 +857,243 @@ def smooth_speaker_assignments(
             suppressed += 1
         index = end_index
     return output, {"short_speaker_flip_suppressed_count": suppressed}
+
+
+def _cross_mic_echo_midpoint(unit: dict[str, Any]) -> float:
+    start = int(unit.get("start_frame") or 0)
+    end = max(start + 1, int(unit.get("end_frame") or start + 1))
+    return (start + end) / 2.0
+
+
+def _cross_mic_echo_offsets(
+    left_units: list[dict[str, Any]],
+    right_units: list[dict[str, Any]],
+) -> list[int]:
+    left_text = [normalize_text(unit.get("text")) for unit in left_units]
+    right_text = [normalize_text(unit.get("text")) for unit in right_units]
+    matcher = difflib.SequenceMatcher(None, left_text, right_text, autojunk=False)
+    offsets: list[int] = []
+    for left_start, right_start, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            offsets.append(
+                int(left_units[left_start + offset].get("start_frame") or 0)
+                - int(right_units[right_start + offset].get("start_frame") or 0)
+            )
+    return offsets
+
+
+def _cross_mic_echo_candidate(
+    left_track: int,
+    right_track: int,
+    left_units: list[dict[str, Any]],
+    right_units: list[dict[str, Any]],
+    left_start: int,
+    left_end: int,
+    right_start: int,
+    right_end: int,
+) -> dict[str, Any] | None:
+    left_slice = left_units[left_start:left_end]
+    right_slice = right_units[right_start:right_end]
+    left_text = "".join(normalize_text(unit.get("text")) for unit in left_slice)
+    right_text = "".join(normalize_text(unit.get("text")) for unit in right_slice)
+    if min(len(left_text), len(right_text)) < CROSS_MIC_ECHO_MINIMUM_CHARACTERS:
+        return None
+    similarity = difflib.SequenceMatcher(None, left_text, right_text, autojunk=False).ratio()
+    offsets = _cross_mic_echo_offsets(left_slice, right_slice)
+    median_offset = statistics.median(abs(offset) for offset in offsets) if offsets else math.inf
+    if (
+        similarity < CROSS_MIC_ECHO_TEXT_SIMILARITY
+        or median_offset > CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES
+    ):
+        return None
+    return {
+        "left_track": left_track,
+        "right_track": right_track,
+        "left_start_index": left_start,
+        "left_end_index": left_end,
+        "right_start_index": right_start,
+        "right_end_index": right_end,
+        "start_frame": min(
+            int(left_slice[0].get("start_frame") or 0),
+            int(right_slice[0].get("start_frame") or 0),
+        ),
+        "end_frame": max(
+            int(left_slice[-1].get("end_frame") or 0),
+            int(right_slice[-1].get("end_frame") or 0),
+        ),
+        "text_similarity": similarity,
+        "median_offset_frames": median_offset,
+        "left_candidate_indices": [int(unit["_echo_candidate_index"]) for unit in left_slice],
+        "right_candidate_indices": [int(unit["_echo_candidate_index"]) for unit in right_slice],
+    }
+
+
+def _detect_cross_mic_echo_regions(
+    candidates: list[dict[str, Any]],
+    fps: float,
+) -> list[dict[str, Any]]:
+    tracks: dict[int, list[dict[str, Any]]] = {}
+    ordered = sorted(
+        [candidate for candidate in candidates if normalize_text(candidate.get("text"))],
+        key=lambda row: (
+            int(row.get("start_frame") or 0),
+            int(row.get("end_frame") or 0),
+            int(row.get("track_index") or 0),
+        ),
+    )
+    for candidate in ordered:
+        tracks.setdefault(int(candidate.get("track_index") or 0), []).append(candidate)
+    track_indices = sorted(index for index in tracks if index > 0)
+    window_frames = max(1, int(round(6.0 * fps)))
+    step_frames = max(1, int(round(3.0 * fps)))
+    join_gap_frames = max(1, int(round(0.4 * fps)))
+    regions: list[dict[str, Any]] = []
+    for left_position, left_track in enumerate(track_indices):
+        for right_track in track_indices[left_position + 1:]:
+            left_units = tracks[left_track]
+            right_units = tracks[right_track]
+            timeline_start = min(
+                int(left_units[0].get("start_frame") or 0),
+                int(right_units[0].get("start_frame") or 0),
+            )
+            timeline_end = max(
+                int(left_units[-1].get("end_frame") or 0),
+                int(right_units[-1].get("end_frame") or 0),
+            )
+            for window_start in range(timeline_start, timeline_end + 1, step_frames):
+                window_end = window_start + window_frames
+                left_indices = [
+                    index for index, unit in enumerate(left_units)
+                    if window_start <= _cross_mic_echo_midpoint(unit) < window_end
+                ]
+                right_indices = [
+                    index for index, unit in enumerate(right_units)
+                    if window_start <= _cross_mic_echo_midpoint(unit) < window_end
+                ]
+                if (
+                    len(left_indices) < CROSS_MIC_ECHO_MINIMUM_CHARACTERS
+                    or len(right_indices) < CROSS_MIC_ECHO_MINIMUM_CHARACTERS
+                ):
+                    continue
+                left_start, left_end = left_indices[0], left_indices[-1] + 1
+                right_start, right_end = right_indices[0], right_indices[-1] + 1
+                left_text = [normalize_text(unit.get("text")) for unit in left_units[left_start:left_end]]
+                right_text = [normalize_text(unit.get("text")) for unit in right_units[right_start:right_end]]
+                matcher = difflib.SequenceMatcher(None, left_text, right_text, autojunk=False)
+                for block in matcher.get_matching_blocks():
+                    if block.size < CROSS_MIC_ECHO_MINIMUM_CHARACTERS:
+                        continue
+                    candidate = _cross_mic_echo_candidate(
+                        left_track,
+                        right_track,
+                        left_units,
+                        right_units,
+                        left_start + block.a,
+                        left_start + block.a + block.size,
+                        right_start + block.b,
+                        right_start + block.b + block.size,
+                    )
+                    if candidate:
+                        regions.append(candidate)
+
+    regions.sort(
+        key=lambda region: (
+            region["left_track"],
+            region["right_track"],
+            region["start_frame"],
+            region["end_frame"],
+        )
+    )
+    merged: list[dict[str, Any]] = []
+    for region in regions:
+        if not merged:
+            merged.append(region)
+            continue
+        previous = merged[-1]
+        joinable = (
+            previous["left_track"] == region["left_track"]
+            and previous["right_track"] == region["right_track"]
+            and region["start_frame"] - previous["end_frame"] <= join_gap_frames
+            and region["left_start_index"] <= previous["left_end_index"] + 2
+            and region["right_start_index"] <= previous["right_end_index"] + 2
+            and max(previous["end_frame"], region["end_frame"])
+            - min(previous["start_frame"], region["start_frame"])
+            <= window_frames
+        )
+        if not joinable:
+            merged.append(region)
+            continue
+        combined = _cross_mic_echo_candidate(
+            int(region["left_track"]),
+            int(region["right_track"]),
+            tracks[int(region["left_track"])],
+            tracks[int(region["right_track"])],
+            min(int(previous["left_start_index"]), int(region["left_start_index"])),
+            max(int(previous["left_end_index"]), int(region["left_end_index"])),
+            min(int(previous["right_start_index"]), int(region["right_start_index"])),
+            max(int(previous["right_end_index"]), int(region["right_end_index"])),
+        )
+        if combined:
+            merged[-1] = combined
+        elif not (
+            region["left_start_index"] >= previous["left_start_index"]
+            and region["left_end_index"] <= previous["left_end_index"]
+            and region["right_start_index"] >= previous["right_start_index"]
+            and region["right_end_index"] <= previous["right_end_index"]
+        ):
+            merged.append(region)
+    return merged
+
+
+def suppress_cross_mic_echo_regions(
+    candidates: list[dict[str, Any]],
+    fps: float,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    indexed = [dict(candidate, _echo_candidate_index=index) for index, candidate in enumerate(candidates or [])]
+    regions = _detect_cross_mic_echo_regions(indexed, fps)
+    suppressed_indices: set[int] = set()
+    selected_indices: set[int] = set()
+    suppressed_regions = 0
+    ambiguous_regions = 0
+    for region in regions:
+        left_indices = [int(index) for index in region["left_candidate_indices"]]
+        right_indices = [int(index) for index in region["right_candidate_indices"]]
+        left_units = [indexed[index] for index in left_indices]
+        right_units = [indexed[index] for index in right_indices]
+        left_score = statistics.median(float(unit.get("speaker_score_db") or 0.0) for unit in left_units)
+        right_score = statistics.median(float(unit.get("speaker_score_db") or 0.0) for unit in right_units)
+        if abs(left_score - right_score) < CROSS_MIC_ECHO_AMBIGUOUS_DB:
+            ambiguous_regions += 1
+            left_start = min(int(unit.get("start_frame") or 0) for unit in left_units)
+            right_start = min(int(unit.get("start_frame") or 0) for unit in right_units)
+            left_wins = (left_start, int(region["left_track"])) <= (right_start, int(region["right_track"]))
+        else:
+            left_wins = left_score > right_score
+        winner_indices, loser_indices = (
+            (left_indices, right_indices) if left_wins else (right_indices, left_indices)
+        )
+        newly_suppressed = [index for index in loser_indices if index not in selected_indices]
+        if not newly_suppressed:
+            continue
+        suppressed_indices.update(newly_suppressed)
+        selected_indices.update(winner_indices)
+        suppressed_regions += 1
+        for index in winner_indices:
+            indexed[index]["speaker_decision"] = "cross_mic_echo_selected"
+
+    filtered: list[dict[str, Any]] = []
+    for index, candidate in enumerate(indexed):
+        if index in suppressed_indices:
+            continue
+        output = dict(candidate)
+        output.pop("_echo_candidate_index", None)
+        filtered.append(output)
+    return filtered, {
+        "cross_mic_echo_region_count": len(regions),
+        "cross_mic_echo_suppressed_count": suppressed_regions,
+        "cross_mic_echo_ambiguous_count": ambiguous_regions,
+        "cross_mic_echo_suppressed_unit_count": len(suppressed_indices),
+    }
 
 
 def build_exclusive_unit_stream(
