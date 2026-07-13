@@ -1167,6 +1167,17 @@ def _is_break_punctuation(text: str) -> bool:
     return any(char in str(text or "") for char in "。！？!?；;")
 
 
+def _boundary_model_context(
+    units: list[dict[str, Any]],
+    position: int,
+) -> tuple[str, int]:
+    context = normalize_text("".join(str(unit.get("text") or "") for unit in units))
+    character_position = len(
+        normalize_text("".join(str(unit.get("text") or "") for unit in units[:position]))
+    )
+    return context, character_position
+
+
 def _boundary_strength(units: list[dict[str, Any]], position: int, fps: float, profile: dict[str, Any] | None) -> float:
     left = units[position - 1]
     right = units[position]
@@ -1181,7 +1192,6 @@ def _boundary_strength(units: list[dict[str, Any]], position: int, fps: float, p
     if _is_break_punctuation(str(left.get("text") or "")):
         score += 8.0
     score += float(left.get("asr_punctuation_strength") or 0.0) * 8.0
-    context = "".join(str(unit.get("text") or "") for unit in units)
     right_context = normalize_text("".join(str(unit.get("text") or "") for unit in units[position:]))
     if any(right_context.startswith(starter) for starter in CLAUSE_STARTERS):
         score += 5.0
@@ -1189,7 +1199,8 @@ def _boundary_strength(units: list[dict[str, Any]], position: int, fps: float, p
         score -= 20.0
     if profile and profile.get("boundary_model"):
         model = profile["boundary_model"]
-        probability = boundary_probability(context, position, model)
+        context, character_position = _boundary_model_context(units, position)
+        probability = boundary_probability(context, character_position, model)
         threshold = max(0.05, min(0.95, float(model.get("decision_threshold") or 0.5)))
         if probability >= threshold:
             model_margin = (probability - threshold) / max(1e-6, 1.0 - threshold)
@@ -1201,7 +1212,12 @@ def _boundary_strength(units: list[dict[str, Any]], position: int, fps: float, p
     return score
 
 
-def _has_non_model_boundary_evidence(units: list[dict[str, Any]], position: int, fps: float) -> bool:
+def _has_non_model_boundary_evidence(
+    units: list[dict[str, Any]],
+    position: int,
+    fps: float,
+    profile: dict[str, Any] | None = None,
+) -> bool:
     if position <= 0 or position >= len(units):
         return False
     left = units[position - 1]
@@ -1214,7 +1230,19 @@ def _has_non_model_boundary_evidence(units: list[dict[str, Any]], position: int,
     if float(left.get("asr_punctuation_strength") or 0.0) > 0.0:
         return True
     right_context = normalize_text("".join(str(unit.get("text") or "") for unit in units[position:]))
-    return any(right_context.startswith(starter) for starter in CLAUSE_STARTERS)
+    if any(right_context.startswith(starter) for starter in CLAUSE_STARTERS):
+        return True
+    if profile and profile.get("boundary_model"):
+        model = profile["boundary_model"]
+        context, character_position = _boundary_model_context(units, position)
+        probability = boundary_probability(context, character_position, model)
+        threshold = max(0.05, min(0.95, float(model.get("decision_threshold") or 0.5)))
+        margin_value = profile.get("model_boundary_evidence_margin", 0.15)
+        if margin_value is None:
+            margin_value = 0.15
+        margin = max(0.0, min(1.0, float(margin_value)))
+        return probability >= threshold + margin
+    return False
 
 
 def _fill_short_segment_gaps(rows: list[dict[str, Any]], fps: float) -> int:
@@ -1369,6 +1397,22 @@ def _merge_single_unit_speaker_islands(units: list[dict[str, Any]]) -> tuple[lis
     return output, merged
 
 
+def _segmentation_length_parameters(
+    mode: str,
+    profile: dict[str, Any] | None,
+) -> tuple[int, int, int, int]:
+    fallback_minimum, fallback_preferred_maximum, fallback_maximum = (
+        (6, 14, 18) if mode == "live" else (8, 16, 18)
+    )
+    length_model = profile.get("length_model") if isinstance(profile, dict) else None
+    length_model = length_model if isinstance(length_model, dict) else {}
+    minimum = max(1, int(length_model.get("minimum") or fallback_minimum))
+    median = max(minimum, int(length_model.get("median") or 11))
+    preferred_maximum = max(median, int(length_model.get("preferred_maximum") or fallback_preferred_maximum))
+    maximum = max(preferred_maximum, int(length_model.get("maximum") or fallback_maximum))
+    return minimum, median, preferred_maximum, maximum
+
+
 def segment_canonical_units(
     units: list[dict[str, Any]],
     mode: str,
@@ -1438,10 +1482,13 @@ def segment_canonical_units(
             "text_conservation_failed_count": 0,
         }
     mode_profile = ((profile or {}).get("modes") or {}).get(mode) if profile and isinstance(profile.get("modes"), dict) else profile
-    preferred_min, preferred_max, hard_max = (6, 14, 18) if mode == "live" else (8, 16, 18)
+    preferred_min, preferred_center, preferred_max, hard_max = _segmentation_length_parameters(
+        mode,
+        mode_profile,
+    )
     count = len(ordered)
     if count <= hard_max and not any(
-        _has_non_model_boundary_evidence(ordered, position, fps)
+        _has_non_model_boundary_evidence(ordered, position, fps, mode_profile)
         for position in range(1, count)
     ):
         row = {
@@ -1481,12 +1528,12 @@ def segment_canonical_units(
                 end_strength = boundary_score if end < count else 3.0
                 if len(normalized) < 3 or min(start_strength, end_strength) < 3.0:
                     continue
-                if start > 0 and not _has_non_model_boundary_evidence(ordered, start, fps):
+                if start > 0 and not _has_non_model_boundary_evidence(ordered, start, fps, mode_profile):
                     continue
-                if end < count and not _has_non_model_boundary_evidence(ordered, end, fps):
+                if end < count and not _has_non_model_boundary_evidence(ordered, end, fps, mode_profile):
                     continue
                 strong_short_clause = True
-            length_score = -abs(length - 11) * 0.25
+            length_score = -abs(length - preferred_center) * 0.25
             if preferred_min <= length <= preferred_max:
                 length_score += 1.0
             if strong_short_clause:
@@ -1496,7 +1543,7 @@ def segment_canonical_units(
             # rewards cannot create unnecessary fragments.
             split_penalty = 0.0
             if end < count:
-                split_penalty = 2.5 if _has_non_model_boundary_evidence(ordered, end, fps) else 16.0
+                split_penalty = 2.5 if _has_non_model_boundary_evidence(ordered, end, fps, mode_profile) else 16.0
             candidate = scores[start] + length_score + boundary_score - split_penalty
             if candidate > scores[end]:
                 scores[end] = candidate
