@@ -5,6 +5,16 @@ tests/__pycache__/
 .pytest_cache/
 .subfix_asr_env/
 
+# ASR/forced-alignment model binaries, third-party toolchains, and vendored
+# python wheels under .subfix_support/. These are large (multi-GB) build
+# artifacts, not source — never commit them. The curated JSON profiles and
+# the Lua core under .subfix_support/ (not covered by these patterns) ARE
+# tracked as training/config data.
+.subfix_support/qwen3-asr.cpp/
+.subfix_support/models/
+.subfix_support/hf/
+.subfix_support/python-tools/
+
 # Local build output and packaged release artifacts.
 build/
 dist/

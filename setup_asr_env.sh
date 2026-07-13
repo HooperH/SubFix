@@ -2,7 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.subfix_asr_env"
+LOCAL_VENV_DIR="$SCRIPT_DIR/.subfix_asr_env"
+USER_VENV_DIR="$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/.subfix_asr_env"
+if [[ -n "${SUBFIX_ASR_VENV_DIR:-}" ]]; then
+  VENV_DIR="$SUBFIX_ASR_VENV_DIR"
+elif [[ -w "$SCRIPT_DIR" ]] || [[ -w "$LOCAL_VENV_DIR" ]]; then
+  VENV_DIR="$LOCAL_VENV_DIR"
+else
+  VENV_DIR="$USER_VENV_DIR"
+fi
 BUNDLED_PY="$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 
 if [[ -x "$BUNDLED_PY" ]]; then
@@ -23,11 +31,11 @@ fi
 "$VENV_DIR/bin/python" -m pip install 'whisperx'
 "$VENV_DIR/bin/python" -m pip install 'torch' 'transformers'
 
-if [[ "${SUBFIX_INSTALL_QWEN_ASR:-0}" == "1" ]]; then
+if [[ "${SUBFIX_INSTALL_QWEN_ASR:-1}" != "0" ]]; then
   "$VENV_DIR/bin/python" -m pip install -U 'qwen-asr'
-  echo "✅ Qwen3-ASR 可选依赖已安装。首次终检会下载 Qwen/Qwen3-ASR-1.7B 和 Qwen/Qwen3-ForcedAligner-0.6B。"
+  echo "✅ Qwen3-ASR 已安装。首次生成会下载 Qwen/Qwen3-ASR-1.7B 和 Qwen/Qwen3-ForcedAligner-0.6B。"
 else
-  echo "ℹ️ 跳过 Qwen3-ASR 可选依赖。如需启用：SUBFIX_INSTALL_QWEN_ASR=1 ./setup_asr_env.sh"
+  echo "ℹ️ 已按 SUBFIX_INSTALL_QWEN_ASR=0 跳过 Qwen3-ASR。v4 生成字幕将不可用。"
 fi
 
 echo "✅ ASR 环境已安装。首次规整会下载 CTC/WhisperX/stable-ts 对齐模型。"

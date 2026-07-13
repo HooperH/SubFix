@@ -298,20 +298,49 @@ local function set_subtitle_loaded_state(is_loaded, status_text, target_window)
     end
 end
 
-local function set_mini_subtitle_area_state(target_window, show_tree, message)
+local function set_mini_subtitle_area_state(target_window, show_tree, message, show_generate_button)
     local window = resolve_window(target_window)
     if not window or not is_mini_window(window) then
         return
     end
 
-    local stack = find_window_item(window, "MiniSubtitleAreaStack")
+    local placeholder = find_window_item(window, "MiniSubtitlePlaceholder")
+    local tree_wrap = find_window_item(window, "MiniSubtitleTreeWrap")
+    local generate_button = find_window_item(window, "MiniGenerateSelectionSubtitlesBtn")
     local placeholder_label = find_window_item(window, "MiniSubtitlePlaceholderLabel")
     if placeholder_label and message and message ~= "" then
         pcall(function() placeholder_label.Text = tostring(message) end)
     end
-    if stack then
-        switch_stack_page_index_only(window, "MiniSubtitleAreaStack", show_tree and MINI_SUBTITLE_TREE_INDEX or MINI_SUBTITLE_PLACEHOLDER_INDEX)
+    if type(set_item_hidden) == "function" then
+        set_item_hidden(placeholder, show_tree == true)
+        set_item_hidden(tree_wrap, show_tree ~= true)
+        if generate_button then
+            set_item_hidden(generate_button, show_generate_button ~= true)
+        end
+    else
+        if placeholder then
+            pcall(function() placeholder.Hidden = show_tree == true end)
+        end
+        if tree_wrap then
+            pcall(function() tree_wrap.Hidden = show_tree ~= true end)
+        end
+        if generate_button then
+            pcall(function() generate_button.Hidden = show_generate_button ~= true end)
+        end
     end
+    pcall(function() window:RecalcLayout() end)
+    pcall(function() window:Update() end)
+end
+
+function rows_have_usable_subtitle_text(rows)
+    for _, row in ipairs(rows or {}) do
+        local text = tostring((row and row.text) or "")
+        text = text:gsub("^%s*(.-)%s*$", "%1")
+        if text ~= "" and text ~= tostring(row.index or "") then
+            return true
+        end
+    end
+    return false
 end
 
 local function update_target_track_hint()
@@ -1074,8 +1103,6 @@ PREVIEW_SOURCE_TIMELINE = "timeline"
 PREVIEW_SOURCE_HISTORY = "history"
 current_preview_source = PREVIEW_SOURCE_TIMELINE
 current_history_entry_filename = ""
-local MINI_SUBTITLE_PLACEHOLDER_INDEX = 0
-local MINI_SUBTITLE_TREE_INDEX = 1
 BACKUP_HISTORY_LIMIT = 20
 BACKUP_HISTORY_STORE_LIMIT = 200
 BACKUP_HISTORY_MANIFEST = "_backup_history_manifest.tsv"
@@ -1665,7 +1692,7 @@ function extract_timeline_mark_candidate(marks)
         local mark = candidate.mark
         local mark_in = get_mark_range_value(mark, "in")
         local mark_out = get_mark_range_value(mark, "out")
-        if mark_in ~= nil and mark_out ~= nil then
+        if mark_in ~= nil or mark_out ~= nil then
             return candidate.type, mark_in, mark_out
         end
     end
@@ -1702,6 +1729,13 @@ function read_timeline_work_scope(timeline, fps, tl_start_frame, tl_end_frame)
             LogMsg(msg)
         end
         return full_scope
+    end
+
+    if mark_in == nil then
+        mark_in = tl_start_frame
+    end
+    if mark_out == nil then
+        mark_out = tl_end_frame
     end
 
     local start_frame = normalize_timeline_mark_frame(mark_in, tl_start_frame, tl_end_frame)
@@ -1992,6 +2026,58 @@ local function sanitize_reference_script_text(text)
     end
 
     return trim_text(table.concat(lines, "\n"))
+end
+
+local function split_reference_script_keywords(text)
+    text = sanitize_reference_script_text(text)
+    local delimiter_pattern = {",", "，", "、", ";", "；"}
+    for _, delimiter in ipairs(delimiter_pattern) do
+        text = text:gsub(delimiter, "\n")
+    end
+
+    local keywords = {}
+    local seen_keywords = {}
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local keyword = trim_text(line)
+        if keyword ~= "" and not seen_keywords[keyword] then
+            seen_keywords[keyword] = true
+            keywords[#keywords + 1] = keyword
+        end
+    end
+    return keywords
+end
+
+local function format_reference_script_context(text)
+    text = sanitize_reference_script_text(text)
+    if text == "" then
+        return ""
+    end
+
+    local function is_keyword_list(keywords)
+        if #keywords <= 1 or #keywords > 80 then
+            return false
+        end
+
+        if text:find("。", 1, true) or text:find("！", 1, true) or text:find("？", 1, true)
+            or text:find("!", 1, true) or text:find("?", 1, true) then
+            return false
+        end
+
+        for _, keyword in ipairs(keywords) do
+            if count_utf8_chars(keyword) > 36 then
+                return false
+            end
+        end
+
+        return true
+    end
+
+    local keywords = split_reference_script_keywords(text)
+    if is_keyword_list(keywords) then
+        return "【关键词字典】\n- " .. table.concat(keywords, "\n- ")
+    end
+
+    return text
 end
 
 local function get_textedit_content(item)
@@ -5842,7 +5928,7 @@ local function shell_quote(value)
     return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
-local function run_shell_capture(cmd)
+function run_shell_capture(cmd)
     local handle = io.popen(cmd .. " 2>&1")
     if not handle then
         return false, "无法启动命令"
@@ -5855,6 +5941,184 @@ local function run_shell_capture(cmd)
     end
 
     return false, output
+end
+
+function kill_ai_curl_process()
+    if not AI_CURL_PID_FILE then return end
+    pcall(function()
+        local pf = io.open(AI_CURL_PID_FILE, "r")
+        if pf then
+            local pid = trim_text(pf:read("*l") or "")
+            pf:close()
+            if pid ~= "" and pid:match("^%d+$") then
+                os.execute(string.format(
+                    "pkill -P %s 2>/dev/null; kill -9 %s 2>/dev/null",
+                    pid, pid))
+            end
+        end
+    end)
+end
+
+local LONG_TASK_PROGRESS_BAR_WIDTH = 36
+
+function long_task_progress_elapsed_text(started_at)
+    local elapsed = math.max(0, os.time() - (tonumber(started_at) or os.time()))
+    if elapsed >= 60 then
+        return string.format("%dm%02ds", math.floor(elapsed / 60), math.floor(elapsed % 60))
+    end
+    return string.format("%ds", math.floor(elapsed + 0.5))
+end
+
+function long_task_progress_bar_text(progress_state, payload)
+    local total = tonumber(payload and payload.progress_total)
+    local index = tonumber(payload and payload.progress_index)
+    if not total or not index or total <= 0 then
+        total = tonumber(payload and payload.total_batches)
+        index = tonumber(payload and payload.batch_index)
+    end
+
+    local fraction = 0
+    if total and index and total > 0 then
+        fraction = math.max(0, math.min(1, index / total))
+    end
+
+    local stage = tostring(payload and payload.stage or "")
+    if stage ~= "完成" and stage ~= "已取消" and stage ~= "失败" then
+        fraction = math.min(fraction, 0.98)
+    end
+
+    progress_state.progress_fraction = math.max(tonumber(progress_state.progress_fraction) or 0, fraction)
+    local width = LONG_TASK_PROGRESS_BAR_WIDTH
+    local percent = math.floor(progress_state.progress_fraction * 100 + 0.5)
+    if progress_state.progress_fraction >= 0.995 then
+        return string.rep("■", width) .. "⚑", percent
+    end
+
+    local marker_pos = math.floor(progress_state.progress_fraction * width + 0.5)
+    marker_pos = math.max(1, math.min(width, marker_pos))
+    local cells = {}
+    for cell_index = 1, width do
+        if cell_index < marker_pos then
+            cells[#cells + 1] = "■"
+        elseif cell_index == marker_pos then
+            cells[#cells + 1] = "ᗧ"
+        else
+            cells[#cells + 1] = "□"
+        end
+    end
+    return table.concat(cells) .. "⚑", percent
+end
+
+function show_long_task_progress_window(options)
+    options = type(options) == "table" and options or {}
+    if not dispatcher or not ui then
+        return nil, "无法初始化 Resolve UI"
+    end
+
+    local progress_state = {
+        cancel_requested = false,
+        started_at = os.time(),
+        progress_fraction = 0,
+        finished = false,
+        on_cancel = options.on_cancel
+    }
+    local progress_window = dispatcher:AddWindow({
+        ID = "LongTaskProgressWindow",
+        WindowTitle = tostring(options.title or "SubFix · 正在处理"),
+        Geometry = {520, 380, 430, 200},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 20,
+        ui:Label{ID = "LongTaskProgressStatusLabel", Text = "准备中", Weight = 0, MinimumSize = {0, 22}},
+        ui:HGroup{
+            Weight = 0,
+            ui:HGap(0, 1),
+            ui:Label{ID = "LongTaskProgressBarLabel", Text = "ᗧ" .. string.rep("□", LONG_TASK_PROGRESS_BAR_WIDTH - 1) .. "⚑", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
+        },
+        ui:Label{ID = "LongTaskProgressMetaLabel", Text = "进度 0%  ·  用时 0s", Weight = 0, MinimumSize = {0, 18}},
+        ui:HGroup{
+            Weight = 0,
+            ui:HGap(0, 1),
+            ui:Label{ID = "LongTaskProgressHintLabel", Text = tostring(options.hint or "去摸个鱼吧🐟～\n::)"), Weight = 0, MinimumSize = {0, 38}, Alignment = {AlignHCenter = true, AlignVCenter = true}},
+            ui:HGap(0, 1)
+        },
+        ui:VGap(4),
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:HGap(0, 1),
+            ui:Button{ID = "LongTaskProgressCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}},
+            ui:HGap(0, 1)
+        }
+    })
+
+    progress_state.window = progress_window
+
+    local function request_cancel()
+        if progress_state.finished then
+            progress_window:Hide()
+            return
+        end
+        progress_state.cancel_requested = true
+        if type(progress_state.on_cancel) == "function" then
+            progress_state.on_cancel(progress_state)
+        end
+    end
+
+    function progress_window.On.LongTaskProgressCancelBtn.Clicked(ev)
+        request_cancel()
+    end
+
+    function progress_window.On.LongTaskProgressWindow.Close(ev)
+        request_cancel()
+    end
+
+    progress_window:Show()
+    return progress_state
+end
+
+function update_long_task_progress_window(progress_state, payload, status_override)
+    local progress_window = progress_state and progress_state.window
+    if not progress_window then return end
+    local ok_items, items = pcall(function() return progress_window:GetItems() end)
+    if not ok_items or not items then return end
+
+    payload = type(payload) == "table" and payload or {}
+    local stage = tostring(payload.stage or "处理中")
+    local message = tostring(payload.message or "")
+    local status_text = tostring(status_override or "")
+    if status_text == "" then
+        status_text = message ~= "" and message or stage
+    end
+    local bar, percent = long_task_progress_bar_text(progress_state, payload)
+    local elapsed = long_task_progress_elapsed_text(progress_state.started_at)
+
+    if items.LongTaskProgressStatusLabel then items.LongTaskProgressStatusLabel.Text = status_text end
+    if items.LongTaskProgressBarLabel then items.LongTaskProgressBarLabel.Text = bar end
+    if items.LongTaskProgressMetaLabel then items.LongTaskProgressMetaLabel.Text = "进度 " .. tostring(percent) .. "%  ·  用时 " .. elapsed end
+end
+
+function finish_long_task_progress_window(progress_state, status, message)
+    local progress_window = progress_state and progress_state.window
+    if not progress_window then return end
+    local stage = status == "cancelled" and "已取消" or (status == "failed" and "失败" or "完成")
+    local payload = {stage = stage, message = tostring(message or "")}
+    if status == "done" then
+        payload.progress_index = 100
+        payload.progress_total = 100
+    end
+    update_long_task_progress_window(progress_state, payload, message)
+    progress_state.finished = true
+    if status == "done" then
+        pcall(function() progress_window:Hide() end)
+        return
+    end
+    local ok_items, items = pcall(function() return progress_window:GetItems() end)
+    if ok_items and items and items.LongTaskProgressCancelBtn then
+        items.LongTaskProgressCancelBtn.Text = "关闭"
+    end
 end
 
 function normalize_progress_elapsed_text()
@@ -5870,43 +6134,19 @@ end
 function refresh_normalize_progress_window()
     if not NormalizeProgress then return end
     render_normalize_progress_status()
-    if not NormalizeProgress.window then return end
-    local ok_items, items = pcall(function() return NormalizeProgress.window:GetItems() end)
-    if not ok_items or not items then return end
 
     local stage = tostring(NormalizeProgress.stage or "准备中")
     local message = tostring(NormalizeProgress.message or "")
     local current_batch = tonumber(NormalizeProgress.current_batch) or 0
     local total_batches = tonumber(NormalizeProgress.total_batches) or 0
-    local processed_rows = tonumber(NormalizeProgress.processed_rows) or 0
-    local total_rows = tonumber(NormalizeProgress.total_rows) or 0
-    local width = 24
-    local filled = 0
-    if total_batches > 0 then
-        filled = math.floor((math.min(current_batch, total_batches) / total_batches) * width + 0.5)
-    end
-    filled = math.max(0, math.min(width, filled))
-    local bar = "[" .. string.rep("#", filled) .. string.rep("-", width - filled) .. "]"
-
-    if items.NormalizeProgressStageLabel then
-        items.NormalizeProgressStageLabel.Text = "阶段：" .. stage
-    end
-    if items.NormalizeProgressMessageLabel then
-        items.NormalizeProgressMessageLabel.Text = message
-    end
-    if items.NormalizeProgressBatchLabel then
-        items.NormalizeProgressBatchLabel.Text = string.format("%s  批次 %d/%d  字幕 %d/%d  用时 %s",
-            bar, current_batch, total_batches, processed_rows, total_rows, normalize_progress_elapsed_text())
-    end
-    if items.NormalizeProgressAudioLabel then
-        items.NormalizeProgressAudioLabel.Text = "音频：" .. tostring(NormalizeProgress.audio_label or "等待检测")
-    end
-    if items.NormalizeProgressLog then
-        items.NormalizeProgressLog.Text = table.concat(NormalizeProgress.logs or {}, "\n")
-    end
-    if items.NormalizeProgressCancelBtn then
-        items.NormalizeProgressCancelBtn.Text = NormalizeProgress.running and "取消" or "关闭"
-    end
+    update_long_task_progress_window(NormalizeProgress.progress_state, {
+        stage = stage,
+        message = message,
+        progress_index = NormalizeProgress.progress_index,
+        progress_total = NormalizeProgress.progress_total,
+        batch_index = current_batch,
+        total_batches = total_batches
+    }, message)
 end
 
 function render_normalize_progress_status()
@@ -5991,76 +6231,24 @@ function cancel_normalize_progress(reason)
 end
 
 function show_normalize_progress_window(target_window)
-    if NormalizeProgress and NormalizeProgress.window then
-        pcall(function() NormalizeProgress.window:Show() end)
-        refresh_normalize_progress_window()
-        return NormalizeProgress.window
-    end
-
-    local progress_window = dispatcher:AddWindow({
-        ID = "NormalizeProgressWindow",
-        WindowTitle = "SubFix · 规整字幕长度",
-        Geometry = {360, 220, 620, 360},
-    },
-    ui:VGroup{
-        Spacing = 8,
-        ContentsMargins = 10,
-        ui:Label{ID = "NormalizeProgressStageLabel", Text = "阶段：准备中", Weight = 0},
-        ui:Label{ID = "NormalizeProgressMessageLabel", Text = "等待开始", Weight = 0},
-        ui:Label{ID = "NormalizeProgressBatchLabel", Text = "[------------------------]  批次 0/0  字幕 0/0  用时 0s", Weight = 0},
-        ui:Label{ID = "NormalizeProgressAudioLabel", Text = "音频：等待检测", Weight = 0},
-        ui:TextEdit{
-            ID = "NormalizeProgressLog",
-            ReadOnly = true,
-            Weight = 1,
-            Text = "",
-            PlaceholderText = "这里会显示规整字幕长度的阶段日志。"
-        },
-        ui:HGroup{
-            Weight = 0,
-            Spacing = 8,
-            ui:HGap(0, 1),
-            ui:Button{ID = "NormalizeProgressCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}},
-            ui:Button{ID = "NormalizeProgressCloseBtn", Text = "关闭", Weight = 0, MinimumSize = {88, 28}}
-        }
-    })
-
-    function progress_window.On.NormalizeProgressWindow.Close(ev)
-        if NormalizeProgress and NormalizeProgress.running then
-            cancel_normalize_progress("用户关闭进度窗口，正在取消规整字幕长度...")
-        else
-            progress_window:Hide()
-        end
-    end
-
-    function progress_window.On.NormalizeProgressCancelBtn.Clicked(ev)
-        if NormalizeProgress and NormalizeProgress.running then
-            cancel_normalize_progress("用户取消规整字幕长度")
-        else
-            progress_window:Hide()
-        end
-    end
-
-    function progress_window.On.NormalizeProgressCloseBtn.Clicked(ev)
-        if NormalizeProgress and NormalizeProgress.running then
-            cancel_normalize_progress("用户关闭进度窗口，正在取消规整字幕长度...")
-        else
-            progress_window:Hide()
-        end
-    end
-
     NormalizeProgress = NormalizeProgress or {}
-    NormalizeProgress.window = progress_window
     NormalizeProgress.target_window = target_window
-    progress_window:Show()
+    local progress_state = show_long_task_progress_window({
+        title = "SubFix · 规整字幕长度",
+        on_cancel = function()
+            cancel_normalize_progress("用户取消规整字幕长度")
+        end
+    })
+    if type(progress_state) == "table" then
+        NormalizeProgress.progress_state = progress_state
+        NormalizeProgress.window = progress_state.window
+    end
     refresh_normalize_progress_window()
-    return progress_window
+    return NormalizeProgress.window
 end
 
 function start_normalize_progress(target_window, total_rows)
-    local existing_window = NormalizeProgress and NormalizeProgress.window
     NormalizeProgress = {
-        window = existing_window,
         target_window = target_window,
         running = true,
         cancelled = false,
@@ -6078,6 +6266,7 @@ function start_normalize_progress(target_window, total_rows)
     NORMALIZE_HELPER_PID_FILE = nil
     set_gated_actions_enabled(false)
     set_normalize_action_running(true)
+    show_normalize_progress_window(target_window)
     render_normalize_progress_status()
     append_normalize_progress_log("开始规整字幕长度")
     return NormalizeProgress
@@ -6093,9 +6282,7 @@ function finish_normalize_progress(status, message)
     NORMALIZE_HELPER_PID_FILE = nil
     set_gated_actions_enabled(true)
     set_normalize_action_running(false)
-    if NormalizeProgress.window then
-        pcall(function() NormalizeProgress.window:Hide() end)
-    end
+    finish_long_task_progress_window(NormalizeProgress.progress_state, status, message)
     refresh_normalize_progress_window()
 end
 
@@ -7018,8 +7205,14 @@ SUBFIX_AUDIO_ALIGN.max_stable_ts_move_frames = 18
 SUBFIX_AUDIO_ALIGN.normalize_length_max_audio_move_frames = 24
 SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames = 90
 SUBFIX_AUDIO_ALIGN.min_ctc_confidence = 0.30
+SUBFIX_AUDIO_ALIGN.normalize_length_ctc_move_min_confidence = 0.55
+SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_frames = 12
+SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_min_confidence = 0.70
+SUBFIX_AUDIO_ALIGN.normalize_length_original_onset_guard_frames = 6
+SUBFIX_AUDIO_ALIGN.normalize_length_ctc_onset_override_min_confidence = 0.90
+SUBFIX_AUDIO_ALIGN.normalize_length_ctc_min_onset_improvement_frames = 1
 SUBFIX_AUDIO_ALIGN.normalize_length_start_bias_frames = -2
-SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames = 4
+SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames = 2
 SUBFIX_AUDIO_ALIGN.normalize_length_min_improvement_frames = 3
 SUBFIX_AUDIO_ALIGN.normalize_length_forward_search_frames = 24
 SUBFIX_AUDIO_ALIGN.normalize_length_backward_search_frames = 6
@@ -7030,6 +7223,15 @@ SUBFIX_AUDIO_ALIGN.normalize_length_review_low_confidence = 0.45
 SUBFIX_AUDIO_ALIGN.normalize_length_review_large_move_frames = 24
 SUBFIX_AUDIO_ALIGN.normalize_length_review_previous_guard_frames = 3
 SUBFIX_AUDIO_ALIGN.normalize_length_review_min_confidence_gain = 0.03
+SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_min_confidence = 0.65
+SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_max_abs_frames = 6
+SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_min_samples = 3
+SUBFIX_AUDIO_ALIGN.normalize_length_end_min_confidence = 0.45
+SUBFIX_AUDIO_ALIGN.normalize_length_end_tail_padding_frames = 2
+SUBFIX_AUDIO_ALIGN.normalize_length_min_duration_frames = 6
+SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_min_score = 0.86
+SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_large_move_min_score = 0.92
+SUBFIX_AUDIO_ALIGN.normalize_length_qwen_display_lead_frames = 3
 SUBFIX_AUDIO_ALIGN.alignment_max_rows_per_batch = 18
 SUBFIX_AUDIO_ALIGN.alignment_max_batch_seconds = 28
 SUBFIX_AUDIO_ALIGN.alignment_batch_context_frames = 12
@@ -7074,6 +7276,46 @@ function SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(value)
     if parsed > max_bias then parsed = max_bias end
     if parsed < -max_bias then parsed = -max_bias end
     return parsed
+end
+
+function SUBFIX_AUDIO_ALIGN.parse_normalize_length_bias_input(value)
+    local text = trim_text(tostring(value or ""))
+    if text == "" or text == "自动" or text:lower() == "auto" then
+        return "auto", SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(SUBFIX_AUDIO_ALIGN.normalize_length_start_bias_frames)
+    end
+    return "manual", SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(text)
+end
+
+function SUBFIX_AUDIO_ALIGN.resolve_normalize_length_auto_bias(results)
+    local min_confidence = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_min_confidence) or 0.65
+    local max_abs_frames = math.max(0, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_max_abs_frames) or 6)
+    local min_samples = math.max(1, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_auto_bias_min_samples) or 3)
+    local samples = {}
+
+    for _, result in ipairs(results or {}) do
+        if result and result.matched and result.row and result.ctc_confidence ~= nil then
+            local confidence = tonumber(result.ctc_confidence) or 0
+            local old_start = tonumber(result.old_start_frame) or tonumber(result.row.start_frame)
+            local ctc_start = tonumber(result.stable_ts_start_frame) or tonumber(result.new_start_frame)
+            if confidence >= min_confidence and old_start and ctc_start then
+                local sample = math.floor((old_start - ctc_start) + 0.5)
+                if math.abs(sample) <= max_abs_frames then
+                    samples[#samples + 1] = sample
+                end
+            end
+        end
+    end
+
+    if #samples < min_samples then
+        return 0, #samples, true
+    end
+    table.sort(samples)
+    local mid = math.floor((#samples + 1) / 2)
+    local median = samples[mid]
+    if #samples % 2 == 0 then
+        median = math.floor(((samples[mid] + samples[mid + 1]) / 2) + 0.5)
+    end
+    return SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(median), #samples, false
 end
 
 function SUBFIX_AUDIO_ALIGN.normalize_text(text)
@@ -8618,9 +8860,34 @@ function SUBFIX_AUDIO_ALIGN.get_script_dir()
     return os.getenv("PWD") or "."
 end
 
+function SUBFIX_AUDIO_ALIGN.parent_dir(path)
+    local cleaned = tostring(path or ""):gsub("[/\\]$", "")
+    local parent = cleaned:match("^(.*)[/\\][^/\\]+$")
+    if parent and parent ~= "" then
+        return parent
+    end
+    return cleaned
+end
+
+function SUBFIX_AUDIO_ALIGN.resolve_support_root()
+    local script_dir = SUBFIX_AUDIO_ALIGN.get_script_dir()
+    local helper = script_dir .. "/.subfix_support/subfix_asr_transcribe.py"
+    if SUBFIX_AUDIO_ALIGN.file_exists(helper) then
+        return script_dir
+    end
+
+    local parent = SUBFIX_AUDIO_ALIGN.parent_dir(script_dir)
+    local parent_helper = parent .. "/.subfix_support/subfix_asr_transcribe.py"
+    if SUBFIX_AUDIO_ALIGN.file_exists(parent_helper) then
+        return parent
+    end
+    return script_dir
+end
+
 function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     local script_dir = SUBFIX_AUDIO_ALIGN.get_script_dir()
-    local helper_dir = script_dir .. "/.subfix_support"
+    local support_root = SUBFIX_AUDIO_ALIGN.resolve_support_root()
+    local helper_dir = support_root .. "/.subfix_support"
     local helper = helper_dir .. "/subfix_asr_transcribe.py"
     local setup = helper_dir .. "/setup_asr_env.sh"
     local python = helper_dir .. "/.subfix_asr_env/bin/python"
@@ -8631,6 +8898,8 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     local legacy_helper = script_dir .. "/subfix_asr_transcribe.py"
     local legacy_setup = script_dir .. "/setup_asr_env.sh"
     local legacy_python = script_dir .. "/.subfix_asr_env/bin/python"
+    local home_dir = os.getenv("HOME") or ""
+    local user_python = home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/.subfix_asr_env/bin/python"
 
     if not SUBFIX_AUDIO_ALIGN.file_exists(helper) and SUBFIX_AUDIO_ALIGN.file_exists(visible_helper) then
         helper = visible_helper
@@ -8644,6 +8913,9 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     if not SUBFIX_AUDIO_ALIGN.file_exists(python) and SUBFIX_AUDIO_ALIGN.file_exists(legacy_python) then
         python = legacy_python
     end
+    if not SUBFIX_AUDIO_ALIGN.file_exists(python) and SUBFIX_AUDIO_ALIGN.file_exists(user_python) then
+        python = user_python
+    end
 
     return {
         script_dir = script_dir,
@@ -8652,6 +8924,40 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
         setup = setup,
         python = python
     }
+end
+
+function SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths)
+    paths = type(paths) == "table" and paths or SUBFIX_AUDIO_ALIGN.get_asr_paths()
+    local helper_dir = tostring(paths.helper_dir or "")
+    if helper_dir == "" then
+        return false
+    end
+    if not SUBFIX_AUDIO_ALIGN.file_exists(helper_dir .. "/qwen3-asr.cpp/build/qwen3-asr-cli") then
+        return false
+    end
+    local model_names = {
+        "qwen3-forced-aligner-0.6b-f16.gguf",
+        "qwen3-forced-aligner-0.6b-q8_0.gguf",
+        "qwen3-forced-aligner-0.6b-q5_0.gguf",
+        "qwen3-forced-aligner-0.6b-q4_k.gguf"
+    }
+    for _, model_name in ipairs(model_names) do
+        if SUBFIX_AUDIO_ALIGN.file_exists(helper_dir .. "/models/" .. model_name) then
+            return true
+        end
+    end
+    return false
+end
+
+function SUBFIX_AUDIO_ALIGN.resolve_normalize_align_engine(paths)
+    local configured = tostring(os.getenv("SUBFIX_ALIGN_ENGINE") or "")
+    if configured ~= "" then
+        return configured
+    end
+    if SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths) then
+        return "qwen3_cpp"
+    end
+    return "ctc"
 end
 
 function SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
@@ -9721,7 +10027,20 @@ function SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_start(row_start, candidate_s
     local ctc_candidate = tonumber(candidate_start) or original_start
     local origin_guard_frames = tonumber(options.origin_guard_frames) or SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames
     local max_move_frames = tonumber(options.max_move_frames) or SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames
-    local min_confidence = tonumber(options.min_confidence) or SUBFIX_AUDIO_ALIGN.min_ctc_confidence
+    local min_confidence = tonumber(options.min_confidence) or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_move_min_confidence
+    local large_move_frames = tonumber(options.large_move_frames) or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_frames
+    local large_move_min_confidence = tonumber(options.large_move_min_confidence) or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_min_confidence
+    local onset_guard_frames = tonumber(options.onset_guard_frames) or SUBFIX_AUDIO_ALIGN.normalize_length_original_onset_guard_frames
+    local onset_override_min_confidence = tonumber(options.onset_override_min_confidence) or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_onset_override_min_confidence
+    local min_onset_improvement_frames = math.max(0, tonumber(options.min_onset_improvement_frames) or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_min_onset_improvement_frames or 1)
+    local local_onset_frames = type(options.local_onset_frames) == "table" and options.local_onset_frames or nil
+    local preserve_original_onset = options.preserve_original_onset ~= false
+    local require_onset_improvement = options.require_onset_improvement == true
+    local alignment_mode = tostring(options.alignment_mode or "")
+    local row_remap_score = tonumber(options.row_remap_score)
+    local row_remap_decision = tostring(options.row_remap_decision or "")
+    local qwen_remap_min_score = tonumber(options.qwen_remap_min_score) or SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_min_score
+    local qwen_remap_large_move_min_score = tonumber(options.qwen_remap_large_move_min_score) or SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_large_move_min_score
     local ctc_confidence = tonumber(confidence) or 0
     local move_frames = ctc_candidate - original_start
     local move_distance = math.abs(move_frames)
@@ -9729,16 +10048,258 @@ function SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_start(row_start, candidate_s
     if move_distance <= origin_guard_frames then
         return original_start, false, "preserved_already_aligned", 0, ctc_confidence, nil
     end
-    if ctc_confidence > 0 and ctc_confidence < min_confidence then
+    if alignment_mode == "qwen3_forced_aligner" then
+        if row_remap_decision ~= "accepted_local_match" then
+            return original_start, false, "rejected_low_remap_score", nil, row_remap_score, nil
+        end
+        if not row_remap_score or row_remap_score < qwen_remap_min_score then
+            return original_start, false, "rejected_low_remap_score", nil, row_remap_score, nil
+        end
+        if move_distance > large_move_frames and row_remap_score < qwen_remap_large_move_min_score then
+            return original_start, false, "rejected_low_remap_score", nil, row_remap_score, nil
+        end
+    end
+    local _, original_onset_distance = SUBFIX_AUDIO_ALIGN.nearest_onset_distance(original_start, local_onset_frames, {
+        max_before_frames = onset_guard_frames,
+        max_after_frames = onset_guard_frames
+    })
+    if preserve_original_onset and move_distance > large_move_frames and original_onset_distance and ctc_confidence < onset_override_min_confidence then
+        return original_start, false, "preserved_already_aligned", original_onset_distance, ctc_confidence, nil
+    end
+    local _, candidate_onset_distance = SUBFIX_AUDIO_ALIGN.nearest_onset_distance(ctc_candidate, local_onset_frames, {
+        max_before_frames = onset_guard_frames,
+        max_after_frames = onset_guard_frames
+    })
+    if require_onset_improvement and preserve_original_onset then
+        if not candidate_onset_distance then
+            return original_start, false, "rejected_no_onset", original_onset_distance, nil, nil
+        end
+        local onset_improvement = original_onset_distance and (original_onset_distance - candidate_onset_distance) or candidate_onset_distance
+        if original_onset_distance and onset_improvement < min_onset_improvement_frames then
+            return original_start, false, "rejected_not_better", original_onset_distance, candidate_onset_distance, onset_improvement
+        end
+    end
+    if ctc_confidence < min_confidence then
+        return original_start, false, "rejected_low_confidence", nil, ctc_confidence, nil
+    end
+    if move_distance > large_move_frames and ctc_confidence < large_move_min_confidence then
         return original_start, false, "rejected_low_confidence", nil, ctc_confidence, nil
     end
     if move_distance > max_move_frames then
         return original_start, false, "rejected_large_move", nil, ctc_confidence, nil
     end
     if move_frames > 0 then
-        return ctc_candidate, true, "moved_forward_better", move_distance, ctc_confidence, move_distance
+        return ctc_candidate, true, "moved_forward_better", original_onset_distance, candidate_onset_distance, move_distance
     end
-    return ctc_candidate, true, "moved_backward_better", move_distance, ctc_confidence, move_distance
+    return ctc_candidate, true, "moved_backward_better", original_onset_distance, candidate_onset_distance, move_distance
+end
+
+function SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_end(new_start, old_end, candidate_end, confidence, next_start, audio_end, fps)
+    local start_frame = tonumber(new_start) or 0
+    local original_end = tonumber(old_end) or (start_frame + 1)
+    local ctc_end = tonumber(candidate_end)
+    local ctc_confidence = tonumber(confidence) or 0
+    local min_confidence = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_end_min_confidence) or 0.45
+    if not ctc_end then
+        return original_end, false, "rejected_no_ctc_end"
+    end
+    if ctc_confidence > 0 and ctc_confidence < min_confidence then
+        return original_end, false, "rejected_end_low_confidence"
+    end
+
+    local min_duration = math.max(1, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_min_duration_frames) or math.floor((tonumber(fps) or 24) * 0.25 + 0.5))
+    local min_end = start_frame + min_duration
+    local max_end = nil
+    if tonumber(next_start) then
+        max_end = tonumber(next_start)
+    end
+    if tonumber(audio_end) then
+        max_end = max_end and math.min(max_end, tonumber(audio_end)) or tonumber(audio_end)
+    end
+    if max_end and max_end < min_end then
+        return original_end, false, "rejected_end_min_duration"
+    end
+
+    local corrected_end = math.max(min_end, math.floor(ctc_end + 0.5))
+    if max_end then
+        corrected_end = math.min(corrected_end, max_end)
+    end
+    corrected_end = math.max(start_frame + 1, corrected_end)
+    if corrected_end == original_end then
+        return original_end, false, "preserved_end_already_aligned"
+    end
+    return corrected_end, true, "end_corrected"
+end
+
+function SUBFIX_AUDIO_ALIGN.qwen_global_candidate_is_accepted(result)
+    if not result or result.matched ~= true or not result.row then
+        return false
+    end
+    if result.alignment_mode ~= "qwen3_forced_aligner" then
+        return false
+    end
+    if result.row_remap_decision ~= "accepted_local_match" then
+        return false
+    end
+    local row_remap_score = tonumber(result.row_remap_score) or 0
+    if row_remap_score < SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_min_score then
+        return false
+    end
+    return tonumber(result.ctc_start_frame) ~= nil or tonumber(result.stable_ts_start_frame) ~= nil or tonumber(result.new_start_frame) ~= nil
+end
+
+function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_position, fps, normalize_bias_frames)
+    local candidates = {}
+    local candidate_by_row = {}
+    local min_duration = math.max(1, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_min_duration_frames) or math.floor((tonumber(fps) or 24) * 0.25 + 0.5))
+    local max_move_frames = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames) or 90
+    local large_move_frames = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_frames) or 12
+    local large_move_min_score = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_large_move_min_score) or 0.92
+    local tail_padding = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_end_tail_padding_frames) or 0
+    local start_bias_frames = tonumber(normalize_bias_frames) or 0
+    local qwen_display_lead_frames = math.max(0, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_qwen_display_lead_frames) or 0)
+
+    for _, result in ipairs(results or {}) do
+        if SUBFIX_AUDIO_ALIGN.qwen_global_candidate_is_accepted(result) then
+            local row = result.row
+            local row_index = row_position and row_position[row]
+            local old_start = tonumber(row and row.start_frame) or nil
+            local old_end = tonumber(row and row.end_frame) or nil
+            local qwen_start = tonumber(result.ctc_start_frame) or tonumber(result.stable_ts_start_frame) or tonumber(result.new_start_frame)
+            local qwen_end = tonumber(result.ctc_end_frame)
+            if row_index and old_start and old_end and qwen_start then
+                local move_distance = math.abs(qwen_start - old_start)
+                local row_remap_score = tonumber(result.row_remap_score) or 0
+                local rejected_reason = nil
+                if move_distance > max_move_frames then
+                    rejected_reason = "rejected_large_move"
+                elseif move_distance > large_move_frames and row_remap_score < large_move_min_score then
+                    rejected_reason = "rejected_low_remap_score"
+                end
+
+                if not rejected_reason then
+                    local audio_source = result.audio_source or {}
+                    local audio_start = tonumber(audio_source.start_frame)
+                    local audio_end = tonumber(audio_source.end_frame)
+                    local new_start = math.floor(qwen_start + start_bias_frames - qwen_display_lead_frames)
+                    if audio_start and new_start < audio_start then
+                        new_start = audio_start
+                    else
+                        new_start = math.max(0, new_start)
+                    end
+                    local candidate = {
+                        result = result,
+                        row = row,
+                        row_index = row_index,
+                        old_start = old_start,
+                        old_end = old_end,
+                        old_duration = math.max(1, old_end - old_start),
+                        qwen_start = qwen_start,
+                        qwen_end = qwen_end,
+                        new_start = new_start,
+                        candidate_end = qwen_end and math.floor(qwen_end + start_bias_frames + tail_padding) or nil,
+                        start_bias_frames = start_bias_frames,
+                        qwen_display_lead_frames = qwen_display_lead_frames,
+                        audio_start = audio_start,
+                        audio_end = audio_end,
+                        row_remap_score = row_remap_score
+                    }
+                    candidates[#candidates + 1] = candidate
+                    candidate_by_row[row] = candidate
+                else
+                    result.qwen_global_writeback = false
+                    result.qwen_global_rejected_reason = rejected_reason
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return (a.row_index or 0) < (b.row_index or 0)
+    end)
+
+    local plan_by_row = {}
+    for index, candidate in ipairs(candidates) do
+        local row_index = candidate.row_index
+        local prev_row = row_index and rows[row_index - 1] or nil
+        local next_row = row_index and rows[row_index + 1] or nil
+        local prev_candidate = prev_row and candidate_by_row[prev_row] or nil
+        local next_candidate = next_row and candidate_by_row[next_row] or nil
+        local prev_end = prev_row and tonumber(prev_row.end_frame) or nil
+        local next_start = next_row and tonumber(next_row.start_frame) or nil
+        local prev_limit = prev_candidate and prev_candidate.new_start or prev_end
+        local next_qwen_start_frame = next_candidate and next_candidate.new_start or nil
+        local max_end = next_qwen_start_frame or next_start
+
+        if candidate.audio_end then
+            max_end = max_end and math.min(max_end, candidate.audio_end) or candidate.audio_end
+        end
+        if candidate.audio_start and candidate.new_start < candidate.audio_start then
+            candidate.new_start = candidate.audio_start
+        end
+
+        local decision = "preserved_already_aligned"
+        local should_apply = true
+        local new_start = candidate.new_start
+        local new_end = candidate.old_end
+        local end_decision = "rejected_no_ctc_end"
+
+        if prev_limit and new_start < prev_limit then
+            should_apply = false
+            decision = "rejected_order"
+        elseif next_start and not next_qwen_start_frame and new_start >= next_start then
+            should_apply = false
+            decision = "rejected_order"
+        elseif candidate.audio_end and new_start >= candidate.audio_end then
+            should_apply = false
+            decision = "rejected_order"
+        else
+            local min_end = new_start + min_duration
+            if max_end and max_end < min_end then
+                should_apply = false
+                decision = "rejected_order"
+            else
+                local candidate_end = candidate.candidate_end or (new_start + candidate.old_duration)
+                if next_qwen_start_frame then
+                    candidate_end = math.min(candidate_end, next_qwen_start_frame)
+                    end_decision = "qwen_global_boundary"
+                end
+                if max_end then
+                    candidate_end = math.min(candidate_end, max_end)
+                end
+                new_end = math.max(new_start + 1, math.max(min_end, candidate_end))
+                if max_end then
+                    new_end = math.min(new_end, max_end)
+                end
+                if new_end <= new_start then
+                    should_apply = false
+                    decision = "rejected_order"
+                elseif new_start < candidate.old_start then
+                    decision = "moved_backward_better"
+                elseif new_start > candidate.old_start then
+                    decision = "moved_forward_better"
+                elseif new_end ~= candidate.old_end then
+                    decision = "preserved_already_aligned"
+                end
+            end
+        end
+
+        plan_by_row[candidate.row] = {
+            should_apply = should_apply,
+            decision = decision,
+            final_start = should_apply and new_start or candidate.old_start,
+            final_end = should_apply and new_end or candidate.old_end,
+            can_move = should_apply,
+            start_bias_frames = candidate.start_bias_frames,
+            qwen_display_lead_frames = candidate.qwen_display_lead_frames,
+            end_decision = end_decision,
+            next_qwen_start_frame = next_qwen_start_frame,
+            qwen_candidate_index = index,
+            qwen_candidate_count = #candidates
+        }
+    end
+
+    return plan_by_row
 end
 
 function SUBFIX_AUDIO_ALIGN.reject_neighbor_gap_outlier(old_start, old_end, new_start, duration, prev_end, next_start)
@@ -9813,6 +10374,7 @@ function SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, f
         rejected_direction = "direction_rejected",
         rejected_not_better = "not_better",
         rejected_low_confidence = "low_confidence",
+        rejected_low_remap_score = "low_remap_score",
         rejected_neighbor_gap = "neighbor_gap_outlier",
         rejected_order = "order_blocked",
         rejected_unmatched = "unmatched",
@@ -9820,6 +10382,13 @@ function SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, f
     }
     local reason = reason_map[raw_decision] or raw_decision
     local move_frames = final_start - old_start_frame
+    local alignment_mode = tostring(result.alignment_mode or "")
+    local qwen_start_frame = nil
+    local qwen_end_frame = nil
+    if alignment_mode == "qwen3_forced_aligner" then
+        qwen_start_frame = tonumber(result.ctc_start_frame) or tonumber(result.stable_ts_start_frame) or tonumber(result.new_start_frame)
+        qwen_end_frame = tonumber(result.ctc_end_frame)
+    end
     local direction = "preserved"
     if move_frames > 0 then
         direction = "forward"
@@ -9827,8 +10396,11 @@ function SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, f
         direction = "backward"
     end
 
-	    return {
-	        row_index = tonumber(row.index) or tonumber(result.source_index) or 0,
+    return {
+        row_index = tonumber(row.index) or tonumber(result.source_index) or 0,
+        align_engine = alignment_mode == "qwen3_forced_aligner" and "qwen3_cpp" or tostring(result.align_engine or ""),
+        qwen_item_count = tonumber(result.qwen_item_count),
+        qwen_output_path = tostring(result.qwen_output_path or ""),
         text = tostring(row.text or ""),
         matched = result.matched == true,
         decision = raw_decision,
@@ -9836,17 +10408,32 @@ function SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, f
         old_start_frame = old_start_frame,
         old_end_frame = old_end_frame,
         stable_ts_candidate_frame = stable_ts_candidate_frame,
+        ctc_end_frame = tonumber(result.ctc_end_frame),
+        qwen_start_frame = qwen_start_frame,
+        qwen_end_frame = qwen_end_frame,
         stable_ts_move_frames = tonumber(result.stable_ts_move_frames),
         ctc_confidence = tonumber(result.ctc_confidence),
         ctc_char_count = tonumber(result.ctc_char_count),
-        alignment_pass = tostring(result.alignment_pass or "fast_pass"),
+	        row_remap_score = tonumber(result.row_remap_score),
+	        row_remap_decision = tostring(result.row_remap_decision or ""),
+	        remap_text_candidate = tostring(result.remap_text_candidate or ""),
+	        qwen_global_writeback = result.qwen_global_writeback == true,
+	        qwen_global_next_start_frame = tonumber(result.qwen_global_next_start_frame),
+	        qwen_global_candidate_index = tonumber(result.qwen_global_candidate_index),
+	        qwen_global_candidate_count = tonumber(result.qwen_global_candidate_count),
+	        qwen_display_lead_frames = tonumber(result.qwen_display_lead_frames),
+	        alignment_pass = tostring(result.alignment_pass or "fast_pass"),
         review_requested = result.review_requested == true,
         review_adopted = result.review_adopted == true,
         review_reason = tostring(result.review_reason or ""),
         review_rejected_reason = tostring(result.review_rejected_reason or ""),
         start_bias_frames = tonumber(result.start_bias_frames) or 0,
+        auto_bias_frames = tonumber(result.auto_bias_frames),
+        auto_bias_sample_count = tonumber(result.auto_bias_sample_count),
+        auto_bias_fallback = result.auto_bias_fallback == true,
         final_start_frame = final_start,
         final_end_frame = tonumber(row.end_frame) or tonumber(result.new_end_frame) or old_end_frame,
+        end_decision = tostring(result.end_decision or ""),
         move_frames = move_frames,
         direction = direction,
         can_move = can_move == true,
@@ -9891,6 +10478,13 @@ function SUBFIX_AUDIO_ALIGN.write_gap_fill_alignment_diagnostics(records, refere
         successful_batch_count = tonumber(reference_info and reference_info.successful_batch_count),
         failed_batch_count = tonumber(reference_info and reference_info.failed_batch_count),
         diagnostic = tostring(reference_info and reference_info.diagnostic or ""),
+        auto_bias_frames = tonumber(decision_counts and decision_counts.auto_bias_frames),
+        auto_bias_sample_count = tonumber(decision_counts and decision_counts.auto_bias_sample_count),
+        auto_bias_fallback = decision_counts and decision_counts.auto_bias_fallback == true,
+        end_corrected_count = tonumber(decision_counts and decision_counts.end_corrected_count),
+        align_engine = tostring(reference_info and reference_info.align_engine or decision_counts and decision_counts.align_engine or ""),
+        qwen_item_count = tonumber(reference_info and reference_info.qwen_item_count),
+        qwen_output_path = tostring(reference_info and reference_info.qwen_output_path or ""),
         decision_counts = decision_counts or {},
         records = records
     }
@@ -9910,18 +10504,24 @@ function SUBFIX_AUDIO_ALIGN.write_gap_fill_alignment_diagnostics(records, refere
         return text
     end
 
-	    local fields = {
-	        "row_index", "text", "matched", "decision", "reason",
-	        "old_start_frame", "stable_ts_candidate_frame", "final_start_frame",
-	        "move_frames", "direction", "ctc_confidence", "ctc_char_count",
-	        "alignment_pass", "review_requested", "review_adopted",
-	        "review_reason", "review_rejected_reason", "start_bias_frames",
-	        "previous_onset_frame", "previous_onset_delta_frames",
-	        "next_onset_frame", "next_onset_delta_frames", "audio_track_index",
-	        "audio_item_index", "audio_file_name", "resolved_audio_path",
-	        "audio_mapping_source", "audio_mapping_fallback_reason", "linked_offset_samples",
-	        "audio_channel_index", "audio_item_start_frame", "audio_item_end_frame"
-	    }
+    local fields = {
+        "align_engine", "qwen_item_count", "qwen_output_path",
+        "row_index", "text", "matched", "decision", "reason",
+        "old_start_frame", "old_end_frame", "stable_ts_candidate_frame", "ctc_end_frame",
+	        "qwen_start_frame", "qwen_end_frame",
+	        "final_start_frame", "final_end_frame", "move_frames", "direction",
+	        "ctc_confidence", "ctc_char_count", "row_remap_score", "row_remap_decision",
+	        "remap_text_candidate", "qwen_global_writeback", "qwen_global_next_start_frame",
+	        "qwen_global_candidate_index", "qwen_global_candidate_count", "qwen_display_lead_frames",
+	        "alignment_pass", "review_requested",
+        "review_adopted", "review_reason", "review_rejected_reason", "start_bias_frames",
+        "auto_bias_frames", "auto_bias_sample_count", "auto_bias_fallback", "end_decision",
+        "previous_onset_frame", "previous_onset_delta_frames",
+        "next_onset_frame", "next_onset_delta_frames", "audio_track_index",
+        "audio_item_index", "audio_file_name", "resolved_audio_path",
+        "audio_mapping_source", "audio_mapping_fallback_reason", "linked_offset_samples",
+        "audio_channel_index", "audio_item_start_frame", "audio_item_end_frame"
+    }
     local csv_file = io.open(csv_path, "w")
     if not csv_file then
         return nil, "无法写入诊断 CSV: " .. tostring(csv_path)
@@ -10026,6 +10626,9 @@ function SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, fps, bia
                     result.batch_index = batch_index
                     result.audio_source = audio_source
                     result.local_onset_frames = reference_info.local_onset_frames
+                    result.align_engine = align_engine
+                    result.qwen_item_count = tonumber(batch_payload.diagnostic and batch_payload.diagnostic.qwen_item_count)
+                    result.qwen_output_path = tostring(batch_payload.diagnostic and batch_payload.diagnostic.qwen_output_path or "")
                     results[#results + 1] = result
                 end
                 if progress then
@@ -10135,19 +10738,33 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
         return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, plan_err)
     end
 
+    local align_engine = SUBFIX_AUDIO_ALIGN.resolve_normalize_align_engine(paths)
+    local helper_mode = "ctc_align_text_batches"
+    local helper_label = "批量 CTC 文本对齐"
+    local progress_stage = "CTC 对齐"
+    local source_label = "主讲轨批量 CTC"
+    local mapping_mode = "ctc_text_alignment_batches"
+    if align_engine == "qwen3_cpp" then
+        helper_mode = "qwen_forced_align_text_batches"
+        helper_label = "批量 Qwen3 forced alignment"
+        progress_stage = "Qwen3 对齐"
+        source_label = "主讲轨批量 Qwen3"
+        mapping_mode = "qwen3_forced_align_text_batches"
+    end
+
     if progress then
         update_normalize_progress({
-            stage = "CTC 对齐",
+            stage = progress_stage,
             current_batch = 0,
             total_batches = batch_total,
-            message = "正在启动批量 CTC helper...",
-            log = string.format("启动批量 CTC helper，共 %d 批", batch_total)
+            message = "正在启动" .. helper_label .. "...",
+            log = string.format("启动%s，共 %d 批", helper_label, batch_total)
         })
     end
     local cmd_parts = {
         shell_quote(paths.python),
         shell_quote(paths.helper),
-        "--mode", "ctc_align_text_batches",
+        "--mode", helper_mode,
         "--batch-plan-json", shell_quote(batch_plan_path),
         "--output", shell_quote(output_path),
         "--model", shell_quote(SUBFIX_AUDIO_ALIGN.default_ctc_model),
@@ -10158,7 +10775,7 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
     local ok, output, status = run_subfix_background_command(table.concat(cmd_parts, " "), {
         progress = progress,
         progress_path = progress_path,
-        label = "批量 CTC 文本对齐"
+        label = helper_label
     })
     if status == "cancelled" then
         return nil, { cancelled = true, diagnostic = "已取消" }
@@ -10166,24 +10783,27 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
     local payload_text = read_text_file(output_path)
     local payload, decode_err = decode_json_text(payload_text or "")
     if not payload then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, "批量 CTC 输出解析失败: " .. tostring(decode_err or output))
+        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, helper_label .. "输出解析失败: " .. tostring(decode_err or output))
     end
     if payload.ok == false then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, tostring(payload.error or output or "批量 CTC 文本对齐失败"))
+        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, tostring(payload.error or output or helper_label .. "失败"))
     end
     if not ok then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, "批量 CTC 执行失败: " .. tostring(output or ""))
+        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, helper_label .. "执行失败: " .. tostring(output or ""))
     end
 
     local summary = {
         audio_track_index = batch_plan and batch_plan.track_index,
-        audio_source_name = "主讲轨批量 CTC",
+        audio_source_name = source_label,
         processed_batch_count = batch_total,
         successful_batch_count = 0,
         failed_batch_count = 0,
         unassigned_count = #(batch_plan and batch_plan.unassigned_rows or {}),
         speech_segment_count = 0,
-        mapping_mode = "ctc_text_alignment_batches",
+        mapping_mode = mapping_mode,
+        align_engine = align_engine,
+        qwen_item_count = tonumber(payload and payload.diagnostic and payload.diagnostic.qwen_item_count),
+        qwen_output_path = tostring(payload and payload.diagnostic and payload.diagnostic.qwen_output_path or ""),
         onset_corrected_count = 0,
         onset_pullback_total_frames = 0,
         batch_failures = {},
@@ -10212,13 +10832,13 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
         local batch_payload = batch_payload_by_id[tostring(batch_index)] or {}
         if progress then
             update_normalize_progress({
-                stage = "CTC 对齐",
+                stage = progress_stage,
                 current_batch = batch_index,
                 total_batches = batch_total,
                 processed_rows = processed_rows,
                 audio_label = string.format("A%d #%d %s", tonumber(audio_source.track_index) or 0, tonumber(audio_source.item_index) or batch_index, tostring(range_label)),
                 message = string.format("正在处理第 %d/%d 批，字幕 %d 条", batch_index, batch_total, #batch_rows),
-                log = string.format("读取批量 CTC 第 %d/%d 批结果", batch_index, batch_total)
+                log = string.format("读取%s第 %d/%d 批结果", helper_label, batch_index, batch_total)
             })
         end
         local reference_err = nil
@@ -10229,8 +10849,8 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
                 model = tostring(payload.model or SUBFIX_AUDIO_ALIGN.default_ctc_model),
                 local_onset_frames = SUBFIX_AUDIO_ALIGN.map_stable_ts_onsets_to_frames(batch_payload.speech_onsets, audio_source, fps),
                 speech_segment_count = #batch_payload.aligned_rows,
-                mapping_mode = "ctc_text_alignment_batches",
-                diagnostic = "ctc_batch_text_segments=" .. tostring(#batch_payload.aligned_rows)
+                mapping_mode = mapping_mode,
+                diagnostic = "align_batch_text_segments=" .. tostring(#batch_payload.aligned_rows)
             }
             local batch_results, match_err = SUBFIX_AUDIO_ALIGN.match_rows_to_stable_ts(batch_rows, reference_info.rows, {
                 bias_frames = bias_frames,
@@ -10264,10 +10884,10 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
                     })
                 end
             else
-                reference_err = match_err or "批量 CTC 匹配失败"
+                reference_err = match_err or (helper_label .. "匹配失败")
             end
         else
-            reference_err = tostring(batch_payload.error or "批量 CTC 未返回当前 batch 的完整对齐结果")
+            reference_err = tostring(batch_payload.error or helper_label .. "未返回当前 batch 的完整对齐结果")
         end
 
         if reference_err then
@@ -10296,7 +10916,7 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
     if #summary.batch_failures > 0 then
         summary.diagnostic = table.concat(summary.batch_failures, "\n")
     else
-        summary.diagnostic = string.format("主讲轨 A%d，音频片段 %d 个，批量 CTC 全部成功。", tonumber(summary.audio_track_index) or 0, tonumber(summary.processed_batch_count) or 0)
+        summary.diagnostic = string.format("主讲轨 A%d，音频片段 %d 个，%s全部成功。", tonumber(summary.audio_track_index) or 0, tonumber(summary.processed_batch_count) or 0, helper_label)
     end
     return results, summary
 end
@@ -10544,9 +11164,14 @@ function SUBFIX_AUDIO_ALIGN.copy_review_result_into_fast_result(fast_result, rev
     fast_result.new_start_frame = review_result.new_start_frame
     fast_result.new_end_frame = review_result.new_end_frame
     fast_result.stable_ts_start_frame = review_result.stable_ts_start_frame
+    fast_result.ctc_start_frame = review_result.ctc_start_frame
+    fast_result.ctc_end_frame = review_result.ctc_end_frame
     fast_result.stable_ts_move_frames = review_result.stable_ts_move_frames
     fast_result.ctc_confidence = review_result.ctc_confidence
     fast_result.ctc_char_count = review_result.ctc_char_count
+    fast_result.row_remap_score = review_result.row_remap_score
+    fast_result.row_remap_decision = review_result.row_remap_decision
+    fast_result.remap_text_candidate = review_result.remap_text_candidate
     fast_result.stable_ts_large_move_preserved = review_result.stable_ts_large_move_preserved
     fast_result.onset_corrected = review_result.onset_corrected
     fast_result.local_onset_delta_frames = review_result.local_onset_delta_frames
@@ -11034,9 +11659,15 @@ function SUBFIX_AUDIO_ALIGN.match_rows_to_stable_ts(source_rows, aligned_rows, o
         local row_end = tonumber(target_row and target_row.end_frame) or row_start + 1
         local original_duration = math.max(1, row_end - row_start)
         local stable_ts_start_frame = tonumber(aligned_row and aligned_row.start_frame) or row_start
+        local ctc_start_frame = tonumber(aligned_row and aligned_row.ctc_start_frame)
+        local ctc_end_frame = tonumber(aligned_row and aligned_row.ctc_end_frame)
         local ctc_confidence = tonumber(aligned_row and aligned_row.ctc_confidence)
         local ctc_char_count = tonumber(aligned_row and aligned_row.ctc_char_count)
+        local row_remap_score = tonumber(aligned_row and aligned_row.row_remap_score)
+        local row_remap_decision = tostring(aligned_row and aligned_row.row_remap_decision or "")
+        local remap_text_candidate = tostring(aligned_row and aligned_row.remap_text_candidate or "")
         local is_ctc_candidate = ctc_confidence ~= nil or ctc_char_count ~= nil
+        local aligned_mode = tostring(aligned_row and aligned_row.alignment_mode or "")
         local stable_ts_move_frames = stable_ts_start_frame - row_start
         local stable_ts_large_move_preserved = false
         if math.abs(stable_ts_move_frames) > (tonumber(options.max_stable_ts_move_frames) or SUBFIX_AUDIO_ALIGN.max_stable_ts_move_frames) then
@@ -11103,13 +11734,18 @@ function SUBFIX_AUDIO_ALIGN.match_rows_to_stable_ts(source_rows, aligned_rows, o
                 new_start_frame = start_frame,
                 new_end_frame = end_frame,
                 stable_ts_start_frame = stable_ts_start_frame,
+                ctc_start_frame = ctc_start_frame,
+                ctc_end_frame = ctc_end_frame,
                 stable_ts_move_frames = stable_ts_move_frames,
                 ctc_confidence = ctc_confidence,
                 ctc_char_count = ctc_char_count,
+                row_remap_score = row_remap_score,
+                row_remap_decision = row_remap_decision,
+                remap_text_candidate = remap_text_candidate,
                 stable_ts_large_move_preserved = stable_ts_large_move_preserved,
                 onset_corrected = onset_corrected,
                 local_onset_delta_frames = local_onset_delta_frames,
-                alignment_mode = is_ctc_candidate and "ctc_forced_alignment" or (stable_ts_large_move_preserved and "stable_ts_large_move" or "stable_ts_forced_alignment_gapless")
+                alignment_mode = aligned_mode ~= "" and aligned_mode or (is_ctc_candidate and "ctc_forced_alignment" or (stable_ts_large_move_preserved and "stable_ts_large_move" or "stable_ts_forced_alignment_gapless"))
             }
         end
     end
@@ -11219,6 +11855,8 @@ end
 function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, fps, options)
     options = type(options) == "table" and options or {}
     local normalize_progress = options.progress
+    local normalize_bias_mode = tostring(options.bias_mode or "manual")
+    local normalize_start_mode = tostring(options.start_mode or "balanced")
     local normalize_bias_frames = SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(options.bias_frames)
     if not rows or #rows == 0 then
         return nil, false, "没有字幕数据", nil
@@ -11330,9 +11968,34 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
         update_normalize_progress({stage = "应用修正", message = "正在评估并应用安全时间码修正...", log = "开始评估受保护时间码修正"})
     end
 
+    local auto_bias_sample_count = 0
+    local auto_bias_fallback = false
+    if normalize_bias_mode == "auto" then
+        normalize_bias_frames, auto_bias_sample_count, auto_bias_fallback = SUBFIX_AUDIO_ALIGN.resolve_normalize_length_auto_bias(results)
+        if reference_info then
+            reference_info.diagnostic = tostring(reference_info.diagnostic or "") ..
+                string.format("\nauto_bias_frames=%d samples=%d fallback=%s", normalize_bias_frames, auto_bias_sample_count, tostring(auto_bias_fallback == true))
+        end
+        if normalize_progress then
+            local bias_log = auto_bias_fallback
+                and string.format("自动偏移样本不足（%d 条），回退 %+d 帧", auto_bias_sample_count, normalize_bias_frames)
+                or string.format("自动偏移校准为 %+d 帧，样本 %d 条", normalize_bias_frames, auto_bias_sample_count)
+            update_normalize_progress({message = bias_log, log = bias_log})
+        end
+    end
+
     local aligned_count = 0
     local matched_count = 0
     local blocked_count = 0
+    local ctc_min_confidence = normalize_start_mode == "aggressive"
+        and SUBFIX_AUDIO_ALIGN.min_ctc_confidence
+        or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_move_min_confidence
+    local ctc_large_move_frames = normalize_start_mode == "aggressive"
+        and SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames
+        or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_frames
+    local ctc_large_move_min_confidence = normalize_start_mode == "aggressive"
+        and SUBFIX_AUDIO_ALIGN.min_ctc_confidence
+        or SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_min_confidence
     local decision_counts = {
         preserved_already_aligned = 0,
         moved_forward_better = 0,
@@ -11343,15 +12006,21 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
         rejected_direction = 0,
         rejected_order = 0,
         rejected_low_confidence = 0,
+        rejected_low_remap_score = 0,
         rejected_neighbor_gap = 0,
         rejected_unmatched = 0,
+        auto_bias_frames = normalize_bias_frames,
+        auto_bias_sample_count = auto_bias_sample_count,
+        auto_bias_fallback = auto_bias_fallback == true,
+        end_corrected_count = 0,
         review_requested_count = tonumber(reference_info and reference_info.review_requested_count) or 0,
         review_adopted_count = tonumber(reference_info and reference_info.review_adopted_count) or 0,
         review_rejected_count = tonumber(reference_info and reference_info.review_rejected_count) or 0
-    }
-    local diagnostic_records = {}
+	    }
+	    local diagnostic_records = {}
+	    local qwen_global_plan_by_row = SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_position, fps, normalize_bias_frames)
 
-    for _, result in ipairs(results or {}) do
+	    for _, result in ipairs(results or {}) do
         if is_normalize_progress_cancelled() then
             return nil, false, "已取消", {cancelled = true}
         end
@@ -11363,100 +12032,180 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
             diagnostic_records[#diagnostic_records + 1] =
                 SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, result.old_start_frame, result.protected_decision, false, fps)
         end
-        if result.matched and result.row then
-            local row = result.row
-            local row_index = row_position[row]
-            local old_start = tonumber(row.start_frame) or 0
-            local old_end = tonumber(row.end_frame) or (old_start + 1)
-            local duration = math.max(1, old_end - old_start)
-            local candidate_start = tonumber(result.stable_ts_start_frame) or tonumber(result.new_start_frame) or old_start
-            local new_start, should_move, decision, original_onset_distance, candidate_onset_distance, onset_improvement = old_start, false, "rejected_no_onset", nil, nil, nil
+	        if result.matched and result.row then
+	            local row = result.row
+	            local row_index = row_position[row]
+	            local old_start = tonumber(row.start_frame) or 0
+	            local old_end = tonumber(row.end_frame) or (old_start + 1)
+	            local duration = math.max(1, old_end - old_start)
+	            local qwen_global_plan = qwen_global_plan_by_row[row]
+	            if qwen_global_plan then
+	                local final_start = qwen_global_plan.final_start
+	                local new_end = qwen_global_plan.final_end
+	                local decision = qwen_global_plan.decision or "rejected_order"
+	                local can_move = qwen_global_plan.can_move == true
+	                result.qwen_global_writeback = can_move
+	                result.qwen_global_next_start_frame = qwen_global_plan.next_qwen_start_frame
+	                result.qwen_global_candidate_index = qwen_global_plan.qwen_candidate_index
+	                result.qwen_global_candidate_count = qwen_global_plan.qwen_candidate_count
+	                result.qwen_display_lead_frames = qwen_global_plan.qwen_display_lead_frames
+	                result.start_bias_frames = qwen_global_plan.start_bias_frames or 0
+	                result.biased_candidate_start_frame = final_start
+	                result.auto_bias_frames = normalize_bias_frames
+	                result.auto_bias_sample_count = auto_bias_sample_count
+	                result.auto_bias_fallback = auto_bias_fallback == true
+	                result.end_decision = qwen_global_plan.end_decision or "qwen_global_writeback"
+	                result.original_onset_distance = nil
+	                result.candidate_onset_distance = nil
+	                result.onset_improvement_frames = nil
 
-            if result.stable_ts_large_move_preserved then
-                decision = "rejected_large_move"
-            elseif result.alignment_mode == "ctc_forced_alignment" or result.ctc_confidence ~= nil then
-                new_start, should_move, decision, original_onset_distance, candidate_onset_distance, onset_improvement =
-                    SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_start(old_start, candidate_start, result.ctc_confidence, {
-                        origin_guard_frames = SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames,
-                        max_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames,
-                        min_confidence = SUBFIX_AUDIO_ALIGN.min_ctc_confidence
-                    })
-            else
-                new_start, should_move, decision, original_onset_distance, candidate_onset_distance, onset_improvement =
-                    SUBFIX_AUDIO_ALIGN.protected_audio_candidate_start(old_start, candidate_start, result.local_onset_frames, {
-                        origin_guard_frames = SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames,
-                        max_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_audio_move_frames,
-                        min_improvement_frames = SUBFIX_AUDIO_ALIGN.normalize_length_min_improvement_frames,
-                        forward_search_frames = SUBFIX_AUDIO_ALIGN.normalize_length_forward_search_frames,
-                        backward_search_frames = SUBFIX_AUDIO_ALIGN.normalize_length_backward_search_frames
-                    })
-            end
+	                if can_move and (final_start ~= old_start or new_end ~= old_end) then
+	                    row.start_frame = final_start
+	                    row.end_frame = math.max(final_start + 1, new_end)
+	                    row.target_abs_frame = math.floor((row.start_frame + row.end_frame) / 2)
+	                    aligned_count = aligned_count + 1
+	                    if new_end ~= old_end then
+	                        decision_counts.end_corrected_count = (tonumber(decision_counts.end_corrected_count) or 0) + 1
+	                    end
+	                elseif not can_move and final_start ~= old_start then
+	                    blocked_count = blocked_count + 1
+	                end
 
-            local start_bias_frames = normalize_bias_frames
-            local applied_start_bias_frames = 0
-            local can_apply_user_bias = should_move or decision == "preserved_already_aligned"
-            if can_apply_user_bias and start_bias_frames ~= 0 then
-                local biased_start = math.max(0, math.floor(new_start + start_bias_frames))
-                if biased_start ~= old_start then
-                    new_start = biased_start
-                    should_move = true
-                    if decision == "preserved_already_aligned" then
-                        decision = new_start < old_start and "moved_backward_better" or "moved_forward_better"
-                    end
-                end
-                applied_start_bias_frames = start_bias_frames
-            end
-            result.start_bias_frames = applied_start_bias_frames
-            result.biased_candidate_start_frame = new_start
+	                decision_counts[decision] = (decision_counts[decision] or 0) + 1
+	                result.protected_decision = decision
+	                diagnostic_records[#diagnostic_records + 1] =
+	                    SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, row.start_frame, decision, can_move, fps)
+	            else
+	                local candidate_start = tonumber(result.stable_ts_start_frame) or tonumber(result.new_start_frame) or old_start
+	                local new_start, should_move, decision, original_onset_distance, candidate_onset_distance, onset_improvement = old_start, false, "rejected_no_onset", nil, nil, nil
 
-            local prev_row = row_index and rows[row_index - 1] or nil
-            local next_row = row_index and rows[row_index + 1] or nil
-            local prev_start = prev_row and tonumber(prev_row.start_frame) or nil
-            local prev_end = prev_row and tonumber(prev_row.end_frame) or nil
-            local next_start = next_row and tonumber(next_row.start_frame) or nil
-            local reject_neighbor_gap = false
-            if should_move and new_start ~= old_start then
-                reject_neighbor_gap = SUBFIX_AUDIO_ALIGN.reject_neighbor_gap_outlier(old_start, old_end, new_start, duration, prev_end, next_start)
-                if reject_neighbor_gap then
-                    should_move = false
-                    new_start = old_start
-                    decision = "rejected_neighbor_gap"
-                end
-            end
-            local audio_source = result.audio_source or {}
-            local audio_start = tonumber(audio_source.start_frame)
-            local audio_end = tonumber(audio_source.end_frame)
-            local can_move = new_start > 0
-                and (not prev_start or new_start > prev_start)
-                and (not prev_end or new_start >= prev_end)
-                and (not next_start or new_start < next_start)
-                and (not audio_start or new_start >= audio_start)
-                and (not audio_end or new_start < audio_end)
+	                if result.stable_ts_large_move_preserved then
+	                    decision = "rejected_large_move"
+	                elseif result.alignment_mode == "ctc_forced_alignment" or result.ctc_confidence ~= nil then
+	                    new_start, should_move, decision, original_onset_distance, candidate_onset_distance, onset_improvement =
+	                        SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_start(old_start, candidate_start, result.ctc_confidence, {
+	                            origin_guard_frames = SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames,
+	                            max_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames,
+	                            min_confidence = ctc_min_confidence,
+	                            large_move_frames = ctc_large_move_frames,
+	                            large_move_min_confidence = ctc_large_move_min_confidence,
+	                            onset_guard_frames = SUBFIX_AUDIO_ALIGN.normalize_length_original_onset_guard_frames,
+	                            onset_override_min_confidence = SUBFIX_AUDIO_ALIGN.normalize_length_ctc_onset_override_min_confidence,
+	                            min_onset_improvement_frames = SUBFIX_AUDIO_ALIGN.normalize_length_ctc_min_onset_improvement_frames,
+	                            preserve_original_onset = normalize_start_mode == "conservative",
+	                            require_onset_improvement = normalize_start_mode == "conservative",
+	                            alignment_mode = result.alignment_mode,
+	                            row_remap_score = result.row_remap_score,
+	                            row_remap_decision = result.row_remap_decision,
+	                            qwen_remap_min_score = SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_min_score,
+	                            qwen_remap_large_move_min_score = SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_large_move_min_score,
+	                            local_onset_frames = result.local_onset_frames
+	                        })
+	                else
+	                    new_start, should_move, decision, original_onset_distance, candidate_onset_distance, onset_improvement =
+	                        SUBFIX_AUDIO_ALIGN.protected_audio_candidate_start(old_start, candidate_start, result.local_onset_frames, {
+	                            origin_guard_frames = SUBFIX_AUDIO_ALIGN.normalize_length_origin_guard_frames,
+	                            max_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_audio_move_frames,
+	                            min_improvement_frames = SUBFIX_AUDIO_ALIGN.normalize_length_min_improvement_frames,
+	                            forward_search_frames = SUBFIX_AUDIO_ALIGN.normalize_length_forward_search_frames,
+	                            backward_search_frames = SUBFIX_AUDIO_ALIGN.normalize_length_backward_search_frames
+	                        })
+	                end
 
-            if should_move and can_move and new_start ~= old_start then
-                local new_end = new_start + duration
-                if next_start and new_end > next_start then
-                    new_end = next_start
-                end
+	                local start_bias_frames = normalize_bias_frames
+	                local applied_start_bias_frames = 0
+	                local can_apply_user_bias = should_move or (normalize_bias_mode ~= "auto" and decision == "preserved_already_aligned")
+	                if can_apply_user_bias and start_bias_frames ~= 0 then
+	                    local biased_start = math.max(0, math.floor(new_start + start_bias_frames))
+	                    if biased_start ~= old_start then
+	                        new_start = biased_start
+	                        should_move = true
+	                        if decision == "preserved_already_aligned" then
+	                            decision = new_start < old_start and "moved_backward_better" or "moved_forward_better"
+	                        end
+	                    end
+	                    applied_start_bias_frames = start_bias_frames
+	                end
+	                result.start_bias_frames = applied_start_bias_frames
+	                result.biased_candidate_start_frame = new_start
+	                result.auto_bias_frames = normalize_bias_frames
+	                result.auto_bias_sample_count = auto_bias_sample_count
+	                result.auto_bias_fallback = auto_bias_fallback == true
 
-                row.start_frame = new_start
-                row.end_frame = math.max(new_start + 1, new_end)
-                row.target_abs_frame = math.floor((row.start_frame + row.end_frame) / 2)
-                aligned_count = aligned_count + 1
-            elseif should_move and new_start ~= old_start then
-                blocked_count = blocked_count + 1
-                decision = "rejected_order"
-            end
+	                local prev_row = row_index and rows[row_index - 1] or nil
+	                local next_row = row_index and rows[row_index + 1] or nil
+	                local prev_start = prev_row and tonumber(prev_row.start_frame) or nil
+	                local prev_end = prev_row and tonumber(prev_row.end_frame) or nil
+	                local next_start = next_row and tonumber(next_row.start_frame) or nil
+	                local reject_neighbor_gap = false
+	                if should_move and new_start ~= old_start then
+	                    reject_neighbor_gap = SUBFIX_AUDIO_ALIGN.reject_neighbor_gap_outlier(old_start, old_end, new_start, duration, prev_end, next_start)
+	                    if reject_neighbor_gap then
+	                        should_move = false
+	                        new_start = old_start
+	                        decision = "rejected_neighbor_gap"
+	                    end
+	                end
+	                local audio_source = result.audio_source or {}
+	                local audio_start = tonumber(audio_source.start_frame)
+	                local audio_end = tonumber(audio_source.end_frame)
+	                local can_move = new_start > 0
+	                    and (not prev_start or new_start > prev_start)
+	                    and (not prev_end or new_start >= prev_end)
+	                    and (not next_start or new_start < next_start)
+	                    and (not audio_start or new_start >= audio_start)
+	                    and (not audio_end or new_start < audio_end)
 
-            decision_counts[decision] = (decision_counts[decision] or 0) + 1
-            result.protected_decision = decision
-            result.original_onset_distance = original_onset_distance
-            result.candidate_onset_distance = candidate_onset_distance
-            result.onset_improvement_frames = onset_improvement
-            diagnostic_records[#diagnostic_records + 1] =
-                SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, row.start_frame, decision, can_move, fps)
-        end
-    end
+	                local final_start = old_start
+	                if should_move and can_move and new_start ~= old_start then
+	                    final_start = new_start
+	                    aligned_count = aligned_count + 1
+	                elseif should_move and new_start ~= old_start then
+	                    blocked_count = blocked_count + 1
+	                    decision = "rejected_order"
+	                end
+
+	                local new_end = final_start + duration
+	                if next_start and new_end > next_start then
+	                    new_end = next_start
+	                end
+	                local can_use_ctc_end = tonumber(result.ctc_end_frame) ~= nil
+	                if result.alignment_mode == "qwen3_forced_aligner" then
+	                    local end_remap_score = tonumber(result.row_remap_score) or 0
+	                    can_use_ctc_end = result.row_remap_decision == "accepted_local_match"
+	                        and end_remap_score >= SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_min_score
+	                end
+	                local ctc_candidate_end = nil
+	                if can_use_ctc_end and tonumber(result.ctc_end_frame) then
+	                    ctc_candidate_end = tonumber(result.ctc_end_frame) + applied_start_bias_frames + (tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_end_tail_padding_frames) or 0)
+	                end
+	                local corrected_end, end_changed, end_decision =
+	                    SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_end(final_start, old_end, ctc_candidate_end, result.ctc_confidence, next_start, audio_end, fps)
+	                if end_changed then
+	                    new_end = corrected_end
+	                    decision_counts.end_corrected_count = (tonumber(decision_counts.end_corrected_count) or 0) + 1
+	                end
+	                result.end_decision = end_decision
+
+	                if final_start ~= old_start or new_end ~= old_end then
+	                    row.start_frame = final_start
+	                    row.end_frame = math.max(final_start + 1, new_end)
+	                    row.target_abs_frame = math.floor((row.start_frame + row.end_frame) / 2)
+	                    if final_start == old_start and new_end ~= old_end then
+	                        aligned_count = aligned_count + 1
+	                    end
+	                end
+
+	                decision_counts[decision] = (decision_counts[decision] or 0) + 1
+	                result.protected_decision = decision
+	                result.original_onset_distance = original_onset_distance
+	                result.candidate_onset_distance = candidate_onset_distance
+	                result.onset_improvement_frames = onset_improvement
+	                diagnostic_records[#diagnostic_records + 1] =
+	                    SUBFIX_AUDIO_ALIGN.build_gap_fill_alignment_diagnostic_record(result, row.start_frame, decision, can_move, fps)
+	            end
+	        end
+	    end
 
     if normalize_progress then
         update_normalize_progress({stage = "写诊断", message = "正在写入规整诊断文件...", log = "写入规整诊断文件"})
@@ -11789,7 +12538,10 @@ local function refresh_subtitles(target_window, options)
     print("[Hooper AI 2.0] 开始刷新字幕列表...")
     local refresh_total_started_at = os.clock()
 
-    local function fail_refresh(message)
+    local function fail_refresh(message, fail_options)
+        fail_options = fail_options or {}
+        local show_generate_cta = fail_options.show_generate_cta == true
+        local placeholder_message = show_generate_cta and "时间线上还没有字幕哦" or message
         invalidate_search_cache("refresh_failed")
         if message and message ~= "" then
             update_shared_status(window, message)
@@ -11808,8 +12560,8 @@ local function refresh_subtitles(target_window, options)
         clear_tree_for_window(window)
         set_current_preview_source(PREVIEW_SOURCE_TIMELINE)
         reset_backup_selector_to_placeholder()
-        if options.show_loading_placeholder then
-            set_mini_subtitle_area_state(window, false, message or "字幕加载失败，请稍后重试")
+        if options.show_loading_placeholder or show_generate_cta then
+            set_mini_subtitle_area_state(window, false, placeholder_message or "字幕加载失败，请稍后重试", show_generate_cta)
         end
         return false
     end
@@ -11865,7 +12617,7 @@ local function refresh_subtitles(target_window, options)
 
     if track_count == 0 then
         print("[Hooper AI 2.0] 没有字幕轨道")
-        return fail_refresh("没有字幕轨道")
+        return fail_refresh("没有字幕轨道", {show_generate_cta = true})
     end
 
     if current_track > track_count then
@@ -11884,7 +12636,7 @@ local function refresh_subtitles(target_window, options)
         if current_work_scope.mode == WORK_SCOPE_MODE_SELECTION then
             items = {}
         else
-            return fail_refresh("轨道 " .. tostring(current_track) .. " 上没有字幕")
+            return fail_refresh("轨道 " .. tostring(current_track) .. " 上没有字幕", {show_generate_cta = true})
         end
     end
 
@@ -11929,6 +12681,15 @@ local function refresh_subtitles(target_window, options)
     sort_rows_by_timing(rows)
     print(string.format("[Hooper AI 2.0] 字幕归一化与排序耗时: %d ms", math.floor(((os.clock() - normalize_started_at) * 1000) + 0.5)))
 
+    if #rows == 0 then
+        print("[Hooper AI 2.0] 当前范围内没有字幕")
+        return fail_refresh("当前范围内没有字幕", {show_generate_cta = true})
+    end
+    if not rows_have_usable_subtitle_text(rows) then
+        print("[Hooper AI 2.0] 当前范围内只有空字幕")
+        return fail_refresh("当前范围内只有空字幕", {show_generate_cta = true})
+    end
+
     local render_started_at = os.clock()
     rebuild_tree_from_rows(rows, window, {skip_sort = true})
     print(string.format("[Hooper AI 2.0] 字幕树渲染耗时: %d ms", math.floor(((os.clock() - render_started_at) * 1000) + 0.5)))
@@ -11970,6 +12731,54 @@ local function refresh_subtitles(target_window, options)
         math.floor(((os.clock() - refresh_total_started_at) * 1000) + 0.5),
         startup_elapsed_ms()))
 
+    return true
+end
+
+function load_generate_selection_core_for_subfix()
+    local script_root = SUBFIX_AUDIO_ALIGN and SUBFIX_AUDIO_ALIGN.resolve_support_root and SUBFIX_AUDIO_ALIGN.resolve_support_root() or "."
+    -- Keep the shared core under .subfix_support so Resolve only lists user-facing entry scripts.
+    local core_path = tostring(script_root or "."):gsub("[/\\]$", "") .. "/.subfix_support/subfix_generate_selection_core.lua"
+    local chunk, load_err = loadfile(core_path)
+    if not chunk then
+        return nil, "缺少生成模块: " .. core_path .. " " .. tostring(load_err or ""), script_root
+    end
+
+    local ok, core_or_err = pcall(chunk)
+    if not ok then
+        return nil, "生成模块初始化失败: " .. tostring(core_or_err), script_root
+    end
+    if type(core_or_err) ~= "table" or type(core_or_err.run) ~= "function" then
+        return nil, "生成模块接口无效: " .. core_path, script_root
+    end
+    return core_or_err, nil, script_root
+end
+
+function run_generate_selection_subtitles_from_subfix(target_window)
+    local window = resolve_window(target_window)
+    update_shared_status(window, "正在生成选区字幕...")
+
+    local core, core_err, script_root = load_generate_selection_core_for_subfix()
+    if not core then
+        update_shared_status(window, core_err or "无法加载生成模块")
+        return false
+    end
+
+    local ok, run_err = core.run({
+        script_root = script_root,
+        target_subtitle_track = 1
+    })
+    if not ok then
+        local message = tostring(run_err or "生成选区字幕失败")
+        if message:find("已取消", 1, true) then
+            update_shared_status(window, "已取消生成字幕")
+        else
+            update_shared_status(window, "生成选区字幕失败: " .. message)
+        end
+        return false
+    end
+
+    update_shared_status(window, "选区字幕已生成，正在刷新...")
+    refresh_subtitles(window, {show_loading_placeholder = true})
     return true
 end
 
@@ -12304,6 +13113,100 @@ local function do_search(target_window)
     SEARCH_VIEW.render_current_view(window)
 end
 
+function resolve_subtitle_navigation_frame(row, timeline)
+    local candidate_frame = tonumber(row and row.start_frame)
+    if not candidate_frame then
+        candidate_frame = tonumber(row and row.target_abs_frame) or 0
+    end
+    candidate_frame = math.max(0, math.floor(candidate_frame + 0.5))
+
+    local timeline_start_frame = tonumber(current_tl_start_frame) or 0
+    if timeline then
+        local ok_start, start_frame = pcall(function() return timeline:GetStartFrame() end)
+        if ok_start and tonumber(start_frame) then
+            timeline_start_frame = tonumber(start_frame)
+        end
+    end
+    timeline_start_frame = math.max(0, math.floor(timeline_start_frame + 0.5))
+
+    -- Resolve may report the first subtitle one frame before the timeline start; SetCurrentTimecode rejects that.
+    return math.max(timeline_start_frame, candidate_frame)
+end
+
+function timecode_to_frame_count(timecode, fps)
+    local hh, mm, ss, sep, ff = tostring(timecode or ""):match("^(%d+):(%d+):(%d+)([:;,%.])(%d+)$")
+    if not hh then
+        return nil, nil
+    end
+
+    local fps_int = math.max(1, math.floor((tonumber(fps) or current_fps or 24) + 0.5))
+    hh = tonumber(hh) or 0
+    mm = tonumber(mm) or 0
+    ss = tonumber(ss) or 0
+    ff = tonumber(ff) or 0
+
+    local frame_count = ((hh * 3600 + mm * 60 + ss) * fps_int) + ff
+    if sep == ";" or sep == "," then
+        local drop_frames = math.floor((tonumber(fps) or fps_int) * 0.066666 + 0.5)
+        local total_minutes = (hh * 60) + mm
+        frame_count = frame_count - (drop_frames * (total_minutes - math.floor(total_minutes / 10)))
+    end
+
+    return frame_count, sep
+end
+
+function format_timecode_from_frame_count(frame_count, fps, separator)
+    local fps_int = math.max(1, math.floor((tonumber(fps) or current_fps or 24) + 0.5))
+    local sep = tostring(separator or ":")
+    local frames = math.max(0, math.floor((tonumber(frame_count) or 0) + 0.5))
+
+    if sep == ";" or sep == "," then
+        local drop_frames = math.floor((tonumber(fps) or fps_int) * 0.066666 + 0.5)
+        if drop_frames > 0 then
+            local frames_per_10_minutes = (fps_int * 60 * 10) - (drop_frames * 9)
+            local frames_per_minute = (fps_int * 60) - drop_frames
+            local ten_minute_blocks = math.floor(frames / frames_per_10_minutes)
+            local remaining_frames = frames % frames_per_10_minutes
+            local dropped_frames = drop_frames * 9 * ten_minute_blocks
+            if remaining_frames >= drop_frames then
+                dropped_frames = dropped_frames + (drop_frames * math.floor((remaining_frames - drop_frames) / frames_per_minute))
+            end
+            frames = frames + dropped_frames
+        end
+    end
+
+    local hh = math.floor(frames / (fps_int * 3600))
+    local rem = frames % (fps_int * 3600)
+    local mm = math.floor(rem / (fps_int * 60))
+    rem = rem % (fps_int * 60)
+    local ss = math.floor(rem / fps_int)
+    local ff = rem % fps_int
+    return string.format("%02d:%02d:%02d%s%02d", hh, mm, ss, sep, ff)
+end
+
+function resolve_subtitle_navigation_timecode(row, timeline)
+    local target_frame = resolve_subtitle_navigation_frame(row, timeline)
+    local fps = tonumber(row and row.fps) or tonumber(current_fps) or 24
+    local start_timecode = nil
+    local start_frame = tonumber(current_tl_start_frame) or 0
+
+    if timeline then
+        pcall(function() start_timecode = tostring(timeline:GetStartTimecode() or "") end)
+        local ok_start, timeline_start = pcall(function() return timeline:GetStartFrame() end)
+        if ok_start and tonumber(timeline_start) then
+            start_frame = tonumber(timeline_start)
+        end
+    end
+
+    local start_frame_count, separator = timecode_to_frame_count(start_timecode, fps)
+    if start_frame_count then
+        local frame_offset = math.max(0, math.floor(target_frame - start_frame + 0.5))
+        return format_timecode_from_frame_count(start_frame_count + frame_offset, fps, separator), target_frame
+    end
+
+    return frames_to_timecode(target_frame, fps), target_frame
+end
+
 -- ========== 定位跳转 ==========
 local function go_to_subtitle(target_window, row_override)
     local window = resolve_window(target_window)
@@ -12348,9 +13251,18 @@ local function go_to_subtitle(target_window, row_override)
         return
     end
     
-    local abs_start = (tonumber(data.start_frame) or 0)
-    local tc = frames_to_timecode(abs_start, data.fps or current_fps)
+    local tc, abs_start = resolve_subtitle_navigation_timecode(data, timeline)
+    local timeline_start_tc = ""
+    pcall(function() timeline_start_tc = tostring(timeline:GetStartTimecode() or "") end)
     print("[Hooper AI 2.0] 转换时间码: " .. tc)
+    LogMsg(string.format(
+        "字幕跳转: row=%s start_frame=%s target_frame=%s target_tc=%s timeline_start_tc=%s",
+        tostring(data.index or "?"),
+        tostring(data.start_frame),
+        tostring(abs_start),
+        tostring(tc),
+        tostring(timeline_start_tc)
+    ))
     
     local ok, err = timeline:SetCurrentTimecode(tc)
     if ok then
@@ -12746,6 +13658,18 @@ function build_selection_composite_rows(timeline, track_index, scope, selection_
 
     local selected_rows = clone_table(type(selection_rows) == "table" and selection_rows or {})
     sort_rows_by_timing(selected_rows)
+    if #full_rows == 0 then
+        for index, row in ipairs(selected_rows) do
+            row.index = index
+            row.fps = fps or row.fps or current_fps
+        end
+        return selected_rows, nil, {
+            total_count = #selected_rows,
+            replaced_count = #selected_rows,
+            outside_count = 0,
+            target_track_was_empty = true
+        }
+    end
 
     local selected_index = 1
     local composite_rows = {}
@@ -12947,6 +13871,11 @@ function update_timeline_selection_scope()
         print("[Hooper AI 2.0] 已合并 " .. approved_pending_count .. " 条人工批准建议到当前选区字幕")
         LogMsg("已合并 " .. approved_pending_count .. " 条人工批准建议到当前选区字幕")
         sync_current_preview_tree(active_window, pending_dirty_row_ids)
+    end
+
+    local ensured_items, ensure_err = ensure_subtitle_track_exists(current_subtitle_target_track, timeline)
+    if not ensured_items then
+        return fail_selection_update("选区合成整轨写回失败: 无法准备目标字幕轨: " .. tostring(ensure_err))
     end
 
     local composite_rows, composite_err, composite_stats =
@@ -15494,6 +16423,34 @@ local function do_ai_fix()
 	5. 直接返回纯中文翻译，按『序号|中文』格式输出，不要有任何英文或解释]]
     end
 
+    local function start_ai_progress(task_label, total_rows)
+        return show_long_task_progress_window({
+            title = "SubFix · " .. tostring(task_label or "AI 处理"),
+            on_cancel = function()
+                AI_CANCEL_REQUESTED = true
+                kill_ai_curl_process()
+                if status then status:Set("Text", "❌ AI 处理已取消") end
+            end
+        })
+    end
+
+    local function update_ai_progress(progress_state, fields)
+        fields = type(fields) == "table" and fields or {}
+        update_long_task_progress_window(progress_state, fields, fields.message)
+    end
+
+    local function finish_ai_progress(progress_state, status_kind, message)
+        finish_long_task_progress_window(progress_state, status_kind, message)
+    end
+
+    local ai_progress = start_ai_progress(task_name, #sorted_list)
+    update_ai_progress(ai_progress, {
+        stage = task_name,
+        message = "正在准备 " .. tostring(task_name),
+        progress_index = 0,
+        progress_total = 100
+    })
+
     local base_sys_prompt = sys_prompt
     
     -- 写入系统的临时目录
@@ -15574,21 +16531,26 @@ local function do_ai_fix()
         local final_user_content = tostring(user_content or "")
 
         if request_use_script_context and request_script_context ~= "" then
-            final_sys_prompt = string.format([[【重要背景：录制参考文稿】
+            request_script_context = format_reference_script_context(request_script_context)
+            final_sys_prompt = string.format([[【重要背景：录制参考文稿 / 关键词字典】
 ---
 %s
 ---
 
 【纠错指令补充】
-1. 上方文稿仅作为你核对“专有名词、特定术语、人名型号”的唯一标准字典。
-2. 严禁对齐：视频中存在大量即兴发挥，如果 ASR 听写的内容在文稿中没有，说明是主讲人临时加的，必须保留！
-3. 严禁删减：绝对不允许按照文稿的简洁度去删减字幕中的口语词（如“然后”、“其实”）。
-4. 读音优先：只有当 ASR 听写的词与文稿中某个词“读音高度接近”且“语义更通顺”时，才允许参考文稿修正。
-5. 文稿可作为判断相邻两行边界是否错位的辅助上下文，但不能借机把整句强行对齐到稿子。
+1. 上方内容可能是完整文稿，也可能是关键词字典；关键词只是低优先级弱提示。
+2. 参考内容的唯一用途是修正 ASR 识别错误或误听错字；不是事实校对表、不是术语统一表、不是改名依据、不是润色依据。
+3. 只要不能证明原词是 ASR 听错，就必须原样保留；不得因为参考内容更常见、更像标准词、更完整或出现在词库里就替换原词。
+4. 原字幕若已经表达了可成立的本意，或是可成立的人名、昵称、角色名、品牌名、节目梗、口头禅、临场发挥，即使不在参考内容里，也必须保留。
+5. 严禁强行加入：不得为了用上某个关键词而新增字幕内容，严禁把关键词强行加入字幕；例如不要把“小酷”改成“小鑫”，不要把“元仔”改成“二蛋”。
+6. 严禁强行对齐：视频中存在大量即兴发挥，严禁按文稿或关键词强行对齐；如果 ASR 听写的内容不在参考内容中，必须优先保留实际口播。
+7. 严禁删减：绝对不允许按照文稿的简洁度去删减字幕中的口语词（如“然后”、“其实”）。
+8. 读音优先且保守：只有当原词在当前上下文明显不成立、与参考词读音高度接近、且改后不改变本意时，才允许参考修正；否则原样返回。
+9. 参考内容可作为判断相邻两行边界是否错位的辅助上下文，但不能借机把整句强行对齐到稿子。
 
 %s]], request_script_context, final_sys_prompt)
             final_user_content = string.format(
-                "请结合上方参考文稿，对以下 %d 行字幕进行纠错；允许仅在相邻两行之间做最小必要的尾首重分配，用于修复上一句尾巴误挂到下一句开头；若文稿与实际口播不一致，优先保留实际口播。\n\n%s",
+                "请结合上方参考文稿 / 关键词字典，对以下 %d 行字幕进行纠错；允许仅在相邻两行之间做最小必要的尾首重分配，用于修复上一句尾巴误挂到下一句开头；若参考内容与实际口播不一致，优先保留实际口播。\n\n%s",
                 batch_line_count,
                 final_user_content
             )
@@ -16012,6 +16974,7 @@ local function do_ai_fix()
             if AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 完整纠错被用户取消（第 " .. batch_idx .. " 批前）")
                 if status then status:Set("Text", "❌ AI 处理已取消") end
+                finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
 
@@ -16021,6 +16984,12 @@ local function do_ai_fix()
             local request_err = nil
             local request_err_type = nil
 
+            update_ai_progress(ai_progress, {
+                stage = "完整纠错",
+                message = string.format("完整纠错 %d/%d｜字幕 %d-%d", batch_idx, total_batches, batch_start, batch_end),
+                progress_index = batch_idx * 2 - 1,
+                progress_total = total_batches * 2
+            })
             if status then
                 status:Set("Text", string.format("正在调用完整纠错...（第 %d/%d 批）", batch_idx, total_batches))
             end
@@ -16035,6 +17004,12 @@ local function do_ai_fix()
                 print("[Hooper AI 2.0] " .. fallback_msg .. "（第 " .. batch_idx .. "/" .. total_batches .. " 批）")
                 LogMsg("[AI] " .. fallback_msg .. "（第 " .. batch_idx .. "/" .. total_batches .. " 批）")
                 if status then status:Set("Text", fallback_msg) end
+                update_ai_progress(ai_progress, {
+                    stage = "完整纠错",
+                    message = fallback_msg,
+                    progress_index = batch_idx * 2 - 1,
+                    progress_total = total_batches * 2
+                })
                 ai_content, finish_reason, request_err, request_err_type = execute_ai_request(
                     batch_subtitle_list,
                     "fix_batch_" .. tostring(batch_idx) .. "_fallback",
@@ -16048,12 +17023,18 @@ local function do_ai_fix()
             if not ai_content then
                 print("[Hooper AI 2.0] 请求失败: " .. tostring(request_err))
                 if status then status:Set("Text", tostring(request_err)) end
+                if request_err_type == "cancelled" then
+                    finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
+                else
+                    finish_ai_progress(ai_progress, "failed", tostring(request_err))
+                end
                 return
             end
 
             if finish_reason == "length" then
                 print("[Hooper AI 2.0] AI 输出被截断，未执行替换。")
                 if status then status:Set("Text", "❌ AI 输出被截断，请缩小批次或重试。") end
+                finish_ai_progress(ai_progress, "failed", "❌ AI 输出被截断，请缩小批次或重试。")
                 return
             end
 
@@ -16061,6 +17042,7 @@ local function do_ai_fix()
             if not batch_subtitle_map then
                 print("[Hooper AI 2.0] AI 行文本结果校验失败: " .. tostring(payload_err))
                 if status then status:Set("Text", "❌ AI 返回结果校验失败，未覆盖字幕。") end
+                finish_ai_progress(ai_progress, "failed", "❌ AI 返回结果校验失败，未覆盖字幕。")
                 return
             end
 
@@ -16072,7 +17054,13 @@ local function do_ai_fix()
                 new_subtitle_map[idx] = text
             end
 
-            local boundary_ai_content, boundary_finish_reason, boundary_request_err = execute_ai_request(
+            update_ai_progress(ai_progress, {
+                stage = "边界修复",
+                message = string.format("边界修复 %d/%d｜字幕 %d-%d", batch_idx, total_batches, batch_start, batch_end),
+                progress_index = batch_idx * 2,
+                progress_total = total_batches * 2
+            })
+            local boundary_ai_content, boundary_finish_reason, boundary_request_err, boundary_request_status = execute_ai_request(
                 batch_subtitle_list,
                 "boundary_fix_batch_" .. tostring(batch_idx),
                 {
@@ -16082,6 +17070,12 @@ local function do_ai_fix()
                     sys_prompt_override = boundary_fix_sys_prompt
                 }
             )
+            if boundary_request_status == "cancelled" or AI_CANCEL_REQUESTED then
+                print("[Hooper AI 2.0] 完整纠错边界修复被用户取消（第 " .. batch_idx .. " 批）")
+                if status then status:Set("Text", "❌ AI 处理已取消") end
+                finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
+                return
+            end
             if boundary_ai_content then
                 if boundary_finish_reason == "length" then
                     print("[Hooper AI 2.0] 相邻两行边界修复输出被截断，本批次忽略边界修复结果。")
@@ -16237,6 +17231,7 @@ local function do_ai_fix()
             if AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 的地得专项检测被用户取消（第 " .. batch_idx .. " 批前）")
                 if status then status:Set("Text", "❌ AI 处理已取消") end
+                finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
 
@@ -16245,11 +17240,18 @@ local function do_ai_fix()
             local batch_subtitle_list = build_subtitle_list(batch_start, batch_end)
             local request_err = nil
 
+            update_ai_progress(ai_progress, {
+                stage = "的地得专项检测",
+                message = string.format("的地得专项检测 %d/%d｜字幕 %d-%d", batch_idx, total_batches, batch_start, batch_end),
+                progress_index = batch_idx,
+                progress_total = total_batches
+            })
             if status then
                 status:Set("Text", string.format("正在调用的地得专项检测...（第 %d/%d 批）", batch_idx, total_batches))
             end
 
-            ai_content, finish_reason, request_err = execute_ai_request(batch_subtitle_list, "particle_fix_batch_" .. tostring(batch_idx), {
+            local request_status = nil
+            ai_content, finish_reason, request_err, request_status = execute_ai_request(batch_subtitle_list, "particle_fix_batch_" .. tostring(batch_idx), {
                 script_context = "",
                 use_script_context = false,
                 batch_line_count = batch_end - batch_start + 1
@@ -16257,12 +17259,18 @@ local function do_ai_fix()
             if not ai_content then
                 print("[Hooper AI 2.0] 请求失败: " .. tostring(request_err))
                 if status then status:Set("Text", tostring(request_err)) end
+                if request_status == "cancelled" then
+                    finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
+                else
+                    finish_ai_progress(ai_progress, "failed", tostring(request_err))
+                end
                 return
             end
 
             if finish_reason == "length" then
                 print("[Hooper AI 2.0] 的地得专项检测输出被截断，未执行替换。")
                 if status then status:Set("Text", "❌ AI 输出被截断，请缩小批次或重试。") end
+                finish_ai_progress(ai_progress, "failed", "❌ AI 输出被截断，请缩小批次或重试。")
                 return
             end
 
@@ -16270,6 +17278,7 @@ local function do_ai_fix()
             if not batch_subtitle_map then
                 print("[Hooper AI 2.0] AI 行文本结果校验失败: " .. tostring(payload_err))
                 if status then status:Set("Text", "❌ AI 返回结果校验失败，未覆盖字幕。") end
+                finish_ai_progress(ai_progress, "failed", "❌ AI 返回结果校验失败，未覆盖字幕。")
                 return
             end
 
@@ -16323,6 +17332,7 @@ local function do_ai_fix()
             if AI_CANCEL_REQUESTED then
                 print("[Hooper AI 2.0] 翻译被用户取消（第 " .. batch_idx .. " 批前）")
                 if status then status:Set("Text", "❌ AI 处理已取消") end
+                finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                 return
             end
 
@@ -16331,22 +17341,35 @@ local function do_ai_fix()
             local batch_subtitle_list = build_subtitle_list(batch_start, batch_end)
             local request_err = nil
 
+            update_ai_progress(ai_progress, {
+                stage = tostring(task_name or "翻译"),
+                message = string.format("%s %d/%d｜字幕 %d-%d", tostring(task_name or "翻译"), batch_idx, total_translation_batches, batch_start, batch_end),
+                progress_index = batch_idx,
+                progress_total = total_translation_batches
+            })
             if status then
                 status:Set("Text", string.format("正在调用%s...（第 %d/%d 批）", tostring(task_name or "翻译"), batch_idx, total_translation_batches))
             end
 
-            ai_content, finish_reason, request_err = execute_ai_request(batch_subtitle_list, task_name .. "_batch_" .. tostring(batch_idx), {
+            local request_status = nil
+            ai_content, finish_reason, request_err, request_status = execute_ai_request(batch_subtitle_list, task_name .. "_batch_" .. tostring(batch_idx), {
                 batch_line_count = batch_end - batch_start + 1
             })
             if not ai_content then
                 print("[Hooper AI 2.0] 请求失败: " .. tostring(request_err))
                 if status then status:Set("Text", tostring(request_err)) end
+                if request_status == "cancelled" then
+                    finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
+                else
+                    finish_ai_progress(ai_progress, "failed", tostring(request_err))
+                end
                 return
             end
 
             if finish_reason == "length" then
                 print("[Hooper AI 2.0] 翻译输出被截断，未执行替换。")
                 if status then status:Set("Text", "❌ AI 输出被截断，请缩小批次或重试。") end
+                finish_ai_progress(ai_progress, "failed", "❌ AI 输出被截断，请缩小批次或重试。")
                 return
             end
 
@@ -16354,6 +17377,7 @@ local function do_ai_fix()
             if not batch_subtitle_map then
                 print("[Hooper AI 2.0] AI 行文本结果校验失败: " .. tostring(payload_err))
                 if status then status:Set("Text", "❌ AI 返回结果校验失败，未覆盖字幕。") end
+                finish_ai_progress(ai_progress, "failed", "❌ AI 返回结果校验失败，未覆盖字幕。")
                 return
             end
 
@@ -16371,10 +17395,11 @@ local function do_ai_fix()
 
         if #translation_missing_indices > 0 then
             LogMsg(string.format("[AI] AI 漏回 %d 行，开始逐条重试", #translation_missing_indices))
-            for _, missing_idx in ipairs(translation_missing_indices) do
+            for retry_index, missing_idx in ipairs(translation_missing_indices) do
                 if AI_CANCEL_REQUESTED then
                     print("[Hooper AI 2.0] 翻译重试被用户取消（index=" .. tostring(missing_idx) .. "）")
                     if status then status:Set("Text", "❌ AI 处理已取消") end
+                    finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
                     return
                 end
 
@@ -16383,22 +17408,35 @@ local function do_ai_fix()
                 local retry_ai_content = nil
                 local retry_finish_reason = nil
 
+                update_ai_progress(ai_progress, {
+                    stage = "重试漏回字幕",
+                    message = string.format("重试漏回字幕 %d/%d｜index %d", retry_index, #translation_missing_indices, missing_idx),
+                    progress_index = total_translation_batches + retry_index,
+                    progress_total = total_translation_batches + #translation_missing_indices
+                })
                 if status then
                     status:Set("Text", string.format("正在重试%s漏回字幕...（index %d）", tostring(task_name or "翻译"), missing_idx))
                 end
 
-                retry_ai_content, retry_finish_reason, retry_err = execute_ai_request(translation_retry_list, task_name .. "_retry_" .. tostring(missing_idx), {
+                local retry_status = nil
+                retry_ai_content, retry_finish_reason, retry_err, retry_status = execute_ai_request(translation_retry_list, task_name .. "_retry_" .. tostring(missing_idx), {
                     batch_line_count = 1
                 })
                 if not retry_ai_content then
                     print("[Hooper AI 2.0] 翻译漏行重试失败: " .. tostring(retry_err))
                     if status then status:Set("Text", "❌ AI 漏回字幕重试失败，未覆盖字幕。") end
+                    if retry_status == "cancelled" then
+                        finish_ai_progress(ai_progress, "cancelled", "AI 处理已取消")
+                    else
+                        finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试失败，未覆盖字幕。")
+                    end
                     return
                 end
 
                 if retry_finish_reason == "length" then
                     print("[Hooper AI 2.0] 翻译漏行重试输出被截断，未执行替换。")
                     if status then status:Set("Text", "❌ AI 漏回字幕重试输出被截断，未覆盖字幕。") end
+                    finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试输出被截断，未覆盖字幕。")
                     return
                 end
 
@@ -16406,12 +17444,14 @@ local function do_ai_fix()
                 if not retry_map then
                     print("[Hooper AI 2.0] 翻译漏行重试结果校验失败: " .. tostring(retry_payload_err))
                     if status then status:Set("Text", "❌ AI 漏回字幕重试校验失败，未覆盖字幕。") end
+                    finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试校验失败，未覆盖字幕。")
                     return
                 end
 
                 if type(retry_map[missing_idx]) ~= "string" or trim_text(retry_map[missing_idx]) == "" then
                     print("[Hooper AI 2.0] 翻译漏行重试缺少有效文本: index=" .. tostring(missing_idx))
                     if status then status:Set("Text", "❌ AI 漏回字幕重试缺少有效文本，未覆盖字幕。") end
+                    finish_ai_progress(ai_progress, "failed", "❌ AI 漏回字幕重试缺少有效文本，未覆盖字幕。")
                     return
                 end
 
@@ -16471,6 +17511,7 @@ local function do_ai_fix()
     print("[Hooper AI 2.0] " .. status_text)
     if status then status:Set("Text", status_text) end
     LogMsg("[AI] " .. status_text)
+    finish_ai_progress(ai_progress, "done", status_text)
     
     -- 弹出纠错报告窗口
     if is_correction_task then
@@ -16603,10 +17644,10 @@ local mini_content = ui:VGroup({
 
     ui:VGap(6),
 
-    ui:Stack({
-        ID = "MiniSubtitleAreaStack",
+    ui:VGroup({
+        ID = "MiniSubtitleArea",
         Weight = 1,
-        CurrentIndex = 0,
+        Spacing = 0,
         ui:VGroup({
             ID = "MiniSubtitlePlaceholder",
             Weight = 1,
@@ -16618,6 +17659,18 @@ local mini_content = ui:VGroup({
                 Weight = 0,
                 Alignment = {AlignHCenter = true, AlignVCenter = true},
                 WordWrap = true
+            }),
+            ui:HGroup({
+                Weight = 0,
+                ui:HGap(0, 1),
+                ui:Button({
+                    ID = "MiniGenerateSelectionSubtitlesBtn",
+                    Text = "生成选区字幕",
+                    Weight = 0,
+                    MinimumSize = {132, 30},
+                    MaximumSize = {180, 32}
+                }),
+                ui:HGap(0, 1)
             }),
             ui:VGap(0, 1)
         }),
@@ -16923,7 +17976,7 @@ ensure_ai_config_window = function()
         ui:HGroup{
             Weight = 0,
             Spacing = 6,
-            ui:CheckBox{ID = "EnableScriptAssistCheckbox", Text = "启用文稿辅助纠错", Checked = false, Weight = 1}
+            ui:CheckBox{ID = "EnableScriptAssistCheckbox", Text = "启用文稿/关键词辅助纠错", Checked = false, Weight = 1}
         },
         ui:VGroup{
             Weight = 1,
@@ -16931,10 +17984,10 @@ ensure_ai_config_window = function()
             ui:HGroup{
                 Weight = 0,
                 Spacing = 8,
-                ui:Label{Text = "参考文稿（可选）", Weight = 0},
+                ui:Label{Text = "参考文稿 / 关键词（可选）", Weight = 0},
                 ui:Label{ID = "ReferenceScriptRiskLabel", Text = "<font color='#00AA55'>当前字数：0 · 影响较小</font>", Weight = 1, Alignment = {AlignLeft = true, AlignVCenter = true}}
             },
-            ui:TextEdit{ID = "ReferenceScriptInput", Text = "", Weight = 1, MinimumSize = {0, 180}},
+            ui:TextEdit{ID = "ReferenceScriptInput", Text = "", PlaceholderText = "每行一个关键词，或粘贴完整文稿", Weight = 1, MinimumSize = {0, 180}},
         },
         ui:HGroup{
             Weight = 0,
@@ -16973,7 +18026,7 @@ function show_normalize_length_config_dialog(target_window)
         NormalizeLengthConfigWin = dispatcher:AddWindow({
             ID = "NormalizeLengthConfigWin",
             WindowTitle = "规整字幕长度配置",
-            Geometry = {360, 240, 420, 130}
+            Geometry = {360, 240, 520, 190}
         },
         ui:VGroup{
             ContentsMargins = 10,
@@ -16987,16 +18040,17 @@ function show_normalize_length_config_dialog(target_window)
                 Weight = 0,
                 Spacing = 6,
                 ui:Label{Text = "字幕对齐音频偏移帧数", Weight = 0, MinimumSize = {150, 24}},
-	                ui:LineEdit{
-	                    ID = "NormalizeLengthBiasInput",
-	                    Text = "-2",
+                ui:LineEdit{
+                    ID = "NormalizeLengthBiasInput",
+                    Text = "自动",
                     Weight = 1,
                     Alignment = {AlignHCenter = true, AlignVCenter = true}
                 }
             },
-	            ui:Label{
-	                Text = "推荐：-2 帧；字幕整体偏早可调到 -3 到 -5，字幕整体偏慢可调到 1 到 2。",
+            ui:Label{
+                Text = "自动：按本次 CTC 对齐结果校准。\n手动：输入 -10..10 整数（负数提前，正数延后）。",
                 Weight = 0,
+                MinimumSize = {0, 44},
                 WordWrap = true
             },
             ui:HGroup{
@@ -17014,14 +18068,14 @@ function show_normalize_length_config_dialog(target_window)
 
         function NormalizeLengthConfigWin.On.NormalizeLengthStartBtn.Clicked(ev)
             local bias_input = NormalizeLengthConfigWin:Find("NormalizeLengthBiasInput")
-            local normalize_bias_frames = SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(bias_input and bias_input.Text or nil)
+            local normalize_bias_mode, normalize_bias_frames = SUBFIX_AUDIO_ALIGN.parse_normalize_length_bias_input(bias_input and bias_input.Text or nil)
             if bias_input then
-                bias_input.Text = tostring(normalize_bias_frames)
+                bias_input.Text = normalize_bias_mode == "auto" and "自动" or tostring(normalize_bias_frames)
             end
 
             local target = pending_normalize_length_config_window or active_window or win
             pending_normalize_length_window = target
-            pending_normalize_length_options = {bias_frames = normalize_bias_frames}
+            pending_normalize_length_options = {bias_frames = normalize_bias_frames, bias_mode = normalize_bias_mode, start_mode = "balanced"}
             NormalizeLengthConfigWin:Hide()
             update_shared_status(target, "正在规整字幕长度...")
             if not restart_ui_timer(normalize_length_timer) then
@@ -17039,7 +18093,8 @@ function show_normalize_length_config_dialog(target_window)
 
     local bias_input = NormalizeLengthConfigWin:Find("NormalizeLengthBiasInput")
     if bias_input then
-        bias_input.Text = tostring(SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(bias_input.Text))
+        local bias_mode, bias_frames = SUBFIX_AUDIO_ALIGN.parse_normalize_length_bias_input(bias_input.Text)
+        bias_input.Text = bias_mode == "auto" and "自动" or tostring(bias_frames)
     end
     NormalizeLengthConfigWin:Show()
     return NormalizeLengthConfigWin
@@ -17299,6 +18354,11 @@ function mini_win.On.MiniRefreshBtn.Clicked(ev)
     update_shared_status(mini_win, "正在刷新...")
     set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在刷新字幕...</font>", mini_win)
     refresh_subtitles(mini_win)
+end
+
+function mini_win.On.MiniGenerateSelectionSubtitlesBtn.Clicked(ev)
+    print("[Hooper AI 2.0] 极简版生成选区字幕按钮点击")
+    run_generate_selection_subtitles_from_subfix(mini_win)
 end
 
 function mini_win.On.MiniSearchBox.TextChanged(ev)
@@ -17978,34 +19038,48 @@ function run_normalize_subtitle_length(target_window, options)
     local normalize_progress = start_normalize_progress(window, #current_rows)
     local fps = tonumber(current_fps) or 24.0
     local normalize_bias_frames = SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(options.bias_frames)
+    local normalize_bias_mode = tostring(options.bias_mode or "manual")
+    local normalize_start_mode = tostring(options.start_mode or "balanced")
     local gap_threshold = math.max(1, math.floor(fps * 2 + 0.5))
     local mutation_snapshot = prepare_mutation_snapshot("规整字幕长度")
 
     sort_rows_by_timing(current_rows)
-    update_shared_status(window, "正在规整字幕长度：正在对齐音频...")
-    update_normalize_progress({stage = "CTC 对齐", message = "正在对齐音频...", log = "进入 CTC 对齐阶段，偏移帧 " .. tostring(normalize_bias_frames)})
-    local audio_aligned_count, audio_alignment_effective, stable_align_err, audio_alignment_stats =
-        SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(current_rows, fps, {progress = normalize_progress, bias_frames = normalize_bias_frames})
-    if audio_alignment_stats and audio_alignment_stats.cancelled then
-        local cancel_msg = "规整字幕长度已取消，未应用本次音频对齐结果"
-        update_shared_status(window, cancel_msg)
-        finish_normalize_progress("cancelled", cancel_msg)
-        return
-    end
-    if audio_aligned_count == nil then
-        LogMsg("受保护音频修正失败，继续执行纯规整空隙: " .. tostring(stable_align_err or "未知错误"))
+    local audio_aligned_count = 0
+    local audio_alignment_effective = false
+    local stable_align_err = nil
+    local audio_alignment_stats = nil
+    if normalize_start_mode ~= "off" then
+        update_shared_status(window, "正在规整字幕长度：正在对齐音频...")
+        update_normalize_progress({stage = "CTC 对齐", message = "正在对齐音频...", log = "进入 CTC 对齐阶段，起点模式 " .. tostring(normalize_start_mode) .. "，偏移模式 " .. tostring(normalize_bias_mode) .. "，偏移帧 " .. tostring(normalize_bias_frames)})
+        audio_aligned_count, audio_alignment_effective, stable_align_err, audio_alignment_stats =
+            SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(current_rows, fps, {progress = normalize_progress, bias_frames = normalize_bias_frames, bias_mode = options.bias_mode, start_mode = normalize_start_mode})
+        if audio_alignment_stats and audio_alignment_stats.cancelled then
+            local cancel_msg = "规整字幕长度已取消，未应用本次音频对齐结果"
+            update_shared_status(window, cancel_msg)
+            finish_normalize_progress("cancelled", cancel_msg)
+            return
+        end
+        if audio_aligned_count == nil then
+            LogMsg("受保护音频修正失败，继续执行纯规整空隙: " .. tostring(stable_align_err or "未知错误"))
+            update_normalize_progress({
+                stage = "音频修正未生效",
+                message = "音频修正失败，继续执行纯空隙规整",
+                log = "音频修正失败，继续执行纯空隙规整: " .. tostring(stable_align_err or "未知错误")
+            })
+            audio_alignment_effective = false
+        elseif not audio_alignment_effective then
+            LogMsg(tostring(stable_align_err or "音频修正未生效"))
+            update_normalize_progress({
+                stage = "音频修正未生效",
+                message = tostring(stable_align_err or "音频修正未生效，继续规整空隙"),
+                log = tostring(stable_align_err or "音频修正未生效")
+            })
+        end
+    else
         update_normalize_progress({
-            stage = "音频修正未生效",
-            message = "音频修正失败，继续执行纯空隙规整",
-            log = "音频修正失败，继续执行纯空隙规整: " .. tostring(stable_align_err or "未知错误")
-        })
-        audio_alignment_effective = false
-    elseif not audio_alignment_effective then
-        LogMsg(tostring(stable_align_err or "音频修正未生效"))
-        update_normalize_progress({
-            stage = "音频修正未生效",
-            message = tostring(stable_align_err or "音频修正未生效，继续规整空隙"),
-            log = tostring(stable_align_err or "音频修正未生效")
+            stage = "规整空隙",
+            message = "修正起点已关闭，保留原始起点",
+            log = "跳过 CTC 起点修正，只规整长度和空隙"
         })
     end
     audio_aligned_count = tonumber(audio_aligned_count) or 0
@@ -18016,10 +19090,11 @@ function run_normalize_subtitle_length(target_window, options)
         finish_normalize_progress("cancelled", cancel_msg)
         return
     end
-    update_normalize_progress({stage = "填补空隙", message = "正在填补字幕之间的小空隙...", log = "开始填补小空隙"})
+    update_normalize_progress({stage = "填补空隙", message = "正在填补字幕之间的小空隙...", progress_index = 98, progress_total = 100, log = "开始填补小空隙"})
     local count = 0
     local total = #current_rows
     local report_entries = {}
+    local active_gap_threshold = gap_threshold
 
     for i = 1, total - 1 do
         local curr = current_rows[i]
@@ -18033,9 +19108,10 @@ function run_normalize_subtitle_length(target_window, options)
                 gap = nxt_start - curr_end
             end
 
-            if gap and gap > 0 and gap <= gap_threshold then
+            if gap and gap > 0 and gap <= active_gap_threshold then
                 local original_end = curr.end_frame
                 curr.end_frame = nxt_start
+                curr.target_abs_frame = math.floor((curr.start_frame + curr.end_frame) / 2)
                 count = count + 1
                 -- 记录可还原条目：原文/修改后用「原始字幕文本」+「填补 N 帧空隙」作展示
                 local entry = report_helpers.format_batch_change_report_line(
@@ -18265,7 +19341,7 @@ function win.On.BtnStep1.Clicked(ev)
 end
 
 -- 4️⃣ 最终交付检查
-PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND = 10
+PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND = 11
 PRE_DELIVERY_MAX_SUBTITLE_CHARS = 24
 PRE_DELIVERY_MIN_SUBTITLE_GAP_FRAMES = 3
 PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES = 6
@@ -18285,6 +19361,20 @@ PRE_DELIVERY_SPEECH_EXTRA_TAIL_MIN_CHARS = 1
 PRE_DELIVERY_SPEECH_CTC_DIAGNOSTIC_ENABLED = false
 PRE_DELIVERY_SPEECH_SKIP_SINGLE_TRACK_PROBE = true
 
+function is_timeline_transition_bridge(item_ranges, item_index)
+    local previous_item = item_ranges[item_index - 1]
+    local current_item = item_ranges[item_index]
+    local next_item = item_ranges[item_index + 1]
+    if not previous_item or not current_item or not next_item then return false end
+
+    local shared_cut = previous_item.end_frame
+    local is_bridge = shared_cut == next_item.start_frame
+        and current_item.start_frame <= shared_cut
+        and shared_cut <= current_item.end_frame
+        and current_item.start_frame < current_item.end_frame
+    return is_bridge, shared_cut
+end
+
 function collect_timeline_video_cut_frames(timeline, track_indices)
     local cuts = {}
     if not timeline then return cuts end
@@ -18294,13 +19384,33 @@ function collect_timeline_video_cut_frames(timeline, track_indices)
         local target_track_index = tonumber(track_index) or 1
         local ok_items, items = pcall(function() return timeline:GetItemListInTrack("video", target_track_index) end)
         if ok_items and type(items) == "table" then
+            local item_ranges = {}
             for _, item in ipairs(items) do
                 local ok_start, start_frame = pcall(function() return item:GetStart() end)
                 local ok_end, end_frame = pcall(function() return item:GetEnd() end)
                 start_frame = ok_start and tonumber(start_frame) or nil
                 end_frame = ok_end and tonumber(end_frame) or nil
-                if start_frame then cuts[math.floor(start_frame + 0.5)] = true end
-                if end_frame then cuts[math.floor(end_frame + 0.5)] = true end
+                if start_frame and end_frame then
+                    item_ranges[#item_ranges + 1] = {
+                        start_frame = math.floor(start_frame + 0.5),
+                        end_frame = math.floor(end_frame + 0.5)
+                    }
+                elseif start_frame then
+                    cuts[math.floor(start_frame + 0.5)] = true
+                elseif end_frame then
+                    cuts[math.floor(end_frame + 0.5)] = true
+                end
+            end
+            table.sort(item_ranges, function(a, b)
+                if a.start_frame == b.start_frame then return a.end_frame < b.end_frame end
+                return a.start_frame < b.start_frame
+            end)
+            for item_index, item_range in ipairs(item_ranges) do
+                -- Resolve exposes a transition as an overlapping item around the clips' shared edit point.
+                if not is_timeline_transition_bridge(item_ranges, item_index) then
+                    cuts[item_range.start_frame] = true
+                    cuts[item_range.end_frame] = true
+                end
             end
         end
     end
@@ -18311,62 +19421,56 @@ function collect_timeline_video_cut_frames(timeline, track_indices)
     end
     table.sort(result)
     return result
-end
-
-function collect_timeline_video_track_segments(timeline, track_index)
-    local segments = {}
-    if not timeline then return segments end
-
-    local target_track_index = tonumber(track_index) or 1
-    local ok_items, items = pcall(function() return timeline:GetItemListInTrack("video", target_track_index) end)
-    if ok_items and type(items) == "table" then
-        for _, item in ipairs(items) do
-            local ok_start, start_frame = pcall(function() return item:GetStart() end)
-            local ok_end, end_frame = pcall(function() return item:GetEnd() end)
-            start_frame = ok_start and tonumber(start_frame) or nil
-            end_frame = ok_end and tonumber(end_frame) or nil
-            if start_frame and end_frame and end_frame > start_frame then
-                segments[#segments + 1] = {
-                    start_frame = math.floor(start_frame + 0.5),
-                    end_frame = math.floor(end_frame + 0.5)
-                }
-            end
-        end
-    end
-    return segments
-end
-
-function frame_inside_video_segments(frame, segments)
-    local value = tonumber(frame)
-    if not value then return false end
-    for _, segment in ipairs(segments or {}) do
-        local start_frame = tonumber(segment.start_frame)
-        local end_frame = tonumber(segment.end_frame)
-        if start_frame and end_frame and value > start_frame and value < end_frame then
-            return true
-        end
-    end
-    return false
 end
 
 function collect_visible_timeline_cut_frames(timeline)
-    local cuts = {}
-    local v2_segments = collect_timeline_video_track_segments(timeline, 2)
-    for _, cut_frame in ipairs(collect_timeline_video_cut_frames(timeline, 1)) do
-        if not frame_inside_video_segments(cut_frame, v2_segments) then
-            cuts[cut_frame] = true
+    return collect_timeline_video_cut_frames(timeline, 1)
+end
+
+function collect_timeline_transition_alignment_cuts(timeline)
+    local alignment_cuts = {}
+    if not timeline then return alignment_cuts end
+
+    for _, track_type in ipairs({"video", "audio"}) do
+        local ok_count, track_count = pcall(function() return timeline:GetTrackCount(track_type) end)
+        track_count = ok_count and tonumber(track_count) or 0
+        for track_index = 1, track_count do
+            local ok_enabled, enabled = pcall(function() return timeline:GetIsTrackEnabled(track_type, track_index) end)
+            if not ok_enabled or enabled ~= false then
+                local ok_items, items = pcall(function() return timeline:GetItemListInTrack(track_type, track_index) end)
+                local item_ranges = {}
+                if ok_items and type(items) == "table" then
+                    for _, item in ipairs(items) do
+                        local ok_start, start_frame = pcall(function() return item:GetStart() end)
+                        local ok_end, end_frame = pcall(function() return item:GetEnd() end)
+                        start_frame = ok_start and tonumber(start_frame) or nil
+                        end_frame = ok_end and tonumber(end_frame) or nil
+                        if start_frame and end_frame then
+                            item_ranges[#item_ranges + 1] = {
+                                start_frame = math.floor(start_frame + 0.5),
+                                end_frame = math.floor(end_frame + 0.5)
+                            }
+                        end
+                    end
+                end
+                table.sort(item_ranges, function(a, b)
+                    if a.start_frame == b.start_frame then return a.end_frame < b.end_frame end
+                    return a.start_frame < b.start_frame
+                end)
+                for item_index, item_range in ipairs(item_ranges) do
+                    local is_bridge, shared_cut = is_timeline_transition_bridge(item_ranges, item_index)
+                    if is_bridge then
+                        -- Transition edges are valid subtitle anchors, but must not become new cut candidates.
+                        alignment_cuts[item_range.start_frame] = alignment_cuts[item_range.start_frame] or {}
+                        alignment_cuts[item_range.end_frame] = alignment_cuts[item_range.end_frame] or {}
+                        alignment_cuts[item_range.start_frame][shared_cut] = true
+                        alignment_cuts[item_range.end_frame][shared_cut] = true
+                    end
+                end
+            end
         end
     end
-    for _, cut_frame in ipairs(collect_timeline_video_cut_frames(timeline, 2)) do
-        cuts[cut_frame] = true
-    end
-
-    local result = {}
-    for frame in pairs(cuts) do
-        result[#result + 1] = frame
-    end
-    table.sort(result)
-    return result
+    return alignment_cuts
 end
 
 function pre_delivery_issue_key(issue)
@@ -18422,11 +19526,12 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     local row_list = type(rows) == "table" and rows or {}
     local rate = tonumber(fps) or tonumber(current_fps) or 24
     fps = rate
-    local fast_reading_cps = tonumber(PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND) or 10
+    local fast_reading_cps = tonumber(PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND) or 11
     local max_subtitle_chars = tonumber(PRE_DELIVERY_MAX_SUBTITLE_CHARS) or 24
     local min_subtitle_gap_frames = tonumber(PRE_DELIVERY_MIN_SUBTITLE_GAP_FRAMES) or 3
     local cut_tolerance_frames = tonumber(PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES) or 6
     local cut_frames = collect_visible_timeline_cut_frames(timeline)
+    local transition_alignment_cuts = collect_timeline_transition_alignment_cuts(timeline)
     local issues = {}
     local boundary_alignment_cut_seen = {}
     local previous_row = nil
@@ -18457,6 +19562,9 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             end
         end
         if nearest_cut then
+            local normalized_boundary_frame = math.floor(boundary_frame + 0.5)
+            local acceptable_cuts = transition_alignment_cuts[normalized_boundary_frame]
+            if acceptable_cuts and acceptable_cuts[nearest_cut] then return end
             if boundary_alignment_cut_seen[nearest_cut] then return end
             boundary_alignment_cut_seen[nearest_cut] = true
             add_issue(
@@ -19964,7 +21072,7 @@ function pre_delivery_issue_summary_text(issues, marker_count)
         counts[kind] = (counts[kind] or 0) + 1
     end
     return string.format(
-        "发现问题：%d\n已打 marker：%d\n空字幕：%d\n阅读速度过快：%d\n单条字幕过长：%d\n字幕尾部空格：%d\n字幕间隔过短：%d\n相邻重复字幕：%d\n字幕边界未贴剪辑点：%d\n口播字幕不一致：%d\n口播字幕疑似字词替换：%d\n口播字幕小差异：%d\n口播缺字幕：%d\n字幕无对应口播音频：%d",
+        "发现问题：%d\n已打 marker：%d\n空字幕：%d\n阅读速度过快：%d\n单条字幕过长：%d\n字幕尾部空格：%d\n字幕间隔过短：%d\n相邻重复字幕：%d\n字幕边界未贴剪辑点：%d",
         #(issues or {}),
         tonumber(marker_count) or 0,
         counts["空字幕"] or 0,
@@ -19973,12 +21081,7 @@ function pre_delivery_issue_summary_text(issues, marker_count)
         counts["字幕尾部空格"] or 0,
         counts["字幕间隔过短"] or 0,
         counts["相邻重复字幕"] or 0,
-        counts["字幕边界未贴剪辑点"] or 0,
-        counts["口播字幕不一致"] or 0,
-        counts["口播字幕疑似字词替换"] or 0,
-        counts["口播字幕小差异"] or 0,
-        counts["口播缺字幕"] or 0,
-        counts["字幕无对应口播音频"] or 0
+        counts["字幕边界未贴剪辑点"] or 0
     )
 end
 
@@ -20111,16 +21214,6 @@ function run_pre_delivery_final_check(target_window)
     clear_all_pre_delivery_markers(timeline)
     local fps = tonumber(current_fps) or parse_fps(timeline:GetSetting("timelineFrameRate") or current_fps)
     local issues = collect_pre_delivery_final_check_issues(current_rows, timeline, fps)
-    update_shared_status(window, "正在最终交付检查：正在检查字幕与口播一致性...")
-    local speech_issues, speech_summary = collect_pre_delivery_speech_consistency_issues(current_rows, timeline, fps, {window = window})
-    if speech_summary and speech_summary.cancelled then
-        update_shared_status(window, "最终交付检查已取消")
-        LogMsg("最终交付检查已取消")
-        return
-    end
-    for _, issue in ipairs(speech_issues or {}) do
-        issues[#issues + 1] = issue
-    end
     local tl_start_frame = current_tl_start_frame or 0
     local ok_start, start_frame = pcall(function() return timeline:GetStartFrame() end)
     if ok_start and tonumber(start_frame) then
@@ -20138,43 +21231,6 @@ function run_pre_delivery_final_check(target_window)
     end
 
     local status_text = string.format("最终交付检查完成，发现 %d 个问题，已打 %d 个 marker", #issues, marker_count)
-    local speech_failure_reason = ""
-    if speech_summary and type(speech_summary.failed_reasons) == "table" and speech_summary.failed_reasons[1] then
-        speech_failure_reason = tostring(speech_summary.failed_reasons[1] or "")
-        if #speech_failure_reason > 90 then
-            speech_failure_reason = speech_failure_reason:sub(1, 90) .. "..."
-        end
-    elseif speech_summary and trim_text(speech_summary.reason or "") ~= "" then
-        speech_failure_reason = tostring(speech_summary.reason or "")
-        if #speech_failure_reason > 90 then
-            speech_failure_reason = speech_failure_reason:sub(1, 90) .. "..."
-        end
-    end
-    if speech_summary and trim_text(speech_summary.speech_backend or "") ~= "" then
-        status_text = status_text .. string.format("，口播ASR=%s/%s", tostring(speech_summary.speech_backend or ""), tostring(speech_summary.speech_model or ""))
-        if tonumber(speech_summary.skipped_batch_count) and tonumber(speech_summary.skipped_batch_count) > 0 then
-            status_text = status_text .. string.format("，口播一致性跳过 %d 批", tonumber(speech_summary.skipped_batch_count) or 0)
-        end
-        if tonumber(speech_summary.failed_batch_count) and tonumber(speech_summary.failed_batch_count) > 0 then
-            status_text = status_text .. string.format("，口播一致性失败 %d 批", tonumber(speech_summary.failed_batch_count) or 0)
-            if trim_text(speech_failure_reason) ~= "" then
-                status_text = status_text .. "：" .. speech_failure_reason
-            end
-        end
-    elseif speech_summary and speech_summary.failed then
-        local failed_count = tonumber(speech_summary.failed_batch_count) or 0
-        if failed_count > 0 then
-            status_text = status_text .. string.format("，口播一致性失败 %d 批", failed_count)
-            if trim_text(speech_failure_reason) ~= "" then
-                status_text = status_text .. "：" .. speech_failure_reason
-            end
-        else
-            status_text = status_text .. "，口播一致性跳过"
-            if trim_text(speech_failure_reason) ~= "" then
-                status_text = status_text .. "：" .. speech_failure_reason
-            end
-        end
-    end
     if marker_failed_count > 0 then
         status_text = status_text .. string.format("，marker 失败 %d 个", marker_failed_count)
         for _, issue in ipairs(issues) do
