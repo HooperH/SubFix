@@ -243,6 +243,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "window_seam_suppressed_count",
         "cross_mic_boundary_serialized_count",
         "structural_duplicate_suppressed_count",
+        "near_duplicate_suppressed_count",
         "orphan_segment_merged_count",
         "short_gap_filled_count",
         "text_conservation_failed_count",
@@ -4504,6 +4505,7 @@ def run_generate_subtitles_batch_plan_v4(
         "window_seam_suppressed_count": 0,
         "cross_mic_boundary_serialized_count": 0,
         "cross_mic_duplicate_count": 0,
+        "near_duplicate_suppressed_count": 0,
         "short_speaker_flip_suppressed_count": 0,
         "asr_empty_speech_window_count": 0,
         "asr_single_retry_count": 0,
@@ -5114,6 +5116,11 @@ def run_generate_subtitles_batch_plan_v4(
             float(args.fps or 30.0),
         )
         diagnostic.update(exclusive_diagnostic)
+        canonical_units, near_duplicate_diagnostic = generate_v4.suppress_near_duplicate_units(
+            canonical_units,
+            float(args.fps or 30.0),
+        )
+        diagnostic.update(near_duplicate_diagnostic)
         write_progress(
             progress_path,
             "segment_subtitles",

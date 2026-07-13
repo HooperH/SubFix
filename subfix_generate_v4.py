@@ -992,6 +992,59 @@ def build_exclusive_unit_stream(
     }
 
 
+def suppress_near_duplicate_units(
+    units: list[dict[str, Any]],
+    fps: float,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    ordered = sorted(
+        [dict(unit) for unit in units or []],
+        key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)),
+    )
+    maximum_gap_frames = max(1, int(round(1.2 * fps)))
+    output: list[dict[str, Any]] = []
+    suppressed = 0
+
+    for unit in ordered:
+        start = int(unit.get("start_frame") or 0)
+        end = max(start + 1, int(unit.get("end_frame") or start + 1))
+        text = normalize_text(unit.get("text"))
+        previous = output[-1] if output else None
+        duration = end - start
+        decision = str(unit.get("speaker_decision") or "")
+        short_candidate = duration <= 3 or (
+            decision == "smoothed_short_flip"
+            and duration <= max(3, int(round(0.3 * fps)))
+        )
+        if previous is not None and 1 <= len(text) <= 2 and short_candidate:
+            previous_end = int(previous.get("end_frame") or 0)
+            previous_text = normalize_text(previous.get("text"))
+            gap = start - previous_end
+            changed_track = int(previous.get("track_index") or 0) != int(unit.get("track_index") or 0)
+            low_score_punctuated_tail = (
+                duration <= 3
+                and float(unit.get("asr_punctuation_strength") or 0.0) >= 1.0
+                and float(unit.get("source_score") or 0.0) + 4.0
+                <= float(previous.get("source_score") or 0.0)
+            )
+            # Short duration alone would erase valid word-internal repeats such as "拼多多".
+            has_ghost_evidence = (
+                changed_track
+                or gap > 0
+                or decision == "smoothed_short_flip"
+                or low_score_punctuated_tail
+            )
+            if (
+                0 <= gap <= maximum_gap_frames
+                and previous_text.endswith(text)
+                and has_ghost_evidence
+            ):
+                suppressed += 1
+                continue
+        output.append(unit)
+
+    return output, {"near_duplicate_suppressed_count": suppressed}
+
+
 def _serialize_punctuated_cross_mic_boundaries(
     units: list[dict[str, Any]],
     fps: float,
