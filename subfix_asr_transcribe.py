@@ -75,6 +75,30 @@ class _LazyGenerateV5:
 generate_v5 = _LazyGenerateV5()
 
 
+class _LazyGenerateTextnorm:
+    _module: Any = None
+
+    def _load(self) -> Any:
+        if self._module is not None:
+            return self._module
+        module_path = Path(__file__).resolve().with_name("subfix_generate_textnorm.py")
+        if not module_path.is_file():
+            raise RuntimeError(f"数字与格式规范化模块缺失: {module_path.name}")
+        spec = importlib.util.spec_from_file_location("subfix_generate_textnorm", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("数字与格式规范化模块无法加载")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._module = module
+        return module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+generate_textnorm = _LazyGenerateTextnorm()
+
+
 DEFAULT_MODEL = "small"
 DEFAULT_CTC_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
 HELPER_VERSION = "subfix-2026-07-13-candidate-arbitration-v5"
@@ -267,6 +291,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "energy_valley_boundary_count",
         "confirmed_silence_preserved_count",
         "tail_extended_row_count",
+        "textnorm_changed_row_count",
         "profile_load_status",
         "failure_code",
     }
@@ -4522,6 +4547,7 @@ def run_generate_subtitles_batch_plan_v4(
         "asr_recovered_window_count": 0,
         "asr_unrecovered_window_count": 0,
         "tail_extended_row_count": 0,
+        "textnorm_changed_row_count": 0,
     }
     profile: dict[str, Any] | None = None
     active_mode_profile: dict[str, Any] | None = None
@@ -5174,6 +5200,8 @@ def run_generate_subtitles_batch_plan_v4(
             tail_extension_max_gap_frames,
         )
         diagnostic["tail_extended_row_count"] = tail_extended_row_count
+        subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
+        diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
         if v5_mode and subtitle_rows:
             refined_rows: list[dict[str, Any]] = []
             refinement_diagnostic = {
