@@ -1653,24 +1653,18 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     local selected_audio_sources = nil
-    local selected_subtitle_mode = nil
-    local subtitle_mode = "narration"
+    -- 模式选择下拉已移除，固定使用现场模式（单轨自然退化为单人识别）
+    local subtitle_mode = "live"
     local dialog_cancelled = false
     local track_rows = {}
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = {460, 250, 420, 260},
+        Geometry = {460, 250, 420, 230},
     },
     ui:VGroup{
         Spacing = 8,
         ContentsMargins = 12,
-        ui:HGroup{
-            Weight = 0,
-            Spacing = 8,
-            ui:Label{Text = "节目类型", Weight = 0, MinimumSize = {80, 0}},
-            ui:ComboBox{ID = "GenerateSubtitleModeCombo", Weight = 1}
-        },
         ui:Label{ID = "GenerateSelectionInfoLabel", Text = "选择用于识别的音频轨道", Weight = 0},
         ui:Tree{
             ID = "GenerateAudioTrackTree",
@@ -1700,13 +1694,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local items = selection_window:GetItems()
     local track_tree = items and items.GenerateAudioTrackTree or nil
-    local mode_combo = items and items.GenerateSubtitleModeCombo or nil
     if not track_tree then return nil, nil, "无法初始化音频轨道列表" end
-    if mode_combo then
-        mode_combo:AddItem("叙述模式（单人）")
-        mode_combo:AddItem("现场模式（单轨/多麦）")
-        pcall(function() mode_combo.CurrentIndex = 0 end)
-    end
     pcall(function() track_tree.ColumnCount = 2 end)
     pcall(function() track_tree.HeaderHidden = true end)
     pcall(function() track_tree.RootIsDecorated = false end)
@@ -1743,46 +1731,27 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         set_tree_item_text(row.item, 0, row.checked and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK)
     end
 
-    local function apply_subtitle_mode_selection()
-        local selected_index = 1
-        for index, row in ipairs(track_rows) do
-            if row.checked then selected_index = index break end
-        end
-        for index, row in ipairs(track_rows) do set_track_checked(row, index == selected_index) end
-        safe_refresh_tree_widget(track_tree)
-    end
-
+    -- 现场模式支持多麦：点击即切换该轨勾选状态（单轨场景自然退化为单选）
     function selection_window.On.GenerateAudioTrackTree.ItemClicked(ev)
         local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem"})
         if not item then item = get_selected_tree_node(track_tree) end
         if not item then return end
         local row_index = item_map[item]
         if row_index and track_rows[row_index] then
-            if subtitle_mode == "narration" then
-                for index, row in ipairs(track_rows) do set_track_checked(row, index == row_index) end
-            else
-                set_track_checked(track_rows[row_index], not track_rows[row_index].checked)
-            end
+            set_track_checked(track_rows[row_index], not track_rows[row_index].checked)
             safe_refresh_tree_widget(track_tree)
         end
     end
 
-    function selection_window.On.GenerateSubtitleModeCombo.CurrentIndexChanged(ev)
-        local current_index = mode_combo and tonumber(mode_combo.CurrentIndex) or 0
-        subtitle_mode = current_index == 1 and "live" or "narration"
-        apply_subtitle_mode_selection()
-    end
-
     function selection_window.On.GenerateSelectionConfirmBtn.Clicked(ev)
         selected_audio_sources = collect_checked_audio_sources()
-        if subtitle_mode == "live" and #selected_audio_sources < 1 then
+        if #selected_audio_sources < 1 then
             selected_audio_sources = nil
             if items and items.GenerateSelectionInfoLabel then
                 items.GenerateSelectionInfoLabel.Text = "现场模式至少选择一条音频轨道"
             end
             return
         end
-        selected_subtitle_mode = subtitle_mode
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end
@@ -1818,7 +1787,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     if #selected_audio_sources == 0 then
         return nil, nil, "请至少选择一个音频轨道"
     end
-    return selected_audio_sources, selected_subtitle_mode or subtitle_mode, nil
+    return selected_audio_sources, subtitle_mode, nil
 end
 
 local function progress_elapsed_text(started_at)
@@ -2483,7 +2452,8 @@ local function generate_selection_subtitles()
         print(string.format("[SubFix Generate] 音频候选已按轨道折叠: %d -> %d", raw_audio_source_count, #audio_sources))
     end
     local selected_audio_sources = nil
-    local subtitle_mode = "narration"
+    -- 模式选择下拉已移除，固定使用现场模式
+    local subtitle_mode = "live"
     local selection_err = nil
     if #audio_sources == 1 then
         selected_audio_sources = audio_sources
