@@ -22,6 +22,13 @@
 4. ASCII 固定词大小写规范化（ai -> AI、iphone -> iPhone、ok -> OK）只处理**独立的 ASCII
    token**：要求 token 前后一个字符（如果存在）不是 ASCII 字母或数字。汉字、其他非 ASCII
    字符不会挡住/触发这个判断之外的副作用，因为判断只看「是否是 ASCII 字母数字」。
+5. 主机制的三条安全阀（P2-问题5 回归修复）：
+   a) 模糊量词紧邻数字串之前（几、多、来、余、上、约、近，含「好几」——因为紧邻字符
+      是「几」）时不转换，如「几万块钱」「好几十块钱」，避免把约数当精确数字处理。
+   b) 数字串中出现两个相邻的个位数字符（一二三四五六七八九）视为概数连写（二三十、
+      三四十、七八个），不转换。
+   c) 数字串解析结果为 0 但原文并非「零/〇」时，视为解析失败（如光秃秃的「万」被
+      误判成 0），保留原文，避免「万块钱」被转换成「0块钱」。
 """
 
 from __future__ import annotations
@@ -111,6 +118,14 @@ _DIGIT_VALUE: Dict[str, int] = {
 # 量词前不转换的「不定冠词式」单字数字：中文里「一个/一条/下一个/两个/一只」中的
 # 「一」「两」是不定冠词/口语用法，人工字幕全部保留汉字，量词触发机制必须放行。
 _ARTICLE_LIKE_NUMERALS: Tuple[str, ...] = ("一", "两")
+
+# 模糊量词字符：紧邻在数字串之前出现时（如「几万」「好几十」「多十」「来十」「上十」
+# 「约十」「近十」），说明说话人在表达约数而非精确数字，整段数字串不转换，保留原文。
+_FUZZY_QUANTIFIER_CHARS: Tuple[str, ...] = ("几", "多", "来", "余", "上", "约", "近")
+
+# 概数连写判定用的个位数字符集合（不含零/两/十/百/千/万等）：数字串中若出现两个
+# 相邻的此类字符（如「二三十」「三四十」「七八个」），视为概数连写，不转换。
+_SINGLE_DIGIT_CHARS: Tuple[str, ...] = ("一", "二", "三", "四", "五", "六", "七", "八", "九")
 
 _UNIT_VALUE: Dict[str, int] = {
     "十": 10,
@@ -224,9 +239,28 @@ def _quantifier_trigger_replacement(match: "re.Match[str]") -> str:
     # 「十」及多字数字（四十、三千、十一）照常转换。
     if run in _ARTICLE_LIKE_NUMERALS:
         return run
+
+    # 模糊量词紧邻数字串之前（几万、好几十、多十、来十、余十、上十、约十、近十）：
+    # 说话人在表达约数，整段数字串保留原文，不转换。
+    start = match.start()
+    if start > 0 and match.string[start - 1] in _FUZZY_QUANTIFIER_CHARS:
+        return run
+
+    # 概数连写（二三十、三四十、七八个……）：数字串中出现两个相邻的个位数字符，
+    # 视为约数连写而非精确数字，保留原文。
+    for prev_char, next_char in zip(run, run[1:]):
+        if prev_char in _SINGLE_DIGIT_CHARS and next_char in _SINGLE_DIGIT_CHARS:
+            return run
+
     value = _parse_chinese_number(run)
     if value is None:
         return run
+
+    # 解析结果为 0 但原文并非「零/〇」时，视为解析失败（如光秃秃的「万」被误判为
+    # 0），保留原文，避免「万块钱」「几万块钱」这类表达被错误转换成「0块钱」。
+    if value == 0 and any(char not in ("零", "〇") for char in run):
+        return run
+
     return str(value)
 
 
