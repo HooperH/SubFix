@@ -8047,6 +8047,7 @@
         "training_epochs": 16,
         "validation_f1": 0.747082
       },
+      "model_boundary_evidence_margin": 0.0,
       "length_model": {
         "minimum": 6,
         "median": 6,
