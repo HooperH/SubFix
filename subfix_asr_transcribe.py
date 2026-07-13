@@ -266,6 +266,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "audio_refinement_suggested_silence_count",
         "energy_valley_boundary_count",
         "confirmed_silence_preserved_count",
+        "tail_extended_row_count",
         "profile_load_status",
         "failure_code",
     }
@@ -4520,6 +4521,7 @@ def run_generate_subtitles_batch_plan_v4(
         "asr_subwindow_retry_count": 0,
         "asr_recovered_window_count": 0,
         "asr_unrecovered_window_count": 0,
+        "tail_extended_row_count": 0,
     }
     profile: dict[str, Any] | None = None
     active_mode_profile: dict[str, Any] | None = None
@@ -5163,6 +5165,15 @@ def run_generate_subtitles_batch_plan_v4(
             profile,
             float(args.fps or 30.0),
         )
+        tail_extension_max_gap_frames = int(
+            round(generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS * float(args.fps or 30.0))
+        )
+        subtitle_rows, tail_extended_row_count = generate_v4.extend_subtitle_row_tails(
+            subtitle_rows,
+            float(args.fps or 30.0),
+            tail_extension_max_gap_frames,
+        )
+        diagnostic["tail_extended_row_count"] = tail_extended_row_count
         if v5_mode and subtitle_rows:
             refined_rows: list[dict[str, Any]] = []
             refinement_diagnostic = {

@@ -35,6 +35,15 @@ CROSS_MIC_ECHO_TEXT_SIMILARITY = 0.80
 CROSS_MIC_ECHO_MINIMUM_CHARACTERS = 4
 CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES = 5
 CROSS_MIC_ECHO_AMBIGUOUS_DB = 2.0
+# P3-问题6 (行尾显示延伸): trigger window G selected via parameter
+# simulation over G in {round(0.5*fps), round(1.0*fps), round(1.5*fps)}
+# against the 2026-07-13 bili_master fixture replay; per-row extension is
+# additionally capped at round(0.27*fps) frames (capped variant simulated
+# and selected by review) so a row nudges toward the next line's start
+# without swallowing a skipped manual boundary. See commit message for the
+# full table.
+SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS = 1.0
+SUBTITLE_ROW_TAIL_EXTENSION_MAX_SECONDS = 0.27
 
 
 class V4AlignmentError(RuntimeError):
@@ -1825,6 +1834,48 @@ def segment_canonical_units(
     finalized_diagnostic["single_unit_merged_count"] = single_unit_merged_count
     finalized_diagnostic["text_conservation_failed_count"] = 0
     return finalized_rows, finalized_diagnostic
+
+
+def extend_subtitle_row_tails(
+    rows: list[dict[str, Any]],
+    fps: float,
+    max_gap_frames: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Extend each row's display end toward the next row's start.
+
+    P3-问题6: manual editors habitually keep a subtitle row on screen until
+    the next line's speech begins, while the DP segmenter cuts a row the
+    moment its own speech ends. If the gap between the current row's
+    ``end_frame`` and the next row's ``start_frame`` is small (<= max_gap_frames),
+    treat it as the same "kept on screen" gap and extend the current row's
+    ``end_frame`` toward it, by at most
+    ``round(SUBTITLE_ROW_TAIL_EXTENSION_MAX_SECONDS * fps)`` frames per row
+    (capped variant selected by review simulation: extending all the way to
+    the next row's start swallowed skipped manual boundaries and collapsed
+    one-to-one matches). A gap larger than ``max_gap_frames`` is treated as
+    real silence and is left untouched. Rows that are already adjacent
+    (gap <= 0) are also left untouched. Only ``end_frame`` is mutated; text
+    and start_frame are never touched, so this cannot violate
+    segment_canonical_units' text conservation invariant.
+
+    Returns (rows, tail_extended_row_count).
+    """
+    ordered = sorted(
+        [dict(row) for row in rows or []],
+        key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)),
+    )
+    max_extension_frames = max(1, int(round(SUBTITLE_ROW_TAIL_EXTENSION_MAX_SECONDS * fps)))
+    extended_count = 0
+    for index in range(len(ordered) - 1):
+        current = ordered[index]
+        following = ordered[index + 1]
+        current_end = int(current.get("end_frame") or 0)
+        following_start = int(following.get("start_frame") or 0)
+        gap = following_start - current_end
+        if 0 < gap <= max_gap_frames:
+            current["end_frame"] = current_end + min(gap, max_extension_frames)
+            extended_count += 1
+    return ordered, extended_count
 
 
 def _feature_names(text: str, position: int) -> list[str]:
