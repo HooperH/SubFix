@@ -12,6 +12,7 @@ SOURCE_GENERATE_CORE="$SCRIPT_DIR/.subfix_support/subfix_generate_selection_core
 SOURCE_ASR_HELPER="$SCRIPT_DIR/subfix_asr_transcribe.py"
 SOURCE_GENERATE_V4="$SCRIPT_DIR/subfix_generate_v4.py"
 SOURCE_GENERATE_V5="$SCRIPT_DIR/subfix_generate_v5.py"
+SOURCE_GENERATE_TEXTNORM="$SCRIPT_DIR/subfix_generate_textnorm.py"
 SOURCE_ASR_SETUP="$SCRIPT_DIR/setup_asr_env.sh"
 SOURCE_SEGMENTATION_PROFILE="$SCRIPT_DIR/.subfix_support/segmentation_profile.json"
 SOURCE_SEGMENTATION_PROFILE_V3="$SCRIPT_DIR/.subfix_support/segmentation_profile_v3.json"
@@ -34,7 +35,7 @@ echo "🔄 正在同步到 DaVinci Resolve 插件目录..."
 echo "📁 源文件: $SOURCE_LUA"
 echo "📁 目标: $SUBFIX_MENU_DIR/SubFix.lua"
 
-for required in "$SOURCE_LUA" "$SOURCE_GENERATOR_LUA" "$SOURCE_GENERATE_CORE" "$SOURCE_ASR_HELPER" "$SOURCE_GENERATE_V4" "$SOURCE_GENERATE_V5" "$SOURCE_ASR_SETUP" "$SOURCE_SEGMENTATION_PROFILE" "$SOURCE_SEGMENTATION_PROFILE_V3" "$SOURCE_SEGMENTATION_PROFILE_V4"; do
+for required in "$SOURCE_LUA" "$SOURCE_GENERATOR_LUA" "$SOURCE_GENERATE_CORE" "$SOURCE_ASR_HELPER" "$SOURCE_GENERATE_V4" "$SOURCE_GENERATE_V5" "$SOURCE_GENERATE_TEXTNORM" "$SOURCE_ASR_SETUP" "$SOURCE_SEGMENTATION_PROFILE" "$SOURCE_SEGMENTATION_PROFILE_V3" "$SOURCE_SEGMENTATION_PROFILE_V4"; do
   if [[ ! -f "$required" ]]; then
     echo "❌ 未找到源文件: $required"
     exit 1
@@ -51,6 +52,7 @@ if cp "$SOURCE_LUA" "$SUBFIX_MENU_DIR/SubFix.lua" \
   && cp "$SOURCE_ASR_HELPER" "$HELPER_DIR/subfix_asr_transcribe.py" \
   && cp "$SOURCE_GENERATE_V4" "$HELPER_DIR/subfix_generate_v4.py" \
   && cp "$SOURCE_GENERATE_V5" "$HELPER_DIR/subfix_generate_v5.py" \
+  && cp "$SOURCE_GENERATE_TEXTNORM" "$HELPER_DIR/subfix_generate_textnorm.py" \
   && cp "$SOURCE_ASR_SETUP" "$HELPER_DIR/setup_asr_env.sh" \
   && cp "$SOURCE_SEGMENTATION_PROFILE" "$HELPER_DIR/segmentation_profile.json" \
   && cp "$SOURCE_SEGMENTATION_PROFILE_V3" "$HELPER_DIR/segmentation_profile_v3.json" \
@@ -77,6 +79,7 @@ if command -v rsync &> /dev/null; then
     && rsync -av "$SOURCE_ASR_HELPER" "$HELPER_DIR/subfix_asr_transcribe.py" \
     && rsync -av "$SOURCE_GENERATE_V4" "$HELPER_DIR/subfix_generate_v4.py" \
     && rsync -av "$SOURCE_GENERATE_V5" "$HELPER_DIR/subfix_generate_v5.py" \
+    && rsync -av "$SOURCE_GENERATE_TEXTNORM" "$HELPER_DIR/subfix_generate_textnorm.py" \
     && rsync -av "$SOURCE_ASR_SETUP" "$HELPER_DIR/setup_asr_env.sh" \
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE" "$HELPER_DIR/segmentation_profile.json" \
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V3" "$HELPER_DIR/segmentation_profile_v3.json" \
@@ -115,6 +118,7 @@ echo "cp \"$SOURCE_GENERATE_CORE\" \"$HELPER_DIR/subfix_generate_selection_core.
 echo "cp \"$SOURCE_ASR_HELPER\" \"$HELPER_DIR/subfix_asr_transcribe.py\""
 echo "cp \"$SOURCE_GENERATE_V4\" \"$HELPER_DIR/subfix_generate_v4.py\""
 echo "cp \"$SOURCE_GENERATE_V5\" \"$HELPER_DIR/subfix_generate_v5.py\""
+echo "cp \"$SOURCE_GENERATE_TEXTNORM\" \"$HELPER_DIR/subfix_generate_textnorm.py\""
 echo "cp \"$SOURCE_ASR_SETUP\" \"$HELPER_DIR/setup_asr_env.sh\""
 echo "cp \"$SOURCE_SEGMENTATION_PROFILE\" \"$HELPER_DIR/segmentation_profile.json\""
 echo "cp \"$SOURCE_SEGMENTATION_PROFILE_V3\" \"$HELPER_DIR/segmentation_profile_v3.json\""
