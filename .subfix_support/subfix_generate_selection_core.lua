@@ -1657,10 +1657,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local subtitle_mode = "live"
     -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准。仅控制断句粒度
     -- （每条字幕最大字数），不涉及回声消除或断句算法本体。
+    -- UI 用两个互斥按钮代替下拉框：更直观，一眼看出当前选中项。
     local SUBTITLE_LENGTH_OPTIONS = {
         {label = "标准（≤25字）", max_chars = 25},
         {label = "短视频（≤10字）", max_chars = 10},
     }
+    local SUBTITLE_LENGTH_SELECTED_PREFIX = "● "
+    local SUBTITLE_LENGTH_UNSELECTED_PREFIX = "　"
+    local selected_length_index = 1
     local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
     local dialog_cancelled = false
     local track_rows = {}
@@ -1683,7 +1687,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Weight = 0,
             Spacing = 8,
             ui:Label{Text = "字幕长度：", Weight = 0},
-            ui:ComboBox{ID = "GenerateSubtitleLengthCombo", Weight = 1, MinimumSize = {0, 26}}
+            ui:Button{ID = "GenerateSubtitleLengthStandardBtn", Text = "标准（≤25字）", Weight = 1, MinimumSize = {0, 26}},
+            ui:Button{ID = "GenerateSubtitleLengthShortBtn", Text = "短视频（≤10字）", Weight = 1, MinimumSize = {0, 26}}
         },
         ui:Label{
             ID = "GenerateSelectionRangeLabel",
@@ -1715,18 +1720,29 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     pcall(function() track_tree.ColumnWidth[0] = 28 end)
     pcall(function() track_tree.ColumnWidth[1] = 340 end)
 
-    local length_combo = items and items.GenerateSubtitleLengthCombo or nil
-    if length_combo then
-        for _, option in ipairs(SUBTITLE_LENGTH_OPTIONS) do
-            pcall(function() length_combo:AddItem(option.label) end)
+    local length_standard_btn = items and items.GenerateSubtitleLengthStandardBtn or nil
+    local length_short_btn = items and items.GenerateSubtitleLengthShortBtn or nil
+
+    local function refresh_subtitle_length_buttons()
+        if length_standard_btn then
+            local prefix = selected_length_index == 1 and SUBTITLE_LENGTH_SELECTED_PREFIX or SUBTITLE_LENGTH_UNSELECTED_PREFIX
+            pcall(function() length_standard_btn.Text = prefix .. SUBTITLE_LENGTH_OPTIONS[1].label end)
         end
-        pcall(function() length_combo.CurrentIndex = 0 end)
+        if length_short_btn then
+            local prefix = selected_length_index == 2 and SUBTITLE_LENGTH_SELECTED_PREFIX or SUBTITLE_LENGTH_UNSELECTED_PREFIX
+            pcall(function() length_short_btn.Text = prefix .. SUBTITLE_LENGTH_OPTIONS[2].label end)
+        end
     end
 
+    local function select_subtitle_length(index)
+        selected_length_index = index
+        refresh_subtitle_length_buttons()
+    end
+
+    refresh_subtitle_length_buttons()
+
     local function read_selected_max_chars()
-        if not length_combo then return SUBTITLE_LENGTH_OPTIONS[1].max_chars end
-        local index = tonumber(length_combo.CurrentIndex) or 0
-        local option = SUBTITLE_LENGTH_OPTIONS[index + 1]
+        local option = SUBTITLE_LENGTH_OPTIONS[selected_length_index]
         return option and option.max_chars or SUBTITLE_LENGTH_OPTIONS[1].max_chars
     end
 
@@ -1769,6 +1785,15 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             set_track_checked(track_rows[row_index], not track_rows[row_index].checked)
             safe_refresh_tree_widget(track_tree)
         end
+    end
+
+    -- 字幕长度：两个互斥按钮，点击即切换选中项并高亮当前选择
+    function selection_window.On.GenerateSubtitleLengthStandardBtn.Clicked(ev)
+        select_subtitle_length(1)
+    end
+
+    function selection_window.On.GenerateSubtitleLengthShortBtn.Clicked(ev)
+        select_subtitle_length(2)
     end
 
     function selection_window.On.GenerateSelectionConfirmBtn.Clicked(ev)
