@@ -103,6 +103,12 @@ DEFAULT_MODEL = "small"
 DEFAULT_CTC_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
 HELPER_VERSION = "subfix-2026-07-13-candidate-arbitration-v5"
 TRANSCRIBE_BACKENDS = ("mimo_asr", "qwen3_asr", "mlx_whisper", "openai_whisper")
+# NOTE: GENERATED_SUBTITLE_MAX_CHARS and friends below drive the legacy v3
+# rule-based splitter (split_generated_subtitle_text/_clause,
+# generate_subtitle_rows_from_segments). The user-facing "字幕长度"
+# (--max-chars) option only overrides the v4/v5 main segmentation path
+# (subfix_generate_v4.segment_canonical_units / _segmentation_length_parameters);
+# the v3 path intentionally keeps its own fixed constants untouched.
 GENERATED_SUBTITLE_MAX_CHARS = 18
 GENERATED_SUBTITLE_PREFERRED_MIN_CHARS = 8
 GENERATED_SUBTITLE_PREFERRED_MAX_CHARS = 14
@@ -4126,6 +4132,9 @@ def run_generate_subtitles_batch_plan_v3(
     progress_path: Path | None,
     fixture_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # NOTE: legacy v3 path; intentionally does not read args.max_chars (see
+    # generate_subtitle_rows_from_segments / GENERATED_SUBTITLE_MAX_CHARS note
+    # above). Only the v4/v5 path honours --max-chars.
     if not batches:
         raise RuntimeError("缺少 generate_subtitles batch plan")
     source_batch_count = len(batches)
@@ -5192,6 +5201,7 @@ def run_generate_subtitles_batch_plan_v4(
             subtitle_mode,
             profile,
             float(args.fps or 30.0),
+            max_chars=getattr(args, "max_chars", None),
         )
         subtitle_rows, overlong_tail_reclaimed_count = generate_v4.reclaim_overlong_unit_tails(
             subtitle_rows,
@@ -6079,6 +6089,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fixture-json")
     parser.add_argument("--progress-json")
     parser.add_argument("--diagnostic-output")
+    parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=None,
+        help=(
+            "字幕长度（每条字幕最大字数）注入点，仅作用于 v4/v5 主断句路径"
+            " (segment_canonical_units)。不传时保持现有 length_model/profile 行为不变。"
+        ),
+    )
     args = parser.parse_args(argv)
 
     output_path = Path(args.output)

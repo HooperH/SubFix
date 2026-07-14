@@ -1646,21 +1646,28 @@ end
 
 local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     if not dispatcher or not ui then
-        return nil, nil, "无法初始化 Resolve UI"
+        return nil, nil, nil, "无法初始化 Resolve UI"
     end
     if type(audio_sources) ~= "table" or #audio_sources == 0 then
-        return nil, nil, "未找到与选区重叠的本地音频片段"
+        return nil, nil, nil, "未找到与选区重叠的本地音频片段"
     end
 
     local selected_audio_sources = nil
     -- 模式选择下拉已移除，固定使用现场模式（单轨自然退化为单人识别）
     local subtitle_mode = "live"
+    -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准。仅控制断句粒度
+    -- （每条字幕最大字数），不涉及回声消除或断句算法本体。
+    local SUBTITLE_LENGTH_OPTIONS = {
+        {label = "标准（≤25字）", max_chars = 25},
+        {label = "短视频（≤10字）", max_chars = 10},
+    }
+    local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
     local dialog_cancelled = false
     local track_rows = {}
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = {460, 250, 420, 230},
+        Geometry = {460, 250, 420, 260},
     },
     ui:VGroup{
         Spacing = 8,
@@ -1671,6 +1678,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Weight = 1,
             MinimumSize = {0, 90},
             Events = {ItemClicked = true}
+        },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "字幕长度：", Weight = 0},
+            ui:ComboBox{ID = "GenerateSubtitleLengthCombo", Weight = 1, MinimumSize = {0, 26}}
         },
         ui:Label{
             ID = "GenerateSelectionRangeLabel",
@@ -1694,13 +1707,28 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local items = selection_window:GetItems()
     local track_tree = items and items.GenerateAudioTrackTree or nil
-    if not track_tree then return nil, nil, "无法初始化音频轨道列表" end
+    if not track_tree then return nil, nil, nil, "无法初始化音频轨道列表" end
     pcall(function() track_tree.ColumnCount = 2 end)
     pcall(function() track_tree.HeaderHidden = true end)
     pcall(function() track_tree.RootIsDecorated = false end)
     pcall(function() track_tree.ItemsExpandable = false end)
     pcall(function() track_tree.ColumnWidth[0] = 28 end)
     pcall(function() track_tree.ColumnWidth[1] = 340 end)
+
+    local length_combo = items and items.GenerateSubtitleLengthCombo or nil
+    if length_combo then
+        for _, option in ipairs(SUBTITLE_LENGTH_OPTIONS) do
+            pcall(function() length_combo:AddItem(option.label) end)
+        end
+        pcall(function() length_combo.CurrentIndex = 0 end)
+    end
+
+    local function read_selected_max_chars()
+        if not length_combo then return SUBTITLE_LENGTH_OPTIONS[1].max_chars end
+        local index = tonumber(length_combo.CurrentIndex) or 0
+        local option = SUBTITLE_LENGTH_OPTIONS[index + 1]
+        return option and option.max_chars or SUBTITLE_LENGTH_OPTIONS[1].max_chars
+    end
 
     local item_map = {}
     for index, source in ipairs(audio_sources) do
@@ -1752,6 +1780,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             end
             return
         end
+        selected_max_chars = read_selected_max_chars()
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end
@@ -1782,12 +1811,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     if not selected_audio_sources then
-        return nil, nil, "已取消"
+        return nil, nil, nil, "已取消"
     end
     if #selected_audio_sources == 0 then
-        return nil, nil, "请至少选择一个音频轨道"
+        return nil, nil, nil, "请至少选择一个音频轨道"
     end
-    return selected_audio_sources, subtitle_mode, nil
+    return selected_audio_sources, subtitle_mode, selected_max_chars, nil
 end
 
 local function progress_elapsed_text(started_at)
@@ -2017,7 +2046,7 @@ local function build_asr_helper_command(audio_source, srt_path, json_path, timel
     return table.concat(cmd_parts, " "), nil
 end
 
-local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode)
+local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars)
     local paths = resolve_asr_paths()
     if not file_exists(paths.helper) then
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
@@ -2045,6 +2074,9 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         "--diagnostic-output", shell_quote(paths.diagnostic),
         "--progress-json", shell_quote(progress_path)
     }
+    max_chars = tonumber(max_chars) or 25
+    cmd_parts[#cmd_parts + 1] = "--max-chars"
+    cmd_parts[#cmd_parts + 1] = shell_quote(tostring(max_chars))
     local profile_path = resolve_segmentation_profile_path(paths, generate_engine)
     if profile_path then
         cmd_parts[#cmd_parts + 1] = "--segmentation-profile"
@@ -2158,9 +2190,9 @@ local function run_asr_helper_with_progress(audio_source, srt_path, json_path, t
     return true
 end
 
-local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode)
+local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars)
     local progress_path = json_path .. ".progress.json"
-    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode)
+    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars)
     if not cmd then return false, cmd_err end
     update_generate_progress_window(
         progress_state,
@@ -2454,12 +2486,14 @@ local function generate_selection_subtitles()
     local selected_audio_sources = nil
     -- 模式选择下拉已移除，固定使用现场模式
     local subtitle_mode = "live"
+    -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准，仅有 1 个音频候选自动跳过弹窗时使用该默认值
+    local max_chars = 25
     local selection_err = nil
     if #audio_sources == 1 then
         selected_audio_sources = audio_sources
         print("[SubFix Generate] 仅有 1 个音频候选，自动使用: " .. format_audio_source_label(audio_sources[1], fps))
     else
-        selected_audio_sources, subtitle_mode, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
+        selected_audio_sources, subtitle_mode, max_chars, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
     if not selected_audio_sources then error(selection_err or "已取消") end
     local selected_track_sources = collect_selected_track_sources(selected_audio_sources)
@@ -2519,7 +2553,8 @@ local function generate_selection_subtitles()
         fps,
         progress_state,
         #selected_track_sources,
-        subtitle_mode
+        subtitle_mode,
+        max_chars
     )
     if not helper_ok then
         finish_generate_progress_window(progress_state, helper_status == "cancelled" and "已取消" or "失败", helper_err)

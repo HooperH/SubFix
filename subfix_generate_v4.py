@@ -2035,6 +2035,7 @@ def _merge_single_unit_speaker_islands(units: list[dict[str, Any]]) -> tuple[lis
 def _segmentation_length_parameters(
     mode: str,
     profile: dict[str, Any] | None,
+    max_chars: int | None = None,
 ) -> tuple[int, int, int, int]:
     fallback_minimum, fallback_preferred_maximum, fallback_maximum = (
         (6, 14, 18) if mode == "live" else (8, 16, 18)
@@ -2045,6 +2046,18 @@ def _segmentation_length_parameters(
     median = max(minimum, int(length_model.get("median") or 11))
     preferred_maximum = max(median, int(length_model.get("preferred_maximum") or fallback_preferred_maximum))
     maximum = max(preferred_maximum, int(length_model.get("maximum") or fallback_maximum))
+    if max_chars is not None:
+        # User-facing "subtitle length" override (standard <=25 / short-video
+        # <=10): replaces the length_model-derived caps with values scaled
+        # from the requested per-row character ceiling. Only takes effect
+        # when a caller explicitly passes --max-chars; otherwise the
+        # length_model/profile-derived defaults above are untouched.
+        maximum = int(max_chars)
+        preferred_maximum = max(1, round(maximum * 0.8))
+        minimum = max(1, round(maximum * 0.4))
+        median = max(minimum, min(median, preferred_maximum))
+        preferred_maximum = max(median, preferred_maximum)
+        maximum = max(preferred_maximum, maximum)
     return minimum, median, preferred_maximum, maximum
 
 
@@ -2053,10 +2066,16 @@ def segment_canonical_units(
     mode: str,
     profile: dict[str, Any] | None,
     fps: float,
+    max_chars: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    max_chars_applied: int | str = max_chars if max_chars is not None else "default"
     ordered = sorted([dict(unit) for unit in units or []], key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)))
     if not ordered:
-        return [], {"ordinary_single_character_count": 0, "text_conservation_failed_count": 0}
+        return [], {
+            "ordinary_single_character_count": 0,
+            "text_conservation_failed_count": 0,
+            "max_chars_applied": max_chars_applied,
+        }
     expected_text = "".join(normalize_text(unit.get("text")) for unit in ordered)
     ordered, single_unit_merged_count = _merge_single_unit_speaker_islands(ordered)
     hard_positions = [
@@ -2077,7 +2096,7 @@ def segment_canonical_units(
         incomplete_merged = 0
         short_gap_filled = 0
         for end in [*hard_positions, len(ordered)]:
-            group_rows, group_diagnostic = segment_canonical_units(ordered[start:end], mode, profile, fps)
+            group_rows, group_diagnostic = segment_canonical_units(ordered[start:end], mode, profile, fps, max_chars=max_chars)
             rows.extend(group_rows)
             ordinary_suppressed += int(group_diagnostic.get("ordinary_single_character_suppressed_count") or 0)
             short_reply_suppressed += int(group_diagnostic.get("short_reply_suppressed_count") or 0)
@@ -2115,11 +2134,13 @@ def segment_canonical_units(
             "orphan_segment_merged_count": orphan_merged,
             "short_gap_filled_count": short_gap_filled,
             "text_conservation_failed_count": 0,
+            "max_chars_applied": max_chars_applied,
         }
     mode_profile = ((profile or {}).get("modes") or {}).get(mode) if profile and isinstance(profile.get("modes"), dict) else profile
     preferred_min, preferred_center, preferred_max, hard_max = _segmentation_length_parameters(
         mode,
         mode_profile,
+        max_chars=max_chars,
     )
     count = len(ordered)
     if count <= hard_max and not any(
@@ -2143,6 +2164,7 @@ def segment_canonical_units(
             raise RuntimeError("v4 segmentation text conservation failed")
         finalized_diagnostic["single_unit_merged_count"] = single_unit_merged_count
         finalized_diagnostic["text_conservation_failed_count"] = 0
+        finalized_diagnostic["max_chars_applied"] = max_chars_applied
         return finalized_rows, finalized_diagnostic
     scores = [-math.inf] * (count + 1)
     previous = [-1] * (count + 1)
@@ -2217,6 +2239,7 @@ def segment_canonical_units(
         raise RuntimeError("v4 segmentation text conservation failed")
     finalized_diagnostic["single_unit_merged_count"] = single_unit_merged_count
     finalized_diagnostic["text_conservation_failed_count"] = 0
+    finalized_diagnostic["max_chars_applied"] = max_chars_applied
     return finalized_rows, finalized_diagnostic
 
 
