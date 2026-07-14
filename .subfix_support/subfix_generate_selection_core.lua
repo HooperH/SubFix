@@ -1657,13 +1657,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local subtitle_mode = "live"
     -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准。仅控制断句粒度
     -- （每条字幕最大字数），不涉及回声消除或断句算法本体。
-    -- UI 用两个互斥按钮代替下拉框：更直观，一眼看出当前选中项。
+    -- UI 用两个互斥的小勾选项代替下拉框/大按钮：与上方音频轨道列表同款的
+    -- ☑/☐ 勾选样式，紧凑、一眼看出当前选中项。
     local SUBTITLE_LENGTH_OPTIONS = {
         {label = "标准（≤25字）", max_chars = 25},
         {label = "短视频（≤10字）", max_chars = 10},
     }
-    local SUBTITLE_LENGTH_SELECTED_PREFIX = "● "
-    local SUBTITLE_LENGTH_UNSELECTED_PREFIX = "　"
+    local SUBTITLE_LENGTH_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
+    local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
     local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
     local dialog_cancelled = false
@@ -1671,7 +1672,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = {460, 250, 420, 260},
+        Geometry = {460, 250, 420, 248},
     },
     ui:VGroup{
         Spacing = 8,
@@ -1687,8 +1688,9 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             Weight = 0,
             Spacing = 8,
             ui:Label{Text = "字幕长度：", Weight = 0},
-            ui:Button{ID = "GenerateSubtitleLengthStandardBtn", Text = "标准（≤25字）", Weight = 1, MinimumSize = {0, 26}},
-            ui:Button{ID = "GenerateSubtitleLengthShortBtn", Text = "短视频（≤10字）", Weight = 1, MinimumSize = {0, 26}}
+            ui:Button{ID = "GenerateSubtitleLengthStandardBtn", Text = "标准（≤25字）", Weight = 0, MinimumSize = {0, 20}},
+            ui:Button{ID = "GenerateSubtitleLengthShortBtn", Text = "短视频（≤10字）", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
         },
         ui:Label{
             ID = "GenerateSelectionRangeLabel",
