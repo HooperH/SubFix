@@ -290,6 +290,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "audio_refinement_suggested_silence_count",
         "energy_valley_boundary_count",
         "confirmed_silence_preserved_count",
+        "overlong_tail_reclaimed_count",
         "tail_extended_row_count",
         "textnorm_changed_row_count",
         "profile_load_status",
@@ -4546,6 +4547,7 @@ def run_generate_subtitles_batch_plan_v4(
         "asr_subwindow_retry_count": 0,
         "asr_recovered_window_count": 0,
         "asr_unrecovered_window_count": 0,
+        "overlong_tail_reclaimed_count": 0,
         "tail_extended_row_count": 0,
         "textnorm_changed_row_count": 0,
     }
@@ -5191,6 +5193,12 @@ def run_generate_subtitles_batch_plan_v4(
             profile,
             float(args.fps or 30.0),
         )
+        subtitle_rows, overlong_tail_reclaimed_count = generate_v4.reclaim_overlong_unit_tails(
+            subtitle_rows,
+            canonical_units,
+            float(args.fps or 30.0),
+        )
+        diagnostic["overlong_tail_reclaimed_count"] = overlong_tail_reclaimed_count
         tail_extension_max_gap_frames = int(
             round(generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS * float(args.fps or 30.0))
         )

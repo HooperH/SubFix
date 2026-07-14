@@ -60,6 +60,32 @@ CROSS_MIC_LATE_ECHO_SAME_UTTERANCE_GAP_SECONDS = 0.1
 # full table.
 SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS = 1.0
 SUBTITLE_ROW_TAIL_EXTENSION_MAX_SECONDS = 0.27
+# P3-问题6续 (回收句尾字对齐时长溢出): forced alignment occasionally hands the
+# last character (or last couple of characters) of a row an enormous span --
+# swallowing the pause/silence that should have followed it and dragging the
+# whole row's end_frame far past where the line actually finished. Real
+# example (fps=29.97, "机器人合集" diagnostic replay): "一分我想爸爸了"
+# 113065-113247 (182 frames) is built from per-character units 一(11) 分(5)
+# 我(5) 想(7) 爸(8) 爸(63) 了(64) -- the trailing "爸""了" pair is a clear
+# alignment overrun against the row's own 5-11 frame characters.
+#
+# Only the last OVERLONG_UNIT_TAIL_WINDOW characters of a row are ever
+# eligible ("末字/近末字"): overlong characters earlier in the row (or at the
+# very start of the row) don't push the row's displayed end_frame anywhere,
+# so leaving them alone is free and keeps this pass from ever guessing at
+# mid-row timing. A character only counts as overlong if its own duration
+# exceeds *both* a multiple of the row's own median character duration *and*
+# an absolute frame cap -- so a row where every character is uniformly a
+# little slow (real unhurried delivery) never trips the multiplier test, and
+# a genuinely drawn-out single-character row (e.g. "哇——") has nothing to
+# compare itself against (rows need >= 2 characters to run at all) and is
+# always left untouched. Reclaimed characters are given back the row's own
+# median duration (capped at the same absolute frame cap) rather than being
+# dropped to zero, so a real (if unusually long) character still gets a
+# plausible amount of screen time.
+OVERLONG_UNIT_TAIL_WINDOW = 2
+OVERLONG_UNIT_MEDIAN_MULTIPLIER = 4.0
+OVERLONG_UNIT_ABS_MAX_SECONDS = 0.6
 
 
 class V4AlignmentError(RuntimeError):
@@ -2192,6 +2218,76 @@ def segment_canonical_units(
     finalized_diagnostic["single_unit_merged_count"] = single_unit_merged_count
     finalized_diagnostic["text_conservation_failed_count"] = 0
     return finalized_rows, finalized_diagnostic
+
+
+def reclaim_overlong_unit_tails(
+    rows: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    fps: float,
+) -> tuple[list[dict[str, Any]], int]:
+    """Reclaim a row's end_frame when its last unit(s) hit an alignment overrun.
+
+    ``rows`` is the output of :func:`segment_canonical_units` (each row a
+    contiguous slice of ``units`` by character count); ``units`` is the same
+    per-character canonical unit stream that was fed into segmentation (each
+    with its own ``start_frame``/``end_frame``). Rows and units are both
+    re-sorted here for safety, but the pairing between a row and its
+    constituent units relies on the text-conservation invariant that
+    segmentation already guarantees: walking the (sorted) units in order and
+    consuming exactly ``len(row["text"])`` characters per row reproduces the
+    same row/unit grouping segmentation itself used, with no need to trust
+    frame ranges for the association.
+
+    Only ``end_frame`` is ever mutated; text, row count, and start_frame are
+    untouched, so this cannot violate text conservation or shift any other
+    row's boundaries.
+
+    Returns (rows, overlong_tail_reclaimed_count).
+    """
+    ordered_units = sorted(
+        [dict(unit) for unit in units or []],
+        key=lambda unit: (int(unit.get("start_frame") or 0), int(unit.get("end_frame") or 0)),
+    )
+    output = [dict(row) for row in rows or []]
+    abs_cap_frames = max(1, int(round(OVERLONG_UNIT_ABS_MAX_SECONDS * fps)))
+    cursor = 0
+    reclaimed_count = 0
+    for row in output:
+        target_length = len(str(row.get("text") or ""))
+        row_units: list[dict[str, Any]] = []
+        consumed = 0
+        while consumed < target_length and cursor < len(ordered_units):
+            candidate_unit = ordered_units[cursor]
+            row_units.append(candidate_unit)
+            consumed += len(str(candidate_unit.get("text") or "")) or 1
+            cursor += 1
+        if len(row_units) < 2:
+            continue
+        durations = [
+            max(0, int(candidate_unit.get("end_frame") or 0) - int(candidate_unit.get("start_frame") or 0))
+            for candidate_unit in row_units
+        ]
+        median_duration = statistics.median(durations)
+        threshold = max(median_duration * OVERLONG_UNIT_MEDIAN_MULTIPLIER, abs_cap_frames)
+        window_start = max(0, len(row_units) - OVERLONG_UNIT_TAIL_WINDOW)
+        flagged_start = len(row_units)
+        index = len(row_units) - 1
+        while index >= window_start and durations[index] > threshold:
+            flagged_start = index
+            index -= 1
+        if flagged_start >= len(row_units):
+            continue
+        per_unit_cap_frames = max(1, min(int(round(median_duration)), abs_cap_frames))
+        flagged_count = len(row_units) - flagged_start
+        first_flagged_unit = row_units[flagged_start]
+        new_end_frame = int(first_flagged_unit.get("start_frame") or 0) + per_unit_cap_frames * flagged_count
+        original_start = int(row.get("start_frame") or 0)
+        original_end = int(row.get("end_frame") or 0)
+        new_end_frame = max(original_start + 1, min(new_end_frame, original_end))
+        if new_end_frame < original_end:
+            row["end_frame"] = new_end_frame
+            reclaimed_count += 1
+    return output, reclaimed_count
 
 
 def extend_subtitle_row_tails(
