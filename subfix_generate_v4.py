@@ -2313,6 +2313,165 @@ def reclaim_overlong_unit_tails(
     return output, reclaimed_count
 
 
+def _hard_cut_boundaries(row_units: list[dict[str, Any]], max_chars: int) -> list[int]:
+    """Choose unit-index boundaries splitting ``row_units`` into runs of at
+    most ``max_chars`` characters each.
+
+    Returns a sorted list of indices into ``row_units`` (each in
+    ``1..len(row_units) - 1``); ``row_units[:boundary]`` /
+    ``row_units[boundary:]`` marks a cut. Within the character window that
+    must be cut to respect ``max_chars``, a boundary right after an ASR
+    punctuation mark or the widest inter-unit time gap is preferred (the
+    least jarring place to break); when no such evidence exists in that
+    window the cut lands exactly at the ``max_chars`` character limit
+    (a forced/even split).
+    """
+    lengths = [len(str(unit.get("text") or "")) or 1 for unit in row_units]
+    prefix = [0]
+    for length in lengths:
+        prefix.append(prefix[-1] + length)
+    total = prefix[-1]
+    boundaries: list[int] = []
+    start_prefix = 0
+    unit_count = len(row_units)
+    while total - start_prefix > max_chars:
+        forced_limit = start_prefix + max_chars
+        best_index: int | None = None
+        best_score: tuple[int, int, int] | None = None
+        for index in range(1, unit_count):
+            if prefix[index] <= start_prefix:
+                continue
+            if prefix[index] > forced_limit:
+                break
+            left_unit = row_units[index - 1]
+            right_unit = row_units[index]
+            punctuation = 1 if (
+                _is_break_punctuation(str(left_unit.get("text") or ""))
+                or float(left_unit.get("asr_punctuation_strength") or 0.0) >= 1.0
+            ) else 0
+            gap = max(0, int(right_unit.get("start_frame") or 0) - int(left_unit.get("end_frame") or 0))
+            score = (punctuation, gap, prefix[index])
+            if best_score is None or score > best_score:
+                best_score = score
+                best_index = index
+        if best_index is not None and (best_score[0] > 0 or best_score[1] > 0):
+            chosen = best_index
+        else:
+            chosen = None
+            for index in range(1, unit_count):
+                if prefix[index] <= forced_limit:
+                    chosen = index
+                else:
+                    break
+            if chosen is None:
+                # A single canonical unit's own text already exceeds
+                # max_chars: there is no finer per-character time to split
+                # on, so cut after it anyway rather than fabricate a frame
+                # boundary inside it. This chunk will still exceed
+                # max_chars, which is the unavoidable floor set by the
+                # source alignment granularity.
+                chosen = 1
+        if chosen <= 0 or prefix[chosen] <= start_prefix:
+            break
+        boundaries.append(chosen)
+        start_prefix = prefix[chosen]
+    return boundaries
+
+
+def enforce_hard_char_limit(
+    rows: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    max_chars: int | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Hard-cap every row's character count at ``max_chars`` (post-processing).
+
+    功能: 短视频档硬性字数上限强制切. ``segment_canonical_units``'s DP
+    boundary scoring treats ``max_chars`` as a *soft* target: a long,
+    pause-free clause can still score higher unsplit than split (the split
+    penalty outweighs the length preference), so a handful of rows can land
+    above the requested cap. This pass is a deterministic backstop that
+    forces every row down to ``max_chars`` characters, no matter what the DP
+    decided.
+
+    Only takes effect when ``max_chars`` is not ``None`` — with no cap
+    requested (the pre-existing default), this returns ``rows`` unchanged
+    for full backward compatibility.
+
+    ``rows`` is the output of :func:`segment_canonical_units` (or of
+    :func:`reclaim_overlong_unit_tails`, which only touches ``end_frame``);
+    ``units`` is the same per-character canonical unit stream fed into
+    segmentation. As in :func:`reclaim_overlong_unit_tails`, rows and units
+    are paired by walking the (start_frame-sorted) units in order and
+    consuming exactly ``len(row["text"])`` characters per row — the same
+    grouping segmentation itself used, no need to trust frame ranges.
+
+    When a row needs splitting, each resulting sub-row's ``start_frame``/
+    ``end_frame`` comes from real per-character unit boundaries: the first
+    sub-row keeps the original row's ``start_frame``, the last sub-row keeps
+    the original row's ``end_frame`` (preserving any padding/extension
+    already applied upstream), and every internal cut uses the exact
+    ``start_frame`` of the unit beginning the next sub-row — so adjacent
+    sub-rows are frame-contiguous with no invented or overlapping time.
+    Text is preserved exactly (concatenating the sub-rows' text reproduces
+    the original row's text).
+
+    Returns (rows, hard_char_split_count) where hard_char_split_count counts
+    how many original rows were split (not the number of resulting rows).
+    """
+    if max_chars is None:
+        return [dict(row) for row in rows or []], 0
+    max_chars = max(1, int(max_chars))
+    ordered_units = sorted(
+        [dict(unit) for unit in units or []],
+        key=lambda unit: (int(unit.get("start_frame") or 0), int(unit.get("end_frame") or 0)),
+    )
+    output: list[dict[str, Any]] = []
+    cursor = 0
+    split_count = 0
+    for row in rows or []:
+        row = dict(row)
+        text = str(row.get("text") or "")
+        target_length = len(text)
+        row_units: list[dict[str, Any]] = []
+        consumed = 0
+        while consumed < target_length and cursor < len(ordered_units):
+            candidate_unit = ordered_units[cursor]
+            row_units.append(candidate_unit)
+            consumed += len(str(candidate_unit.get("text") or "")) or 1
+            cursor += 1
+        if len(text) <= max_chars or len(row_units) < 2:
+            output.append(row)
+            continue
+        boundaries = _hard_cut_boundaries(row_units, max_chars)
+        if not boundaries:
+            output.append(row)
+            continue
+        edges = [0, *boundaries, len(row_units)]
+        original_start = int(row.get("start_frame") or 0)
+        original_end = int(row.get("end_frame") or 0)
+        for position in range(len(edges) - 1):
+            slice_start, slice_end = edges[position], edges[position + 1]
+            sub_units = row_units[slice_start:slice_end]
+            sub_row = dict(row)
+            sub_row["text"] = "".join(str(unit.get("text") or "") for unit in sub_units)
+            if position == 0:
+                sub_row["start_frame"] = original_start
+            else:
+                sub_row["start_frame"] = int(sub_units[0].get("start_frame") or 0)
+            if position == len(edges) - 2:
+                sub_row["end_frame"] = original_end
+            else:
+                next_unit_start = int(row_units[slice_end].get("start_frame") or 0)
+                sub_row["end_frame"] = next_unit_start
+            sub_row["end_frame"] = max(sub_row["end_frame"], sub_row["start_frame"] + 1)
+            sub_row["segmentation_decision"] = "hard_char_split"
+            output.append(sub_row)
+        split_count += 1
+    for index, row in enumerate(output, start=1):
+        row["index"] = index
+    return output, split_count
+
+
 def extend_subtitle_row_tails(
     rows: list[dict[str, Any]],
     fps: float,

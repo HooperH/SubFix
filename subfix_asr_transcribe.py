@@ -5209,6 +5209,12 @@ def run_generate_subtitles_batch_plan_v4(
             float(args.fps or 30.0),
         )
         diagnostic["overlong_tail_reclaimed_count"] = overlong_tail_reclaimed_count
+        subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(
+            subtitle_rows,
+            canonical_units,
+            getattr(args, "max_chars", None),
+        )
+        diagnostic["hard_char_split_count"] = hard_char_split_count
         tail_extension_max_gap_frames = int(
             round(generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS * float(args.fps or 30.0))
         )
