@@ -35,6 +35,22 @@ CROSS_MIC_ECHO_TEXT_SIMILARITY = 0.80
 CROSS_MIC_ECHO_MINIMUM_CHARACTERS = 4
 CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES = 5
 CROSS_MIC_ECHO_AMBIGUOUS_DB = 2.0
+# "Late echo": a phrase already spoken on one track bleeds through a different
+# mic a few seconds later (room reflection / neighbouring performer's mic
+# picking up the tail of the line), instead of the near-simultaneous bleed the
+# maximum-median-offset check above targets. This is the single knob for how
+# far apart (in seconds) the two occurrences may be and still be treated as
+# the same echo -- do not hardcode a frame count anywhere else.
+CROSS_MIC_LATE_ECHO_MAX_GAP_SECONDS = 3.0
+# A whole-window text match can coincidentally splice together two unrelated
+# utterances that both happen to end/start with the same character (e.g. two
+# different sentences that each contain a stray "是"). Forced-aligned
+# characters within a single spoken phrase abut with ~0 gap; a real
+# sentence/utterance boundary leaves a noticeably larger gap. Matched runs are
+# trimmed to the longest stretch where both sides stay within this gap, so a
+# late-echo match can never accidentally swallow a neighbouring, unrelated
+# utterance on either track.
+CROSS_MIC_LATE_ECHO_SAME_UTTERANCE_GAP_SECONDS = 0.1
 # P3-问题6 (行尾显示延伸): trigger window G selected via parameter
 # simulation over G in {round(0.5*fps), round(1.0*fps), round(1.5*fps)}
 # against the 2026-07-13 bili_master fixture replay; per-row extension is
@@ -900,6 +916,7 @@ def _cross_mic_echo_candidate(
     left_end: int,
     right_start: int,
     right_end: int,
+    max_offset_frames: float = CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES,
 ) -> dict[str, Any] | None:
     left_slice = left_units[left_start:left_end]
     right_slice = right_units[right_start:right_end]
@@ -912,7 +929,7 @@ def _cross_mic_echo_candidate(
     median_offset = statistics.median(abs(offset) for offset in offsets) if offsets else math.inf
     if (
         similarity < CROSS_MIC_ECHO_TEXT_SIMILARITY
-        or median_offset > CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES
+        or median_offset > max_offset_frames
     ):
         return None
     return {
@@ -1054,6 +1071,342 @@ def _detect_cross_mic_echo_regions(
     return merged
 
 
+def _detect_late_cross_mic_echo_regions(
+    candidates: list[dict[str, Any]],
+    fps: float,
+) -> list[dict[str, Any]]:
+    """Delayed-echo counterpart to _detect_cross_mic_echo_regions.
+
+    The simultaneous detector above only accepts matches whose matched
+    characters land within CROSS_MIC_ECHO_MAXIMUM_MEDIAN_OFFSET_FRAMES of
+    each other -- i.e. genuinely simultaneous mic bleed. A different failure
+    mode: a phrase already spoken in full on one track gets picked up faintly
+    on another mic (room reflection / a neighbouring performer's mic) a few
+    seconds later, after the first track has already finished the line. That
+    repeat can itself be immediately followed, on the *same* track and with no
+    gap, by unrelated real speech -- so detection must operate at the
+    matched-character-run granularity (like the simultaneous detector) rather
+    than flagging a whole clause, or the trailing real content would be
+    deleted along with the echo.
+
+    Acceptance is gated on the wall-clock boundary gap between the two
+    occurrences (later occurrence's first frame minus the earlier
+    occurrence's last frame), which must be strictly positive (the earlier
+    line has already finished -- this is not overlapping simultaneous bleed,
+    that is the other detector's territory) and at most
+    CROSS_MIC_LATE_ECHO_MAX_GAP_SECONDS worth of frames. Each returned region
+    records which side occurred first as "earlier_side" ("left" or "right")
+    so callers only ever consider deleting the later, redundant repeat.
+    """
+    tracks: dict[int, list[dict[str, Any]]] = {}
+    ordered = sorted(
+        [candidate for candidate in candidates if normalize_text(candidate.get("text"))],
+        key=lambda row: (
+            int(row.get("start_frame") or 0),
+            int(row.get("end_frame") or 0),
+            int(row.get("track_index") or 0),
+        ),
+    )
+    for candidate in ordered:
+        tracks.setdefault(int(candidate.get("track_index") or 0), []).append(candidate)
+    track_indices = sorted(index for index in tracks if index > 0)
+    late_gap_frames = max(1, int(round(CROSS_MIC_LATE_ECHO_MAX_GAP_SECONDS * fps)))
+    window_frames = max(1, int(round(6.0 * fps)), late_gap_frames * 2)
+    step_frames = max(1, int(round(3.0 * fps)))
+    same_utterance_gap_frames = max(1, int(round(CROSS_MIC_LATE_ECHO_SAME_UTTERANCE_GAP_SECONDS * fps)))
+    join_gap_frames = same_utterance_gap_frames
+
+    def _boundary_gap(
+        left_slice: list[dict[str, Any]],
+        right_slice: list[dict[str, Any]],
+    ) -> tuple[int, str] | None:
+        left_first_start = int(left_slice[0].get("start_frame") or 0)
+        left_last_end = int(left_slice[-1].get("end_frame") or 0)
+        right_first_start = int(right_slice[0].get("start_frame") or 0)
+        right_last_end = int(right_slice[-1].get("end_frame") or 0)
+        if left_first_start <= right_first_start:
+            return right_first_start - left_last_end, "left"
+        return left_first_start - right_last_end, "right"
+
+    def _longest_same_utterance_run(
+        left_slice: list[dict[str, Any]],
+        right_slice: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Trim a difflib matching block down to its longest internally
+        contiguous (same-utterance) run on *both* sides.
+
+        `left_slice`/`right_slice` are the two, index-aligned halves of a
+        matching block (same length; left_slice[i] is matched to
+        right_slice[i]). Characters that were force-aligned within one
+        spoken phrase abut with ~0 gap; a real utterance/sentence boundary
+        leaves a much larger gap. A coincidental match can splice an
+        unrelated later utterance onto the tail of the true echo (e.g. an
+        unrelated "是" a few frames after the echo ends, matched against the
+        leading "是" of trailing real content) -- splitting wherever *either*
+        side's consecutive gap exceeds the tight same-utterance threshold and
+        keeping only the longest surviving run discards that contamination
+        without needing the far side to also show a gap.
+        """
+        size = len(left_slice)
+        if size <= 1:
+            return 0, size
+        best_start, best_end = 0, 1
+        run_start = 0
+        for index in range(1, size):
+            left_gap = int(left_slice[index].get("start_frame") or 0) - int(
+                left_slice[index - 1].get("end_frame") or 0
+            )
+            right_gap = int(right_slice[index].get("start_frame") or 0) - int(
+                right_slice[index - 1].get("end_frame") or 0
+            )
+            if left_gap > same_utterance_gap_frames or right_gap > same_utterance_gap_frames:
+                if (index - run_start) > (best_end - best_start):
+                    best_start, best_end = run_start, index
+                run_start = index
+        if (size - run_start) > (best_end - best_start):
+            best_start, best_end = run_start, size
+        return best_start, best_end
+
+    def _extend_matched_run(
+        left_units: list[dict[str, Any]],
+        right_units: list[dict[str, Any]],
+        left_start: int,
+        left_end: int,
+        right_start: int,
+        right_end: int,
+    ) -> tuple[int, int, int, int]:
+        """Grow a matched block outward, one character at a time, over the
+        *full* per-track unit lists (not the window-restricted slice used to
+        find it).
+
+        The sliding window used to bound the difflib comparison can clip the
+        true start/end of a genuine echo run purely because a character's
+        midpoint lands a few frames on the wrong side of an arbitrary window
+        boundary (e.g. the window ends one step short of the echo's tail, or
+        starts one step after the echo's head). Since the run is already
+        known-genuine at this point, extending it past the window edge as
+        long as the next character still matches and still abuts with no
+        real utterance gap recovers those clipped characters without
+        widening what counts as a match in the first place.
+        """
+        while (
+            left_start > 0
+            and right_start > 0
+            and normalize_text(left_units[left_start - 1].get("text"))
+            == normalize_text(right_units[right_start - 1].get("text"))
+            and int(left_units[left_start].get("start_frame") or 0)
+            - int(left_units[left_start - 1].get("end_frame") or 0)
+            <= same_utterance_gap_frames
+            and int(right_units[right_start].get("start_frame") or 0)
+            - int(right_units[right_start - 1].get("end_frame") or 0)
+            <= same_utterance_gap_frames
+        ):
+            left_start -= 1
+            right_start -= 1
+        while (
+            left_end < len(left_units)
+            and right_end < len(right_units)
+            and normalize_text(left_units[left_end].get("text"))
+            == normalize_text(right_units[right_end].get("text"))
+            and int(left_units[left_end].get("start_frame") or 0)
+            - int(left_units[left_end - 1].get("end_frame") or 0)
+            <= same_utterance_gap_frames
+            and int(right_units[right_end].get("start_frame") or 0)
+            - int(right_units[right_end - 1].get("end_frame") or 0)
+            <= same_utterance_gap_frames
+        ):
+            left_end += 1
+            right_end += 1
+        return left_start, left_end, right_start, right_end
+
+    regions: list[dict[str, Any]] = []
+    for left_position, left_track in enumerate(track_indices):
+        for right_track in track_indices[left_position + 1:]:
+            left_units = tracks[left_track]
+            right_units = tracks[right_track]
+            timeline_start = min(
+                int(left_units[0].get("start_frame") or 0),
+                int(right_units[0].get("start_frame") or 0),
+            )
+            timeline_end = max(
+                int(left_units[-1].get("end_frame") or 0),
+                int(right_units[-1].get("end_frame") or 0),
+            )
+            for window_start in range(timeline_start, timeline_end + 1, step_frames):
+                window_end = window_start + window_frames
+                left_indices = [
+                    index for index, unit in enumerate(left_units)
+                    if window_start <= _cross_mic_echo_midpoint(unit) < window_end
+                ]
+                right_indices = [
+                    index for index, unit in enumerate(right_units)
+                    if window_start <= _cross_mic_echo_midpoint(unit) < window_end
+                ]
+                if (
+                    len(left_indices) < CROSS_MIC_ECHO_MINIMUM_CHARACTERS
+                    or len(right_indices) < CROSS_MIC_ECHO_MINIMUM_CHARACTERS
+                ):
+                    continue
+                left_start, left_end = left_indices[0], left_indices[-1] + 1
+                right_start, right_end = right_indices[0], right_indices[-1] + 1
+                left_text = [normalize_text(unit.get("text")) for unit in left_units[left_start:left_end]]
+                right_text = [normalize_text(unit.get("text")) for unit in right_units[right_start:right_end]]
+                matcher = difflib.SequenceMatcher(None, left_text, right_text, autojunk=False)
+                for block in matcher.get_matching_blocks():
+                    if block.size < CROSS_MIC_ECHO_MINIMUM_CHARACTERS:
+                        continue
+                    block_left_start = left_start + block.a
+                    block_left_end = block_left_start + block.size
+                    block_right_start = right_start + block.b
+                    block_right_end = block_right_start + block.size
+                    trim_start, trim_end = _longest_same_utterance_run(
+                        left_units[block_left_start:block_left_end],
+                        right_units[block_right_start:block_right_end],
+                    )
+                    if trim_end - trim_start < CROSS_MIC_ECHO_MINIMUM_CHARACTERS:
+                        continue
+                    block_left_end = block_left_start + trim_end
+                    block_left_start = block_left_start + trim_start
+                    block_right_end = block_right_start + trim_end
+                    block_right_start = block_right_start + trim_start
+                    block_left_start, block_left_end, block_right_start, block_right_end = _extend_matched_run(
+                        left_units,
+                        right_units,
+                        block_left_start,
+                        block_left_end,
+                        block_right_start,
+                        block_right_end,
+                    )
+                    gap_result = _boundary_gap(
+                        left_units[block_left_start:block_left_end],
+                        right_units[block_right_start:block_right_end],
+                    )
+                    if gap_result is None:
+                        continue
+                    gap_frames, earlier_side = gap_result
+                    if not (0 < gap_frames <= late_gap_frames):
+                        continue
+                    candidate = _cross_mic_echo_candidate(
+                        left_track,
+                        right_track,
+                        left_units,
+                        right_units,
+                        block_left_start,
+                        block_left_end,
+                        block_right_start,
+                        block_right_end,
+                        max_offset_frames=math.inf,
+                    )
+                    if candidate:
+                        candidate["earlier_side"] = earlier_side
+                        regions.append(candidate)
+
+    regions.sort(
+        key=lambda region: (
+            region["left_track"],
+            region["right_track"],
+            region["start_frame"],
+            region["end_frame"],
+        )
+    )
+    merged: list[dict[str, Any]] = []
+    for region in regions:
+        if not merged:
+            merged.append(region)
+            continue
+        previous = merged[-1]
+        joinable = (
+            previous["left_track"] == region["left_track"]
+            and previous["right_track"] == region["right_track"]
+            and previous["earlier_side"] == region["earlier_side"]
+            and region["start_frame"] - previous["end_frame"] <= join_gap_frames
+            and region["left_start_index"] <= previous["left_end_index"] + 2
+            and region["right_start_index"] <= previous["right_end_index"] + 2
+            and max(previous["end_frame"], region["end_frame"])
+            - min(previous["start_frame"], region["start_frame"])
+            <= window_frames
+        )
+        if not joinable:
+            merged.append(region)
+            continue
+        combined = _cross_mic_echo_candidate(
+            int(region["left_track"]),
+            int(region["right_track"]),
+            tracks[int(region["left_track"])],
+            tracks[int(region["right_track"])],
+            min(int(previous["left_start_index"]), int(region["left_start_index"])),
+            max(int(previous["left_end_index"]), int(region["left_end_index"])),
+            min(int(previous["right_start_index"]), int(region["right_start_index"])),
+            max(int(previous["right_end_index"]), int(region["right_end_index"])),
+            max_offset_frames=math.inf,
+        )
+        if combined:
+            combined["earlier_side"] = region["earlier_side"]
+            merged[-1] = combined
+        elif not (
+            region["left_start_index"] >= previous["left_start_index"]
+            and region["left_end_index"] <= previous["left_end_index"]
+            and region["right_start_index"] >= previous["right_start_index"]
+            and region["right_end_index"] <= previous["right_end_index"]
+        ):
+            merged.append(region)
+    return merged
+
+
+def _suppress_late_cross_mic_echo_regions(
+    candidates: list[dict[str, Any]],
+    fps: float,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    indexed = [dict(candidate, _echo_candidate_index=index) for index, candidate in enumerate(candidates or [])]
+    regions = _detect_late_cross_mic_echo_regions(indexed, fps)
+    suppressed_indices: set[int] = set()
+    selected_indices: set[int] = set()
+    suppressed_regions = 0
+    ambiguous_regions = 0
+    for region in regions:
+        left_indices = [int(index) for index in region["left_candidate_indices"]]
+        right_indices = [int(index) for index in region["right_candidate_indices"]]
+        earlier_indices, later_indices = (
+            (left_indices, right_indices) if region["earlier_side"] == "left" else (right_indices, left_indices)
+        )
+        earlier_units = [indexed[index] for index in earlier_indices]
+        later_units = [indexed[index] for index in later_indices]
+        earlier_score = statistics.median(float(unit.get("speaker_score_db") or 0.0) for unit in earlier_units)
+        later_score = statistics.median(float(unit.get("speaker_score_db") or 0.0) for unit in later_units)
+        if abs(earlier_score - later_score) < CROSS_MIC_ECHO_AMBIGUOUS_DB:
+            # Never guess on a late echo: if the two occurrences are not
+            # clearly separated in level, leave both untouched rather than
+            # risk deleting real speech.
+            ambiguous_regions += 1
+            continue
+        if later_score >= earlier_score:
+            # The later, matched occurrence is not the fainter bleed-through
+            # -- do not delete it on an unclear signal.
+            continue
+        newly_suppressed = [index for index in later_indices if index not in selected_indices]
+        if not newly_suppressed:
+            continue
+        suppressed_indices.update(newly_suppressed)
+        selected_indices.update(earlier_indices)
+        suppressed_regions += 1
+        for index in earlier_indices:
+            indexed[index]["speaker_decision"] = "late_cross_mic_echo_selected"
+
+    filtered: list[dict[str, Any]] = []
+    for index, candidate in enumerate(indexed):
+        if index in suppressed_indices:
+            continue
+        output = dict(candidate)
+        output.pop("_echo_candidate_index", None)
+        filtered.append(output)
+    return filtered, {
+        "late_cross_mic_echo_region_count": len(regions),
+        "late_cross_mic_echo_suppressed_count": suppressed_regions,
+        "late_cross_mic_echo_ambiguous_count": ambiguous_regions,
+        "late_cross_mic_echo_suppressed_unit_count": len(suppressed_indices),
+    }
+
+
 def suppress_cross_mic_echo_regions(
     candidates: list[dict[str, Any]],
     fps: float,
@@ -1090,19 +1443,24 @@ def suppress_cross_mic_echo_regions(
         for index in winner_indices:
             indexed[index]["speaker_decision"] = "cross_mic_echo_selected"
 
-    filtered: list[dict[str, Any]] = []
+    stage1_filtered: list[dict[str, Any]] = []
     for index, candidate in enumerate(indexed):
         if index in suppressed_indices:
             continue
         output = dict(candidate)
         output.pop("_echo_candidate_index", None)
-        filtered.append(output)
-    return filtered, {
+        stage1_filtered.append(output)
+
+    late_filtered, late_diagnostic = _suppress_late_cross_mic_echo_regions(stage1_filtered, fps)
+
+    diagnostic = {
         "cross_mic_echo_region_count": len(regions),
         "cross_mic_echo_suppressed_count": suppressed_regions,
         "cross_mic_echo_ambiguous_count": ambiguous_regions,
         "cross_mic_echo_suppressed_unit_count": len(suppressed_indices),
     }
+    diagnostic.update(late_diagnostic)
+    return late_filtered, diagnostic
 
 
 def build_exclusive_unit_stream(
