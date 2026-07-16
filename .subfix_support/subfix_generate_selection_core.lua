@@ -1646,10 +1646,10 @@ end
 
 local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     if not dispatcher or not ui then
-        return nil, nil, nil, "无法初始化 Resolve UI"
+        return nil, nil, nil, nil, "无法初始化 Resolve UI"
     end
     if type(audio_sources) ~= "table" or #audio_sources == 0 then
-        return nil, nil, nil, "未找到与选区重叠的本地音频片段"
+        return nil, nil, nil, nil, "未找到与选区重叠的本地音频片段"
     end
 
     local selected_audio_sources = nil
@@ -1667,12 +1667,24 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
     local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
+    -- 识别模型：Qwen（本地，backend "auto"，默认）/ 豆包（云端，backend "doubao_asr"）。
+    -- 仅决定把哪个 --backend 传给 ASR helper，不改断句/回声/对齐算法本体。默认
+    -- Qwen(auto) 时与现状完全一致（build 传 DEFAULT_ASR_BACKEND == "auto"）。UI 复用
+    -- 与字幕长度同款的 ☑/☐ 互斥小勾选样式。
+    local SUBTITLE_ENGINE_OPTIONS = {
+        {label = "Qwen（本地）", backend = "auto"},
+        {label = "豆包（云端）", backend = "doubao_asr"},
+    }
+    local SUBTITLE_ENGINE_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
+    local SUBTITLE_ENGINE_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
+    local selected_engine_index = 1
+    local selected_backend = SUBTITLE_ENGINE_OPTIONS[1].backend
     local dialog_cancelled = false
     local track_rows = {}
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = {460, 250, 420, 248},
+        Geometry = {460, 250, 420, 284},
     },
     ui:VGroup{
         Spacing = 8,
@@ -1690,6 +1702,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             ui:Label{Text = "字幕长度：", Weight = 0},
             ui:Button{ID = "GenerateSubtitleLengthStandardBtn", Text = "标准（≤25字）", Weight = 0, MinimumSize = {0, 20}},
             ui:Button{ID = "GenerateSubtitleLengthShortBtn", Text = "短视频（≤10字）", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
+        },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "识别模型：", Weight = 0},
+            ui:Button{ID = "GenerateSubtitleEngineQwenBtn", Text = "Qwen（本地）", Weight = 0, MinimumSize = {0, 20}},
+            ui:Button{ID = "GenerateSubtitleEngineDoubaoBtn", Text = "豆包（云端）", Weight = 0, MinimumSize = {0, 20}},
             ui:HGap(0, 1)
         },
         ui:Label{
@@ -1714,7 +1734,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local items = selection_window:GetItems()
     local track_tree = items and items.GenerateAudioTrackTree or nil
-    if not track_tree then return nil, nil, nil, "无法初始化音频轨道列表" end
+    if not track_tree then return nil, nil, nil, nil, "无法初始化音频轨道列表" end
     pcall(function() track_tree.ColumnCount = 2 end)
     pcall(function() track_tree.HeaderHidden = true end)
     pcall(function() track_tree.RootIsDecorated = false end)
@@ -1746,6 +1766,32 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local function read_selected_max_chars()
         local option = SUBTITLE_LENGTH_OPTIONS[selected_length_index]
         return option and option.max_chars or SUBTITLE_LENGTH_OPTIONS[1].max_chars
+    end
+
+    local engine_qwen_btn = items and items.GenerateSubtitleEngineQwenBtn or nil
+    local engine_doubao_btn = items and items.GenerateSubtitleEngineDoubaoBtn or nil
+
+    local function refresh_subtitle_engine_buttons()
+        if engine_qwen_btn then
+            local prefix = selected_engine_index == 1 and SUBTITLE_ENGINE_SELECTED_PREFIX or SUBTITLE_ENGINE_UNSELECTED_PREFIX
+            pcall(function() engine_qwen_btn.Text = prefix .. SUBTITLE_ENGINE_OPTIONS[1].label end)
+        end
+        if engine_doubao_btn then
+            local prefix = selected_engine_index == 2 and SUBTITLE_ENGINE_SELECTED_PREFIX or SUBTITLE_ENGINE_UNSELECTED_PREFIX
+            pcall(function() engine_doubao_btn.Text = prefix .. SUBTITLE_ENGINE_OPTIONS[2].label end)
+        end
+    end
+
+    local function select_subtitle_engine(index)
+        selected_engine_index = index
+        refresh_subtitle_engine_buttons()
+    end
+
+    refresh_subtitle_engine_buttons()
+
+    local function read_selected_backend()
+        local option = SUBTITLE_ENGINE_OPTIONS[selected_engine_index]
+        return option and option.backend or SUBTITLE_ENGINE_OPTIONS[1].backend
     end
 
     local item_map = {}
@@ -1798,6 +1844,15 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         select_subtitle_length(2)
     end
 
+    -- 识别模型：两个互斥按钮，点击即切换 backend 并高亮当前选择
+    function selection_window.On.GenerateSubtitleEngineQwenBtn.Clicked(ev)
+        select_subtitle_engine(1)
+    end
+
+    function selection_window.On.GenerateSubtitleEngineDoubaoBtn.Clicked(ev)
+        select_subtitle_engine(2)
+    end
+
     function selection_window.On.GenerateSelectionConfirmBtn.Clicked(ev)
         selected_audio_sources = collect_checked_audio_sources()
         if #selected_audio_sources < 1 then
@@ -1808,6 +1863,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             return
         end
         selected_max_chars = read_selected_max_chars()
+        selected_backend = read_selected_backend()
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end
@@ -1838,12 +1894,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     if not selected_audio_sources then
-        return nil, nil, nil, "已取消"
+        return nil, nil, nil, nil, "已取消"
     end
     if #selected_audio_sources == 0 then
-        return nil, nil, nil, "请至少选择一个音频轨道"
+        return nil, nil, nil, nil, "请至少选择一个音频轨道"
     end
-    return selected_audio_sources, subtitle_mode, selected_max_chars, nil
+    return selected_audio_sources, subtitle_mode, selected_max_chars, selected_backend, nil
 end
 
 local function progress_elapsed_text(started_at)
@@ -2073,7 +2129,7 @@ local function build_asr_helper_command(audio_source, srt_path, json_path, timel
     return table.concat(cmd_parts, " "), nil
 end
 
-local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars)
+local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend)
     local paths = resolve_asr_paths()
     if not file_exists(paths.helper) then
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
@@ -2082,12 +2138,14 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         return nil, "ASR 环境未安装，请先运行: " .. tostring(paths.setup)
     end
     subtitle_mode = subtitle_mode == "live" and "live" or "narration"
+    -- backend 由生成对话框的"识别模型"选择决定；缺省回退到 DEFAULT_ASR_BACKEND(auto/Qwen 本地)。
+    local asr_backend = (type(backend) == "string" and backend ~= "") and backend or DEFAULT_ASR_BACKEND
     local generate_engine = resolve_generate_engine()
     local cmd_parts = {
         shell_quote(paths.python),
         shell_quote(paths.helper),
         "--mode", "generate_subtitles_batch",
-        "--backend", shell_quote(DEFAULT_ASR_BACKEND),
+        "--backend", shell_quote(asr_backend),
         "--generate-engine", shell_quote(generate_engine),
         "--batch-plan-json", shell_quote(batch_plan_path),
         "--output", shell_quote(json_path),
@@ -2217,9 +2275,9 @@ local function run_asr_helper_with_progress(audio_source, srt_path, json_path, t
     return true
 end
 
-local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars)
+local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend)
     local progress_path = json_path .. ".progress.json"
-    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars)
+    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend)
     if not cmd then return false, cmd_err end
     update_generate_progress_window(
         progress_state,
@@ -2515,12 +2573,15 @@ local function generate_selection_subtitles()
     local subtitle_mode = "live"
     -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准，仅有 1 个音频候选自动跳过弹窗时使用该默认值
     local max_chars = 25
+    -- 识别模型 backend：默认 Qwen 本地（DEFAULT_ASR_BACKEND == "auto"），仅有 1 个音频候选
+    -- 自动跳过弹窗时也用该默认值，保证与现状零改变。
+    local backend = DEFAULT_ASR_BACKEND
     local selection_err = nil
     if #audio_sources == 1 then
         selected_audio_sources = audio_sources
         print("[SubFix Generate] 仅有 1 个音频候选，自动使用: " .. format_audio_source_label(audio_sources[1], fps))
     else
-        selected_audio_sources, subtitle_mode, max_chars, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
+        selected_audio_sources, subtitle_mode, max_chars, backend, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
     if not selected_audio_sources then error(selection_err or "已取消") end
     local selected_track_sources = collect_selected_track_sources(selected_audio_sources)
@@ -2581,7 +2642,8 @@ local function generate_selection_subtitles()
         progress_state,
         #selected_track_sources,
         subtitle_mode,
-        max_chars
+        max_chars,
+        backend
     )
     if not helper_ok then
         finish_generate_progress_window(progress_state, helper_status == "cancelled" and "已取消" or "失败", helper_err)
