@@ -5209,6 +5209,12 @@ def run_generate_subtitles_batch_plan_v4(
             float(args.fps or 30.0),
         )
         diagnostic["overlong_tail_reclaimed_count"] = overlong_tail_reclaimed_count
+        subtitle_rows, word_boundary_protected_count = generate_v4.protect_word_boundaries(
+            subtitle_rows,
+            canonical_units,
+            float(args.fps or 30.0),
+        )
+        diagnostic["word_boundary_protected_count"] = word_boundary_protected_count
         subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(
             subtitle_rows,
             canonical_units,

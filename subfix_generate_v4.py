@@ -25,6 +25,92 @@ PROTECTED_BIGRAMS = {
     "但是", "而且", "已经", "我们", "你们", "他们", "东西", "功能", "机器", "价格", "块钱", "产品", "告诉",
     "成功", "感觉", "科技", "评论", "转发", "帮助", "环绕", "运镜", "自动", "逻辑", "神奇",
 }
+# 词边界保护 (word-boundary protection, see protect_word_boundaries): a
+# small, dependency-free word list used only to decide "does this position
+# fall inside a multi-character word", so a row-to-row cut (or a hard
+# max_chars split) never lands inside one.
+#
+# Environment check done before picking this approach: the ASR helper venv
+# actually used at generation time (.subfix_asr_env, the one
+# setup_asr_env.sh provisions) has no jieba installed, and sync_to_plugin.sh
+# only copies these .py source files into the Resolve plugin folder -- it
+# never syncs/rebuilds .subfix_asr_env. Shipping `import jieba` here would
+# ImportError on every already-installed machine until the user re-runs
+# setup_asr_env.sh, and setup_asr_env.sh itself would first need a new `pip
+# install jieba` line -- not retroactive for existing installs either way.
+# That is exactly the "分词依赖无法可靠分发" risk called out in the spec, so
+# this intentionally does NOT add jieba (or any pip dependency): it is a
+# plain in-memory dictionary + greedy maximum-forward-match tokenizer
+# (_default_word_tokenizer below). Coverage is intentionally partial -- a
+# word missing from this list can still be split across rows -- but it is
+# zero-dependency and needs no environment/packaging change to ship.
+WORD_DICTIONARY = frozenset({
+    # common function words / pronouns / demonstratives
+    "这个", "那个", "什么", "一个", "没有", "可以", "因为", "所以", "但是", "而且", "已经", "我们", "你们",
+    "他们", "自己", "现在", "还是", "就是", "不是", "什么样", "怎么样", "为什么", "这些", "那些", "这样",
+    "那样", "一样", "一直", "一起", "一下", "一遍", "一定", "一些", "真的", "真的是", "绝对", "不过",
+    "然后", "另外", "同时", "因此", "其实", "如果", "虽然", "所有", "所有人", "大家", "只是", "只要",
+    "想过", "想要", "看看", "有点", "别的", "地方", "还能", "还没", "算一下", "加一起",
+    # nouns/verbs from typical spoken-video content (helps the shipped
+    # fixtures/regression videos as well as general coverage)
+    "效果", "视频", "平台", "硬件", "产品", "功能", "机器", "机器人", "价格", "块钱", "毛钱", "包邮",
+    "体验", "广告", "意思", "存在", "合理", "尺寸", "性价比", "扫地机", "拼多多", "迫不及待", "发展",
+    "推出", "获得", "开始", "原谅", "顺到", "摇一摇", "破两百", "能够", "做出", "告诉", "成功", "感觉",
+    "科技", "评论", "转发", "帮助", "环绕", "运镜", "自动", "逻辑", "神奇", "非常", "力气", "姿态",
+    "控制", "跳舞",
+})
+_WORD_DICTIONARY_MAX_LENGTH = max((len(word) for word in WORD_DICTIONARY), default=1)
+
+
+def _default_word_tokenizer(text: str) -> list[str]:
+    """Zero-dependency tokenizer: greedy maximum-forward-match against
+    WORD_DICTIONARY, falling back to single characters for anything not in
+    the dictionary. See WORD_DICTIONARY for why this exists instead of a
+    real segmenter dependency (jieba, etc). Always partitions ``text``
+    exactly (concatenating the returned tokens reproduces ``text``).
+    """
+    tokens: list[str] = []
+    position = 0
+    length = len(text)
+    while position < length:
+        matched: str | None = None
+        max_span = min(_WORD_DICTIONARY_MAX_LENGTH, length - position)
+        for span in range(max_span, 1, -1):
+            candidate = text[position:position + span]
+            if candidate in WORD_DICTIONARY:
+                matched = candidate
+                break
+        if matched is None:
+            matched = text[position]
+        tokens.append(matched)
+        position += len(matched)
+    return tokens
+
+
+def _word_boundary_positions(
+    text: str,
+    tokenizer: Callable[[str], list[str]] | None = None,
+) -> frozenset[int]:
+    """Character offsets (0..len(text)) that fall *between* words -- i.e.
+    safe places to cut ``text`` without splitting a word in half.
+
+    If ``tokenizer`` breaks its partition contract (returned tokens don't
+    concatenate back to ``text``), this refuses to guess and reports only
+    the two string ends as safe (so callers protect nothing rather than
+    risk a wrong merge/cut).
+    """
+    tokenize = tokenizer or _default_word_tokenizer
+    tokens = tokenize(text)
+    if "".join(tokens) != text:
+        return frozenset({0, len(text)})
+    positions = {0}
+    cursor = 0
+    for token in tokens:
+        cursor += len(token)
+        positions.add(cursor)
+    return frozenset(positions)
+
+
 CLAUSE_STARTERS = (
     "也欢迎", "我们会", "但我", "但是", "而且", "其实", "所以", "不过", "然后", "另外", "同时", "因此",
     "你看", "开启", "自动", "除了",
@@ -2313,7 +2399,147 @@ def reclaim_overlong_unit_tails(
     return output, reclaimed_count
 
 
-def _hard_cut_boundaries(row_units: list[dict[str, Any]], max_chars: int) -> list[int]:
+def protect_word_boundaries(
+    rows: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    fps: float,
+    tokenizer: Callable[[str], list[str]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """禁止字幕在词内部切分 (word-boundary protection).
+
+    Several unrelated root causes (cross-mic echo swapping the selected
+    track mid-word, the DP boundary scorer landing a hash-boundary between
+    two characters, a hard max_chars cut hitting exactly inside a word,
+    ...) can all produce the same visible symptom: one row ends with the
+    first half of a word and the very next row starts with its second half
+    (e.g. row N ending "...效" immediately followed by row N+1 starting
+    "果来"). Rather than chase every root cause individually, this is a
+    single generic outlet-level fix applied once all row boundaries exist:
+    tokenize the full concatenated text and, for every row-to-row boundary
+    landing inside a tokenized word, move the leftover half of that word
+    from the start of the right-hand row onto the end of the left-hand row
+    (merging the word back together on the row where it started), then
+    re-derive both rows' frame boundaries from the real per-character
+    ``units`` so time and text stay exactly conserved.
+
+    ``rows`` is the output of :func:`segment_canonical_units` (typically
+    already passed through :func:`reclaim_overlong_unit_tails`) -- each a
+    contiguous slice of ``units`` by character count, the same pairing
+    convention :func:`reclaim_overlong_unit_tails` and
+    :func:`enforce_hard_char_limit` rely on: walking the (start_frame-
+    sorted) units in order and consuming exactly ``len(row["text"])``
+    characters per row reproduces the same row/unit grouping, with no need
+    to trust frame ranges.
+
+    Word boundaries come from ``tokenizer`` (defaults to the built-in
+    zero-dependency :func:`_default_word_tokenizer` / WORD_DICTIONARY --
+    see there for why this isn't jieba). A boundary the tokenizer doesn't
+    recognise as unsafe (including every single-character "word", e.g. a
+    lone "啊") is left untouched, per the "拿不准的词边界不动" rule:
+    coverage is intentionally partial rather than guessing. A word that is
+    itself longer than a row can still only be partially absorbed by its
+    immediate neighbour on a given pass; the loop below re-scans until no
+    unsafe boundary remains (or nothing more can move), so a word spanning
+    more than two rows is still fully reassembled onto the row where it
+    started.
+
+    Returns (rows, word_boundary_protected_count) -- the count is the
+    number of *original* row-to-row boundaries that fell inside a word
+    (computed once, up front, so it doesn't depend on how many internal
+    merge passes were needed to fix them).
+    """
+    original_rows = [dict(row) for row in rows or []]
+    if len(original_rows) < 2:
+        return original_rows, 0
+
+    ordered_units = sorted(
+        [dict(unit) for unit in units or []],
+        key=lambda unit: (int(unit.get("start_frame") or 0), int(unit.get("end_frame") or 0)),
+    )
+
+    entries: list[dict[str, Any]] = []
+    cursor = 0
+    for row in original_rows:
+        text = str(row.get("text") or "")
+        length = len(text)
+        row_units = ordered_units[cursor:cursor + length]
+        cursor += length
+        entries.append(
+            {
+                "meta": row,
+                "text": text,
+                "units": row_units,
+                "start_frame": int(row.get("start_frame") or 0),
+                "end_frame": int(row.get("end_frame") or 0),
+            }
+        )
+
+    full_text = "".join(entry["text"] for entry in entries)
+    word_bounds = _word_boundary_positions(full_text, tokenizer)
+
+    protected_count = 0
+    running = 0
+    for entry in entries[:-1]:
+        running += len(entry["text"])
+        if running not in word_bounds:
+            protected_count += 1
+
+    if protected_count == 0:
+        return original_rows, 0
+
+    changed = True
+    guard = 0
+    guard_limit = max(1000, len(full_text) * 4)
+    while changed and guard < guard_limit:
+        changed = False
+        guard += 1
+        running = 0
+        for index in range(len(entries) - 1):
+            running += len(entries[index]["text"])
+            if running in word_bounds:
+                continue
+            left = entries[index]
+            right = entries[index + 1]
+            word_end = min(bound for bound in word_bounds if bound > running)
+            move_count = min(word_end - running, len(right["text"]))
+            if move_count <= 0:
+                continue
+            left["text"] += right["text"][:move_count]
+            left["units"] += right["units"][:move_count]
+            right["text"] = right["text"][move_count:]
+            right["units"] = right["units"][move_count:]
+            if right["text"]:
+                boundary_frame = int(right["units"][0].get("start_frame") or right["end_frame"])
+                left["end_frame"] = boundary_frame
+                right["start_frame"] = boundary_frame
+            else:
+                left["end_frame"] = right["end_frame"]
+                del entries[index + 1]
+            changed = True
+            break
+
+    new_rows: list[dict[str, Any]] = []
+    for entry in entries:
+        row = dict(entry["meta"])
+        row["text"] = entry["text"]
+        row["start_frame"] = entry["start_frame"]
+        row["end_frame"] = entry["end_frame"]
+        new_rows.append(row)
+    for index, row in enumerate(new_rows, start=1):
+        row["index"] = index
+
+    actual_text = "".join(str(row.get("text") or "") for row in new_rows)
+    if actual_text != full_text:
+        raise RuntimeError("v4 word boundary protection text conservation failed")
+
+    return new_rows, protected_count
+
+
+def _hard_cut_boundaries(
+    row_units: list[dict[str, Any]],
+    max_chars: int,
+    tokenizer: Callable[[str], list[str]] | None = None,
+) -> list[int]:
     """Choose unit-index boundaries splitting ``row_units`` into runs of at
     most ``max_chars`` characters each.
 
@@ -2322,15 +2548,21 @@ def _hard_cut_boundaries(row_units: list[dict[str, Any]], max_chars: int) -> lis
     ``row_units[boundary:]`` marks a cut. Within the character window that
     must be cut to respect ``max_chars``, a boundary right after an ASR
     punctuation mark or the widest inter-unit time gap is preferred (the
-    least jarring place to break); when no such evidence exists in that
-    window the cut lands exactly at the ``max_chars`` character limit
-    (a forced/even split).
+    least jarring place to break); failing that, a word boundary (per
+    ``tokenizer`` / WORD_DICTIONARY -- see protect_word_boundaries) closest
+    to the limit is preferred over cutting through a word; when neither
+    exists in that window the cut lands exactly at the ``max_chars``
+    character limit (a forced/even split, which can land inside a word not
+    covered by the dictionary -- the unavoidable floor when no evidence of
+    any kind is available).
     """
     lengths = [len(str(unit.get("text") or "")) or 1 for unit in row_units]
     prefix = [0]
     for length in lengths:
         prefix.append(prefix[-1] + length)
     total = prefix[-1]
+    row_text = "".join(str(unit.get("text") or "") for unit in row_units)
+    word_bounds = _word_boundary_positions(row_text, tokenizer)
     boundaries: list[int] = []
     start_prefix = 0
     unit_count = len(row_units)
@@ -2357,20 +2589,28 @@ def _hard_cut_boundaries(row_units: list[dict[str, Any]], max_chars: int) -> lis
         if best_index is not None and (best_score[0] > 0 or best_score[1] > 0):
             chosen = best_index
         else:
-            chosen = None
-            for index in range(1, unit_count):
-                if prefix[index] <= forced_limit:
-                    chosen = index
-                else:
-                    break
-            if chosen is None:
-                # A single canonical unit's own text already exceeds
-                # max_chars: there is no finer per-character time to split
-                # on, so cut after it anyway rather than fabricate a frame
-                # boundary inside it. This chunk will still exceed
-                # max_chars, which is the unavoidable floor set by the
-                # source alignment granularity.
-                chosen = 1
+            word_safe_candidates = [
+                index
+                for index in range(1, unit_count)
+                if start_prefix < prefix[index] <= forced_limit and prefix[index] in word_bounds
+            ]
+            if word_safe_candidates:
+                chosen = max(word_safe_candidates)
+            else:
+                chosen = None
+                for index in range(1, unit_count):
+                    if prefix[index] <= forced_limit:
+                        chosen = index
+                    else:
+                        break
+                if chosen is None:
+                    # A single canonical unit's own text already exceeds
+                    # max_chars: there is no finer per-character time to
+                    # split on, so cut after it anyway rather than
+                    # fabricate a frame boundary inside it. This chunk will
+                    # still exceed max_chars, which is the unavoidable
+                    # floor set by the source alignment granularity.
+                    chosen = 1
         if chosen <= 0 or prefix[chosen] <= start_prefix:
             break
         boundaries.append(chosen)
@@ -2382,6 +2622,7 @@ def enforce_hard_char_limit(
     rows: list[dict[str, Any]],
     units: list[dict[str, Any]],
     max_chars: int | None,
+    tokenizer: Callable[[str], list[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Hard-cap every row's character count at ``max_chars`` (post-processing).
 
@@ -2442,7 +2683,7 @@ def enforce_hard_char_limit(
         if len(text) <= max_chars or len(row_units) < 2:
             output.append(row)
             continue
-        boundaries = _hard_cut_boundaries(row_units, max_chars)
+        boundaries = _hard_cut_boundaries(row_units, max_chars, tokenizer)
         if not boundaries:
             output.append(row)
             continue
