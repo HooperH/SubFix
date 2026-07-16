@@ -4764,6 +4764,12 @@ def run_generate_subtitles_batch_plan_v4(
     requested_engine = str(getattr(args, "generate_engine", "v4") or "v4").lower()
     v5_mode = requested_engine == "v5"
     engine_label = "v5" if v5_mode else "v4"
+    # Progress label for the per-window transcription step. It reflects the
+    # requested ASR backend (识别模型) so the progress window doesn't always
+    # read "Qwen" even when the user picked 豆包. Actual dispatch happens in
+    # transcribe_v4_window_batch; forced alignment further downstream is still
+    # Qwen regardless, but that's a separate step not shown by this label.
+    asr_label = "豆包" if str(getattr(args, "backend", "auto") or "auto") == "doubao_asr" else "Qwen"
     if not batches:
         raise RuntimeError(f"缺少 generate_subtitles {engine_label} batch plan")
     if fixture_payload is not None:
@@ -4888,7 +4894,7 @@ def run_generate_subtitles_batch_plan_v4(
         write_progress(
             progress_path,
             "generate_subtitle_batch",
-            f"{engine_label} Qwen 转写 1/{len(windows)}",
+            f"{engine_label} {asr_label} 转写 1/{len(windows)}",
             batch_index=0,
             total_batches=len(windows),
             progress_index=25,
@@ -4901,7 +4907,7 @@ def run_generate_subtitles_batch_plan_v4(
             write_progress(
                 progress_path,
                 "generate_subtitle_batch",
-                f"{engine_label} Qwen 转写 {offset + 1}/{len(windows)}",
+                f"{engine_label} {asr_label} 转写 {offset + 1}/{len(windows)}",
                 batch_index=offset,
                 total_batches=len(windows),
                 progress_index=v4_progress_point(25, 55, offset, len(windows)),
@@ -4926,14 +4932,14 @@ def run_generate_subtitles_batch_plan_v4(
             write_progress(
                 progress_path,
                 "generate_subtitle_batch",
-                f"{engine_label} Qwen 转写 {completed_windows}/{len(windows)}",
+                f"{engine_label} {asr_label} 转写 {completed_windows}/{len(windows)}",
                 batch_index=completed_windows,
                 total_batches=len(windows),
                 progress_index=v4_progress_point(25, 55, completed_windows, len(windows)),
                 progress_total=100,
             )
         if len(raw_payloads) != len(windows):
-            raise RuntimeError(f"{engine_label} Qwen 窗口数量不匹配: {len(raw_payloads)} != {len(windows)}")
+            raise RuntimeError(f"{engine_label} {asr_label} 窗口数量不匹配: {len(raw_payloads)} != {len(windows)}")
         track_by_index = {int(track["track_index"]): track for track in prepared_tracks}
         recovered_payloads: list[dict[str, Any]] = []
         recovery_diagnostics: list[dict[str, Any]] = []
