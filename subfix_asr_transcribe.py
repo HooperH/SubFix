@@ -181,6 +181,11 @@ DOUBAO_ASR_APPID_ENV = "SUBFIX_DOUBAO_APPID"
 DOUBAO_ASR_TOKEN_ENV = "SUBFIX_DOUBAO_TOKEN"
 DOUBAO_ASR_RESOURCE_ID_ENV = "SUBFIX_DOUBAO_RESOURCE_ID"
 DOUBAO_ASR_ENDPOINT_ENV = "SUBFIX_DOUBAO_ENDPOINT"
+# Optional credentials file read as a fallback when the env vars are unset.
+# It sits next to this helper (in the deployed plugin that is
+# .subfix_support/doubao_credentials.json). Keys: "appid" / "token". The real
+# file is gitignored; a doubao_credentials.json.example template is tracked.
+DOUBAO_ASR_CREDENTIALS_FILENAME = "doubao_credentials.json"
 # "录音文件极速版识别" (flash/turbo tier) HTTP endpoint -- synchronous, no
 # submit/query polling needed per the docs.
 DOUBAO_ASR_DEFAULT_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
@@ -3878,6 +3883,31 @@ def transcribe_qwen3_asr_batch(audio_paths: list[Path], model: str, language: st
     ]
 
 
+def _doubao_credentials_path() -> Path:
+    """Path to the optional doubao_credentials.json next to this helper."""
+    return Path(__file__).with_name(DOUBAO_ASR_CREDENTIALS_FILENAME)
+
+
+def _load_doubao_credentials_file() -> dict[str, Any]:
+    """Read {appid, token} from doubao_credentials.json if present.
+
+    Returns an empty dict when the file is missing, unreadable, or not a JSON
+    object -- callers fall back to raising a clear "no credentials" error.
+    Never raises on a malformed/absent file so a stray file can't crash ASR.
+    """
+    try:
+        raw = _doubao_credentials_path().read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
 def _doubao_asr_request_once(
     endpoint: str,
     headers: dict[str, str],
@@ -3905,12 +3935,16 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     because word-level timestamps still come from the existing qwen3 forced
     aligner further down the v4/v5 pipeline (untouched by this function).
 
-    Credentials are read from environment variables only; nothing is
-    hardcoded and nothing is written to disk/git:
-      - SUBFIX_DOUBAO_APPID       (required) console App ID / App Key
-      - SUBFIX_DOUBAO_TOKEN       (required) console Access Token
-      - SUBFIX_DOUBAO_RESOURCE_ID (optional) default volc.bigasr.auc_turbo
-      - SUBFIX_DOUBAO_ENDPOINT    (optional) override request URL
+    Credentials are read with a three-tier priority; nothing is hardcoded and
+    the real credentials file is gitignored:
+      1. Environment variables (highest priority):
+         - SUBFIX_DOUBAO_APPID   (App ID / App Key)
+         - SUBFIX_DOUBAO_TOKEN   (Access Token)
+      2. Otherwise doubao_credentials.json next to this helper, keys
+         "appid" / "token".
+      3. If neither supplies both values, raise RuntimeError with a clear
+         message naming both the env vars and the file path.
+    Optional (env only): SUBFIX_DOUBAO_RESOURCE_ID, SUBFIX_DOUBAO_ENDPOINT.
 
     Raises RuntimeError with a clear message on missing credentials, HTTP
     errors, timeouts, or malformed responses -- callers (see
@@ -3920,8 +3954,17 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     appid = os.getenv(DOUBAO_ASR_APPID_ENV)
     token = os.getenv(DOUBAO_ASR_TOKEN_ENV)
     if not appid or not token:
+        creds = _load_doubao_credentials_file()
+        if not appid:
+            appid = str(creds.get("appid") or "").strip() or None
+        if not token:
+            token = str(creds.get("token") or "").strip() or None
+    if not appid or not token:
         raise RuntimeError(
-            f"豆包 ASR 未配置密钥，请设置环境变量 {DOUBAO_ASR_APPID_ENV} 与 {DOUBAO_ASR_TOKEN_ENV} 后重试"
+            "豆包 ASR 未配置密钥：请设置环境变量 "
+            f"{DOUBAO_ASR_APPID_ENV} 与 {DOUBAO_ASR_TOKEN_ENV}，"
+            f"或在 {_doubao_credentials_path()} 写入 "
+            '{"appid": "...", "token": "..."} 后重试'
         )
     resource_id = os.getenv(DOUBAO_ASR_RESOURCE_ID_ENV) or DOUBAO_ASR_DEFAULT_RESOURCE_ID
     endpoint = os.getenv(DOUBAO_ASR_ENDPOINT_ENV) or DOUBAO_ASR_DEFAULT_ENDPOINT

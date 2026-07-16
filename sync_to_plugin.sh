@@ -19,6 +19,8 @@ SOURCE_SEGMENTATION_PROFILE_V3="$SCRIPT_DIR/.subfix_support/segmentation_profile
 SOURCE_SEGMENTATION_PROFILE_V4="$SCRIPT_DIR/.subfix_support/segmentation_profile_v4.json"
 SOURCE_QWEN_CPP_DIR="$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp"
 SOURCE_QWEN_MODELS_DIR="$SCRIPT_DIR/.subfix_support/models"
+# 豆包云端 ASR 真实密钥（可选，未纳入 git；仅当源目录存在时才复制到插件目录）。
+SOURCE_DOUBAO_CREDENTIALS="$SCRIPT_DIR/.subfix_support/doubao_credentials.json"
 
 link_qwen_support() {
   if [[ -x "$SOURCE_QWEN_CPP_DIR/build/qwen3-asr-cli" ]]; then
@@ -28,6 +30,15 @@ link_qwen_support() {
   if compgen -G "$SOURCE_QWEN_MODELS_DIR/qwen3-forced-aligner-0.6b-*.gguf" > /dev/null; then
     rm -rf "$HELPER_DIR/models" 2>/dev/null || true
     ln -s "$SOURCE_QWEN_MODELS_DIR" "$HELPER_DIR/models" 2>/dev/null || true
+  fi
+}
+
+copy_doubao_credentials_if_present() {
+  # 只有源目录真的存在密钥文件时才复制；没有就静默跳过，绝不报错、绝不进 git。
+  if [[ -f "$SOURCE_DOUBAO_CREDENTIALS" ]]; then
+    cp "$SOURCE_DOUBAO_CREDENTIALS" "$HELPER_DIR/doubao_credentials.json" 2>/dev/null \
+      && echo "✅ 豆包密钥已同步 (doubao_credentials.json)" \
+      || echo "⚠️ 豆包密钥复制失败，可手动放到 $HELPER_DIR/doubao_credentials.json"
   fi
 }
 
@@ -59,6 +70,7 @@ if cp "$SOURCE_LUA" "$SUBFIX_MENU_DIR/SubFix.lua" \
   && cp "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" 2>/dev/null; then
   chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" 2>/dev/null || true
   link_qwen_support
+  copy_doubao_credentials_if_present
   rm -f "$RESOLVE_DIR/SubFix.lua" "$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua" "$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua" "$RESOLVE_DIR/subfix_asr_transcribe.py" "$RESOLVE_DIR/setup_asr_env.sh" 2>/dev/null || true
   rm -rf "$RESOLVE_DIR/__pycache__" 2>/dev/null || true
   echo "✅ SubFix/SubFix.lua 已同步 (直接复制)"
@@ -86,6 +98,7 @@ if command -v rsync &> /dev/null; then
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" 2>/dev/null; then
     chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" 2>/dev/null || true
     link_qwen_support
+    copy_doubao_credentials_if_present
     rm -f "$RESOLVE_DIR/SubFix.lua" "$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua" "$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua" "$RESOLVE_DIR/subfix_asr_transcribe.py" "$RESOLVE_DIR/setup_asr_env.sh" 2>/dev/null || true
     rm -rf "$RESOLVE_DIR/__pycache__" 2>/dev/null || true
     echo "✅ SubFix/SubFix.lua 已同步 (rsync)"

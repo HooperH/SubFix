@@ -15,6 +15,12 @@ tests/__pycache__/
 .subfix_support/hf/
 .subfix_support/python-tools/
 
+# 豆包(火山引擎)云端 ASR 真实密钥，绝不进 git。仅追踪
+# doubao_credentials.json.example 模板。两条模式覆盖仓库根(与 helper .py 同级)
+# 与部署布局下的 .subfix_support/ 等任意子目录。
+doubao_credentials.json
+**/doubao_credentials.json
+
 # Local build output and packaged release artifacts.
 build/
 dist/
