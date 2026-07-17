@@ -2239,12 +2239,18 @@ local function show_generate_progress_window()
     function progress_window.On.GenerateProgressCancelBtn.Clicked(ev)
         if progress_state.finished then
             progress_window:Hide()
+            pcall(function() dispatcher:ExitLoop() end)
             return
         end
         progress_state.cancel_requested = true
     end
 
     function progress_window.On.GenerateProgressWindow.Close(ev)
+        if progress_state.finished then
+            progress_window:Hide()
+            pcall(function() dispatcher:ExitLoop() end)
+            return
+        end
         progress_state.cancel_requested = true
     end
 
@@ -2920,6 +2926,9 @@ local function generate_selection_subtitles()
         if usage then finish_message = finish_message .. "｜" .. usage end
     end
     finish_generate_progress_window(progress_state, "完成", finish_message)
+    -- 让进度窗停留在"完成"态(显示结果/豆包用量)，跑一轮 RunLoop 等用户点"关闭"再隐藏。
+    -- 生成期的 RunLoop 此时已退出，若立即 Hide 完成提示会一闪而过、用户看不到。
+    pcall(function() dispatcher:RunLoop() end)
     pcall(function() progress_state.window:Hide() end)
     print("[SubFix Generate] 生成选区字幕完成，诊断: " .. audio_diag_path)
     return true
