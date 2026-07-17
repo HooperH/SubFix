@@ -310,6 +310,50 @@ local function resolve_asr_paths()
     return paths
 end
 
+-- 豆包（火山引擎）云端 ASR 密钥文件路径：必须与「实际被执行的」
+-- subfix_asr_transcribe.py 同目录，才能与 Python 端
+-- _doubao_credentials_path()（Path(__file__).with_name(...)）指向一致，
+-- 保证 UI 写盘后立即可读、无需再跑 sync。
+local function doubao_credentials_file_path()
+    local helper = tostring(resolve_asr_paths().helper or "")
+    local dir = helper:gsub("/[^/]*$", "")
+    if dir == "" or dir == helper then
+        dir = configured_script_root() .. "/.subfix_support"
+    end
+    return dir .. "/doubao_credentials.json"
+end
+
+-- 读回已存的 appid/token（缺失/解析失败/字段空 → 返回空串），用于预填与「是否已配置」判断。
+local function read_doubao_credentials()
+    local text = read_text_file(doubao_credentials_file_path())
+    if not text or text == "" then return "", "" end
+    local data = decode_json_text(text)
+    if type(data) ~= "table" then return "", "" end
+    return trim_text(tostring(data.appid or "")), trim_text(tostring(data.token or ""))
+end
+
+-- 是否已配置豆包密钥：环境变量优先（与 Python 三级读取一致），否则看密钥文件。
+local function doubao_credentials_configured()
+    local env_appid = trim_text(os.getenv("SUBFIX_DOUBAO_APPID") or "")
+    local env_token = trim_text(os.getenv("SUBFIX_DOUBAO_TOKEN") or "")
+    if env_appid ~= "" and env_token ~= "" then return true end
+    local appid, token = read_doubao_credentials()
+    return appid ~= "" and token ~= ""
+end
+
+-- 写入 appid/token 到密钥文件（json_escape 转义，schema 与 doubao_credentials.json.example 一致）。
+local function save_doubao_credentials(appid, token)
+    local content = string.format(
+        '{\n  "appid": "%s",\n  "token": "%s"\n}\n',
+        json_escape(appid), json_escape(token)
+    )
+    local path = doubao_credentials_file_path()
+    if not write_text_file(path, content) then
+        return false, "无法写入密钥文件: " .. path
+    end
+    return true
+end
+
 local function temp_dir()
     local root = (os.getenv("TMPDIR") or "/tmp") .. "/SubFix_GenerateSelectionSubtitles"
     os.execute("mkdir -p " .. shell_quote(root) .. " 2>/dev/null")
@@ -1794,6 +1838,92 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         return option and option.backend or SUBTITLE_ENGINE_OPTIONS[1].backend
     end
 
+    -- 豆包密钥配置子窗口：点"豆包（云端）"且未配置密钥时按需弹出。复用父对话框
+    -- 已在跑的 dispatcher:RunLoop() 作非模态覆盖，子窗口自身不 RunLoop/ExitLoop，
+    -- 避免嵌套事件循环。
+    local doubao_key_window = dispatcher:AddWindow({
+        ID = "GenerateDoubaoKeyWindow",
+        WindowTitle = "SubFix · 配置豆包密钥",
+        Geometry = {500, 300, 420, 200},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 12,
+        ui:Label{Text = "填写火山引擎（豆包）语音识别密钥", Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "App ID：", Weight = 0, MinimumSize = {96, 0}},
+            ui:LineEdit{ID = "GenerateDoubaoAppIdInput", PlaceholderText = "火山引擎 App ID", Weight = 1}
+        },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "Access Token：", Weight = 0, MinimumSize = {96, 0}},
+            ui:LineEdit{ID = "GenerateDoubaoTokenInput", PlaceholderText = "火山引擎 Access Token", Weight = 1}
+        },
+        ui:Label{ID = "GenerateDoubaoKeyStatusLabel", Text = "密钥仅保存在本机，不会上传或进入版本库。", Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:HGap(0, 1),
+            ui:Button{ID = "GenerateDoubaoKeySaveBtn", Text = "保存", Weight = 0, MinimumSize = {88, 28}},
+            ui:Button{ID = "GenerateDoubaoKeyCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}}
+        }
+    })
+
+    local doubao_key_items = doubao_key_window:GetItems()
+    local doubao_appid_input = doubao_key_items and doubao_key_items.GenerateDoubaoAppIdInput or nil
+    local doubao_token_input = doubao_key_items and doubao_key_items.GenerateDoubaoTokenInput or nil
+    local doubao_key_status_label = doubao_key_items and doubao_key_items.GenerateDoubaoKeyStatusLabel or nil
+
+    local function set_doubao_key_status(text)
+        if doubao_key_status_label then
+            pcall(function() doubao_key_status_label.Text = tostring(text or "") end)
+        end
+    end
+
+    -- 弹出前用已存值预填，方便查看/修改；再 Show（非模态覆盖，父 RunLoop 继续分发事件）。
+    local function open_doubao_key_dialog()
+        local appid, token = read_doubao_credentials()
+        if doubao_appid_input then pcall(function() doubao_appid_input.Text = appid end) end
+        if doubao_token_input then pcall(function() doubao_token_input.Text = token end) end
+        set_doubao_key_status("密钥仅保存在本机，不会上传或进入版本库。")
+        pcall(function() doubao_key_window:Show() end)
+    end
+
+    function doubao_key_window.On.GenerateDoubaoKeySaveBtn.Clicked(ev)
+        local appid = trim_text(doubao_appid_input and doubao_appid_input.Text or "")
+        local token = trim_text(doubao_token_input and doubao_token_input.Text or "")
+        if appid == "" or token == "" then
+            set_doubao_key_status("App ID 和 Access Token 都要填写")
+            return
+        end
+        local ok, err = save_doubao_credentials(appid, token)
+        if not ok then
+            set_doubao_key_status(tostring(err or "保存失败"))
+            return
+        end
+        pcall(function() doubao_key_window:Hide() end)
+    end
+
+    -- 取消/关闭：未配置就选了豆包会在生成时静默回退，故切回 Qwen 并提示，避免误解。
+    local function cancel_doubao_key_dialog()
+        pcall(function() doubao_key_window:Hide() end)
+        select_subtitle_engine(1)
+        if items and items.GenerateSelectionInfoLabel then
+            items.GenerateSelectionInfoLabel.Text = "未配置豆包密钥，已切回 Qwen（本地）"
+        end
+    end
+
+    function doubao_key_window.On.GenerateDoubaoKeyCancelBtn.Clicked(ev)
+        cancel_doubao_key_dialog()
+    end
+
+    function doubao_key_window.On.GenerateDoubaoKeyWindow.Close(ev)
+        cancel_doubao_key_dialog()
+    end
+
     local item_map = {}
     for index, source in ipairs(audio_sources) do
         local ok_item, item = pcall(function() return track_tree:NewItem() end)
@@ -1851,6 +1981,10 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     function selection_window.On.GenerateSubtitleEngineDoubaoBtn.Clicked(ev)
         select_subtitle_engine(2)
+        -- 选豆包但尚未配置密钥：即时弹出配置窗口填 appid/token；已配置过则不弹。
+        if not doubao_credentials_configured() then
+            open_doubao_key_dialog()
+        end
     end
 
     function selection_window.On.GenerateSelectionConfirmBtn.Clicked(ev)
@@ -1885,6 +2019,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     selection_window:Show()
     dispatcher:RunLoop()
     pcall(function() selection_window:Hide() end)
+    pcall(function() doubao_key_window:Hide() end)
 
     if not selected_audio_sources and not dialog_cancelled then
         selected_audio_sources = collect_checked_audio_sources()
