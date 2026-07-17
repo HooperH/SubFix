@@ -2749,18 +2749,14 @@ local function generate_selection_subtitles()
     local selected_audio_sources = nil
     -- 模式选择下拉已移除，固定使用现场模式
     local subtitle_mode = "live"
-    -- 字幕长度：标准（≤25字）/ 短视频（≤10字），默认标准，仅有 1 个音频候选自动跳过弹窗时使用该默认值
+    -- 以下缺省值仅在对话框异常/未返回时兜底；正常路径由对话框返回覆盖。
+    -- 字幕长度默认标准（≤25字）；识别模型 backend 默认 Qwen 本地（DEFAULT_ASR_BACKEND=="auto"）。
     local max_chars = 25
-    -- 识别模型 backend：默认 Qwen 本地（DEFAULT_ASR_BACKEND == "auto"），仅有 1 个音频候选
-    -- 自动跳过弹窗时也用该默认值，保证与现状零改变。
     local backend = DEFAULT_ASR_BACKEND
     local selection_err = nil
-    if #audio_sources == 1 then
-        selected_audio_sources = audio_sources
-        print("[SubFix Generate] 仅有 1 个音频候选，自动使用: " .. format_audio_source_label(audio_sources[1], fps))
-    else
-        selected_audio_sources, subtitle_mode, max_chars, backend, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
-    end
+    -- 始终弹出对话框（含只有 1 个音频候选的情形）：即便只有一条音频轨，用户也需要能
+    -- 选择识别模型（Qwen/豆包）与字幕长度，故不再对单候选自动跳过弹窗、直接生成。
+    selected_audio_sources, subtitle_mode, max_chars, backend, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
     if not selected_audio_sources then error(selection_err or "已取消") end
     local selected_track_sources = collect_selected_track_sources(selected_audio_sources)
     if type(selected_track_sources) ~= "table" or #selected_track_sources == 0 then
