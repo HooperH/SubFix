@@ -1924,6 +1924,39 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         cancel_doubao_key_dialog()
     end
 
+    -- 未配置提醒子窗口：单击豆包且未配置时首次提示（引导双击去配置）。同样复用父
+    -- RunLoop 作非模态覆盖；"知道了"仅关闭提示、保持豆包选中，等用户双击配置。
+    local doubao_reminder_window = dispatcher:AddWindow({
+        ID = "GenerateDoubaoReminderWindow",
+        WindowTitle = "SubFix · 豆包密钥未配置",
+        Geometry = {520, 320, 380, 150},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 12,
+        ui:Label{Text = "已选择「豆包（云端）」，但尚未配置密钥。", Weight = 0},
+        ui:Label{Text = "请双击「豆包（云端）」按钮填写 App ID / Access Token。", Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:HGap(0, 1),
+            ui:Button{ID = "GenerateDoubaoReminderOkBtn", Text = "知道了", Weight = 0, MinimumSize = {88, 28}}
+        }
+    })
+
+    function doubao_reminder_window.On.GenerateDoubaoReminderOkBtn.Clicked(ev)
+        pcall(function() doubao_reminder_window:Hide() end)
+    end
+
+    function doubao_reminder_window.On.GenerateDoubaoReminderWindow.Close(ev)
+        pcall(function() doubao_reminder_window:Hide() end)
+    end
+
+    -- 秒级近似双击：Resolve 按钮无原生双击事件，用相邻两次点击的秒差(<=阈值)近似。
+    local DOUBAO_DOUBLE_CLICK_SECONDS = 1
+    local last_doubao_click_time = nil
+    local doubao_reminder_shown = false
+
     local item_map = {}
     for index, source in ipairs(audio_sources) do
         local ok_item, item = pcall(function() return track_tree:NewItem() end)
@@ -1980,10 +2013,19 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     function selection_window.On.GenerateSubtitleEngineDoubaoBtn.Clicked(ev)
+        -- 单击选中豆包；≤阈值秒内的第二次点击视为双击 → 打开配置窗；单次点击时
+        -- 若未配置且本次会话还没提醒过，弹提醒窗引导用户双击去配置。
+        local now = os.time()
+        local is_double = last_doubao_click_time ~= nil and (now - last_doubao_click_time) <= DOUBAO_DOUBLE_CLICK_SECONDS
+        last_doubao_click_time = now
         select_subtitle_engine(2)
-        -- 选豆包但尚未配置密钥：即时弹出配置窗口填 appid/token；已配置过则不弹。
-        if not doubao_credentials_configured() then
+        if is_double then
+            last_doubao_click_time = nil
+            pcall(function() doubao_reminder_window:Hide() end)
             open_doubao_key_dialog()
+        elseif not doubao_credentials_configured() and not doubao_reminder_shown then
+            doubao_reminder_shown = true
+            pcall(function() doubao_reminder_window:Show() end)
         end
     end
 
@@ -2020,6 +2062,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     dispatcher:RunLoop()
     pcall(function() selection_window:Hide() end)
     pcall(function() doubao_key_window:Hide() end)
+    pcall(function() doubao_reminder_window:Hide() end)
 
     if not selected_audio_sources and not dialog_cancelled then
         selected_audio_sources = collect_checked_audio_sources()
