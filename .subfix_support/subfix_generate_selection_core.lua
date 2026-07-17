@@ -380,6 +380,20 @@ local function save_last_engine_backend(backend)
     write_text_file(generate_prefs_file_path(), content)
 end
 
+-- 从最近一次诊断读豆包用量摘要（调用次数 / 处理音频秒数），用于生成完成提示。
+-- 无诊断/非豆包/字段缺失 → nil。
+local function read_doubao_usage_summary()
+    local text = read_text_file(resolve_asr_paths().diagnostic)
+    if not text or text == "" then return nil end
+    local data = decode_json_text(text)
+    if type(data) ~= "table" or type(data.diagnostic) ~= "table" then return nil end
+    local diag = data.diagnostic
+    local count = tonumber(diag.doubao_call_count)
+    local seconds = tonumber(diag.doubao_audio_seconds)
+    if not count and not seconds then return nil end
+    return string.format("豆包识别约 %.0f 秒 / %d 次调用", seconds or 0, count or 0)
+end
+
 local function temp_dir()
     local root = (os.getenv("TMPDIR") or "/tmp") .. "/SubFix_GenerateSelectionSubtitles"
     os.execute("mkdir -p " .. shell_quote(root) .. " 2>/dev/null")
@@ -2899,7 +2913,13 @@ local function generate_selection_subtitles()
         finish_generate_progress_window(progress_state, "失败", import_err)
         error(import_err)
     end
-    finish_generate_progress_window(progress_state, "完成", "选区字幕已生成并写回时间线")
+    -- 完成提示：用豆包时追加本次用量（成本感知），非豆包或读不到则不加。
+    local finish_message = "选区字幕已生成并写回时间线"
+    if backend == "doubao_asr" then
+        local usage = read_doubao_usage_summary()
+        if usage then finish_message = finish_message .. "｜" .. usage end
+    end
+    finish_generate_progress_window(progress_state, "完成", finish_message)
     pcall(function() progress_state.window:Hide() end)
     print("[SubFix Generate] 生成选区字幕完成，诊断: " .. audio_diag_path)
     return true

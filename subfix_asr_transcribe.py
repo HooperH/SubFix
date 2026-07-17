@@ -348,6 +348,8 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "doubao_log_ids",
         "doubao_resource_ids",
         "doubao_status_codes",
+        "doubao_call_count",
+        "doubao_audio_seconds",
     }
     row_keys = {
         "index",
@@ -4974,6 +4976,18 @@ def run_generate_subtitles_batch_plan_v4(
             )
         if len(raw_payloads) != len(windows):
             raise RuntimeError(f"{engine_label} {asr_label} 窗口数量不匹配: {len(raw_payloads)} != {len(windows)}")
+        # 豆包用量聚合：调用次数(成功返回 log_id 的次数) + 处理音频总秒数，供生成完成后
+        # 在 UI 展示成本感知（豆包为付费云端服务）。
+        if str(getattr(args, "backend", "auto") or "auto") == "doubao_asr":
+            diagnostic["doubao_call_count"] = len(diagnostic.get("doubao_log_ids") or [])
+            diagnostic["doubao_audio_seconds"] = round(
+                sum(
+                    (float(w.get("end_frame") or 0) - float(w.get("start_frame") or 0))
+                    / (float(w.get("fps") or 0) or 30.0)
+                    for w in windows
+                ),
+                2,
+            )
         track_by_index = {int(track["track_index"]): track for track in prepared_tracks}
         recovered_payloads: list[dict[str, Any]] = []
         recovery_diagnostics: list[dict[str, Any]] = []
