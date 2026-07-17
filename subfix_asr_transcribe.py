@@ -345,6 +345,9 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "asr_backend_used",
         "doubao_fallback_count",
         "doubao_fallback_errors",
+        "doubao_log_ids",
+        "doubao_resource_ids",
+        "doubao_status_codes",
     }
     row_keys = {
         "index",
@@ -3913,11 +3916,16 @@ def _doubao_asr_request_once(
     headers: dict[str, str],
     body_bytes: bytes,
     timeout_seconds: float,
-) -> tuple[str, str]:
-    """Issue a single HTTP POST and return (status_code, response_text).
+) -> tuple[str, str, str]:
+    """Issue a single HTTP POST and return (status_code, response_text, log_id).
 
     Uses the stdlib urllib (no new dependency) rather than the `requests`
     package, since `requests` is not otherwise imported by this module.
+
+    log_id is Volcano's per-request trace id (X-Tt-Logid), returned so it can
+    be recorded in the generate diagnostic -- with it the user can look up in
+    the console / a support ticket whether a given call was actually billed
+    and against which quota/tier.
     """
     request = urllib.request.Request(endpoint, data=body_bytes, headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -3925,7 +3933,9 @@ def _doubao_asr_request_once(
         # 顶层 code 字段，需要在此处同步兼容。
         status_code = response.headers.get("X-Api-Status-Code") or ""
         response_text = response.read().decode("utf-8", errors="replace")
-    return status_code, response_text
+        # 火山每个请求的唯一追踪 ID，用于账务/工单精确核对本次调用是否计费。
+        log_id = response.headers.get("X-Tt-Logid") or response.headers.get("X-Api-Request-Id") or ""
+    return status_code, response_text, log_id
 
 
 def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
@@ -3994,7 +4004,7 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     last_error: Exception | None = None
     for attempt in range(1, DOUBAO_ASR_MAX_ATTEMPTS + 1):
         try:
-            status_code, response_text = _doubao_asr_request_once(
+            status_code, response_text, log_id = _doubao_asr_request_once(
                 endpoint, headers, body_bytes, DOUBAO_ASR_TIMEOUT_SECONDS
             )
         except urllib.error.HTTPError as exc:
@@ -4026,6 +4036,7 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
                         "resource_id": resource_id,
                         "endpoint": endpoint,
                         "status_code": status_code,
+                        "log_id": log_id,
                         "attempt": attempt,
                     },
                 }
@@ -4067,9 +4078,21 @@ def transcribe_v4_window_batch(
 
     payloads = []
     fallback_errors: list[str] = []
+    doubao_log_ids: list[str] = []
+    doubao_resource_ids: list[str] = []
+    doubao_status_codes: list[str] = []
     for window_audio_path in window_audio_paths:
         try:
-            payloads.append(transcribe_doubao_asr(window_audio_path, args.model, args.language))
+            payload = transcribe_doubao_asr(window_audio_path, args.model, args.language)
+            payloads.append(payload)
+            # 收集火山返回的追踪/计费线索，便于在诊断里核对每次调用是否真计费。
+            call_diag = payload.get("diagnostic") or {}
+            if call_diag.get("log_id"):
+                doubao_log_ids.append(str(call_diag["log_id"]))
+            if call_diag.get("resource_id"):
+                doubao_resource_ids.append(str(call_diag["resource_id"]))
+            if call_diag.get("status_code"):
+                doubao_status_codes.append(str(call_diag["status_code"]))
         except Exception as exc:
             fallback_errors.append(f"{Path(window_audio_path).name}: {exc}")
             payloads.append(transcribe_qwen3_asr(window_audio_path, args.model, args.language))
@@ -4077,6 +4100,13 @@ def transcribe_v4_window_batch(
         "asr_backend_used": "doubao_asr",
         "doubao_fallback_count": len(fallback_errors),
     }
+    if doubao_log_ids:
+        diagnostic["doubao_log_ids"] = doubao_log_ids
+    if doubao_resource_ids:
+        # 去重保序：同一批次通常同一个 resource_id。
+        diagnostic["doubao_resource_ids"] = list(dict.fromkeys(doubao_resource_ids))
+    if doubao_status_codes:
+        diagnostic["doubao_status_codes"] = list(dict.fromkeys(doubao_status_codes))
     if fallback_errors:
         diagnostic["doubao_fallback_errors"] = fallback_errors
     return payloads, diagnostic
@@ -4928,6 +4958,10 @@ def run_generate_subtitles_batch_plan_v4(
                 diagnostic.setdefault("doubao_fallback_errors", []).extend(
                     chunk_asr_diagnostic["doubao_fallback_errors"]
                 )
+            # 汇总豆包每次调用的追踪/计费线索，供账务核对（log_id 可去火山精确定位）。
+            for _key in ("doubao_log_ids", "doubao_resource_ids", "doubao_status_codes"):
+                if chunk_asr_diagnostic.get(_key):
+                    diagnostic.setdefault(_key, []).extend(chunk_asr_diagnostic[_key])
             completed_windows = min(len(windows), offset + len(chunk))
             write_progress(
                 progress_path,
