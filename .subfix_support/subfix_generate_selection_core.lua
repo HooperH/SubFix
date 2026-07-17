@@ -354,6 +354,32 @@ local function save_doubao_credentials(appid, token)
     return true
 end
 
+-- 生成偏好文件（记住上次选的识别模型等），与 helper 同级。
+local function generate_prefs_file_path()
+    local helper = tostring(resolve_asr_paths().helper or "")
+    local dir = helper:gsub("/[^/]*$", "")
+    if dir == "" or dir == helper then
+        dir = configured_script_root() .. "/.subfix_support"
+    end
+    return dir .. "/subfix_generate_prefs.json"
+end
+
+-- 读上次选择的识别模型 backend（无偏好/解析失败 → nil）。
+local function read_last_engine_backend()
+    local text = read_text_file(generate_prefs_file_path())
+    if not text or text == "" then return nil end
+    local data = decode_json_text(text)
+    if type(data) ~= "table" then return nil end
+    local b = trim_text(tostring(data.last_engine_backend or ""))
+    return b ~= "" and b or nil
+end
+
+-- 记住本次选择的识别模型 backend（写偏好文件；失败静默，不影响生成）。
+local function save_last_engine_backend(backend)
+    local content = string.format('{\n  "last_engine_backend": "%s"\n}\n', json_escape(backend))
+    write_text_file(generate_prefs_file_path(), content)
+end
+
 local function temp_dir()
     local root = (os.getenv("TMPDIR") or "/tmp") .. "/SubFix_GenerateSelectionSubtitles"
     os.execute("mkdir -p " .. shell_quote(root) .. " 2>/dev/null")
@@ -1722,7 +1748,17 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_ENGINE_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
     local SUBTITLE_ENGINE_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_engine_index = 1
-    local selected_backend = SUBTITLE_ENGINE_OPTIONS[1].backend
+    -- 记住上次选择的识别模型：命中偏好则默认选它（找不到/无偏好则保持默认 Qwen）。
+    local last_engine_backend = read_last_engine_backend()
+    if last_engine_backend then
+        for i, opt in ipairs(SUBTITLE_ENGINE_OPTIONS) do
+            if opt.backend == last_engine_backend then
+                selected_engine_index = i
+                break
+            end
+        end
+    end
+    local selected_backend = SUBTITLE_ENGINE_OPTIONS[selected_engine_index].backend
     local dialog_cancelled = false
     local track_rows = {}
     local selection_window = dispatcher:AddWindow({
@@ -2040,6 +2076,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         end
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
+        -- 记住本次识别模型，下次对话框默认选它。
+        save_last_engine_backend(selected_backend)
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end

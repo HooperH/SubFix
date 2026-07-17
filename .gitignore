@@ -21,6 +21,10 @@ tests/__pycache__/
 doubao_credentials.json
 **/doubao_credentials.json
 
+# 运行时生成的生成偏好（记住上次识别模型等），不进 git。
+subfix_generate_prefs.json
+**/subfix_generate_prefs.json
+
 # Local build output and packaged release artifacts.
 build/
 dist/
