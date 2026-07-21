@@ -26,6 +26,7 @@ subfix_generate_prefs.json
 **/subfix_generate_prefs.json
 
 # Local build output and packaged release artifacts.
+/.worktrees/
 build/
 dist/
 *.pkg
