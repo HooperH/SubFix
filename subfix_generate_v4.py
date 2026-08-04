@@ -229,14 +229,27 @@ def compose_track_audio(
     fps = fps_values[0]
     if any(abs(value - fps) > 1e-4 for value in fps_values[1:]):
         raise ValueError("v4 同一轨道的时间线 FPS 不一致")
+    source_audio_tail_truncated_count = 0
+    source_audio_tail_silence_seconds = 0.0
     for item, path, sample_count in valid:
         if item.get("timeline_end_frame") is None:
             continue
         expected_frames = int(item["timeline_end_frame"]) - int(item.get("timeline_start_frame") or 0)
         actual_frames = int(round(sample_count / sample_rate * fps))
         tolerance = max(2, int(math.ceil(max(1, expected_frames) * 0.01)))
-        if expected_frames <= 0 or abs(actual_frames - expected_frames) > tolerance:
+        tail_silence_seconds = float(item.get("source_audio_tail_silence_seconds") or 0.0)
+        truncated_source_tail = (
+            bool(item.get("source_audio_tail_truncated"))
+            and tail_silence_seconds > 0
+            and actual_frames < expected_frames
+        )
+        if expected_frames <= 0 or (
+            abs(actual_frames - expected_frames) > tolerance and not truncated_source_tail
+        ):
             raise ValueError(f"v4 音频时长与时间线跨度不一致，暂不支持重定时片段: {path.name}")
+        if truncated_source_tail:
+            source_audio_tail_truncated_count += 1
+            source_audio_tail_silence_seconds += tail_silence_seconds
     timeline_end = max(
         int(item["timeline_end_frame"])
         if item.get("timeline_end_frame") is not None
@@ -264,6 +277,8 @@ def compose_track_audio(
         "item_count": len(valid),
         "overlap_sample_count": overlap_sample_count,
         "output_sample_count": len(mixed),
+        "source_audio_tail_truncated_count": source_audio_tail_truncated_count,
+        "source_audio_tail_silence_seconds": source_audio_tail_silence_seconds,
     }
 
 
