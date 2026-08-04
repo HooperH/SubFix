@@ -239,7 +239,7 @@ def compose_track_audio(
         tolerance = max(2, int(math.ceil(max(1, expected_frames) * 0.01)))
         tail_silence_seconds = float(item.get("source_audio_tail_silence_seconds") or 0.0)
         truncated_source_tail = (
-            bool(item.get("source_audio_tail_truncated"))
+            item.get("source_audio_tail_truncated") is True
             and tail_silence_seconds > 0
             and actual_frames < expected_frames
         )
