@@ -24,6 +24,8 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
+SUBFIX_VERSION = "3.1.0"
+
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
 function startup_elapsed_ms()
@@ -7234,6 +7236,7 @@ SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_large_move_min_score = 0.92
 SUBFIX_AUDIO_ALIGN.normalize_length_qwen_display_lead_frames = 3
 SUBFIX_AUDIO_ALIGN.alignment_max_rows_per_batch = 18
 SUBFIX_AUDIO_ALIGN.alignment_max_batch_seconds = 28
+SUBFIX_AUDIO_ALIGN.alignment_max_chars_per_batch = 72
 SUBFIX_AUDIO_ALIGN.alignment_batch_context_frames = 12
 SUBFIX_AUDIO_ALIGN.normalize_length_neighbor_original_gap_frames = 8
 SUBFIX_AUDIO_ALIGN.normalize_length_neighbor_max_gap_frames = 36
@@ -8039,6 +8042,26 @@ function SUBFIX_AUDIO_ALIGN.copy_row_for_audio_source(row, audio_source)
     return copy
 end
 
+function SUBFIX_AUDIO_ALIGN.is_non_dialogue_audio_source(audio_source)
+    local source = type(audio_source) == "table" and audio_source or {}
+    local text = string.lower(table.concat({
+        tostring(source.file_name or ""),
+        tostring(source.file_path or ""),
+        tostring(source.resolved_audio_path or "")
+    }, " "))
+    local markers = {
+        "musicbed", "artlist", "epidemicsound", "epidemic sound", "soundstripe", "bgm", "sfx",
+        "/music/", "/bgm/", "/sfx/", "\\music\\", "\\bgm\\", "\\sfx\\",
+        "_bgm", "-bgm", " bgm", "_sfx", "-sfx", " sfx", "instrumental"
+    }
+    for _, marker in ipairs(markers) do
+        if text:find(marker, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
 function SUBFIX_AUDIO_ALIGN.find_primary_audio_track_batches(timeline, rows, fps)
     if not timeline then
         return nil, "缺少时间线"
@@ -8055,6 +8078,7 @@ function SUBFIX_AUDIO_ALIGN.find_primary_audio_track_batches(timeline, rows, fps
     end
 
     local tracks = {}
+    local excluded_non_dialogue_sources = 0
     for track_index = 1, track_count do
         local track_info = {
             track_index = track_index,
@@ -8073,8 +8097,12 @@ function SUBFIX_AUDIO_ALIGN.find_primary_audio_track_batches(timeline, rows, fps
                 if overlap > 0 then
                     local source = SUBFIX_AUDIO_ALIGN.audio_source_from_item(item, track_index, item_index, fps, overlap)
                     if source then
-                        track_info.overlap_frames = track_info.overlap_frames + overlap
-                        track_info.sources[#track_info.sources + 1] = source
+                        if SUBFIX_AUDIO_ALIGN.is_non_dialogue_audio_source(source) then
+                            excluded_non_dialogue_sources = excluded_non_dialogue_sources + 1
+                        else
+                            track_info.overlap_frames = track_info.overlap_frames + overlap
+                            track_info.sources[#track_info.sources + 1] = source
+                        end
                     end
                 end
             end
@@ -8096,6 +8124,9 @@ function SUBFIX_AUDIO_ALIGN.find_primary_audio_track_batches(timeline, rows, fps
 
     local primary_track = tracks[1]
     if not primary_track then
+        if excluded_non_dialogue_sources > 0 then
+            return nil, string.format("未找到可用对白音轨：已排除 %d 个疑似 BGM/SFX 音频片段", excluded_non_dialogue_sources)
+        end
         return nil, "未找到与当前字幕范围重叠的本地音频文件"
     end
 
@@ -8179,6 +8210,7 @@ function SUBFIX_AUDIO_ALIGN.split_alignment_batch_plan_for_accuracy(batch_plan, 
         effective_fps,
         math.floor((tonumber(SUBFIX_AUDIO_ALIGN.alignment_max_batch_seconds) or 28) * effective_fps + 0.5)
     )
+    local max_chars = math.max(8, math.floor(tonumber(SUBFIX_AUDIO_ALIGN.alignment_max_chars_per_batch) or 72))
     local context_frames = math.max(0, math.floor(tonumber(SUBFIX_AUDIO_ALIGN.alignment_batch_context_frames) or 12))
     local split_batches = {}
     local split_count = 0
@@ -8190,6 +8222,10 @@ function SUBFIX_AUDIO_ALIGN.split_alignment_batch_plan_for_accuracy(batch_plan, 
     local function row_end_frame(row)
         local start_frame = row_start_frame(row)
         return tonumber(row and row.end_frame) or (start_frame + 1)
+    end
+
+    local function row_char_count(row)
+        return count_utf8_chars(trim_text(row and row.text or ""))
     end
 
     local function append_chunk(parent_batch, rows)
@@ -8249,32 +8285,38 @@ function SUBFIX_AUDIO_ALIGN.split_alignment_batch_plan_for_accuracy(batch_plan, 
             return a_start < b_start
         end)
 
-        local full_start, full_end = nil, nil
+        local full_start, full_end, full_char_count = nil, nil, 0
         for _, row in ipairs(rows) do
             full_start = full_start and math.min(full_start, row_start_frame(row)) or row_start_frame(row)
             full_end = full_end and math.max(full_end, row_end_frame(row)) or row_end_frame(row)
+            full_char_count = full_char_count + row_char_count(row)
         end
         local full_duration = (full_end or 0) - (full_start or 0)
-        if #rows <= max_rows and full_duration <= max_duration_frames then
+        if #rows <= max_rows and full_duration <= max_duration_frames and full_char_count <= max_chars then
             split_batches[#split_batches + 1] = batch
         else
             split_count = split_count + 1
             local chunk = {}
             local chunk_start = nil
+            local chunk_char_count = 0
             for _, row in ipairs(rows) do
                 local start_frame = row_start_frame(row)
                 local end_frame = row_end_frame(row)
+                local char_count = row_char_count(row)
                 local exceeds_rows = #chunk >= max_rows
                 local exceeds_duration = chunk_start and ((end_frame - chunk_start) > max_duration_frames)
-                if #chunk > 0 and (exceeds_rows or exceeds_duration) then
+                local exceeds_chars = chunk_char_count + char_count > max_chars
+                if #chunk > 0 and (exceeds_rows or exceeds_duration or exceeds_chars) then
                     append_chunk(batch, chunk)
                     chunk = {}
                     chunk_start = nil
+                    chunk_char_count = 0
                 end
                 if not chunk_start then
                     chunk_start = start_frame
                 end
                 chunk[#chunk + 1] = row
+                chunk_char_count = chunk_char_count + char_count
             end
             append_chunk(batch, chunk)
         end
@@ -8932,7 +8974,9 @@ function SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths)
     if helper_dir == "" then
         return false
     end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(helper_dir .. "/qwen3-asr.cpp/build/qwen3-asr-cli") then
+    local legacy_cli = helper_dir .. "/qwen3-asr.cpp/build/qwen3-asr-cli"
+    local packaged_cli = helper_dir .. "/bin/qwen3-asr-cli"
+    if not SUBFIX_AUDIO_ALIGN.file_exists(legacy_cli) and not SUBFIX_AUDIO_ALIGN.file_exists(packaged_cli) then
         return false
     end
     local model_names = {
@@ -8951,13 +8995,13 @@ end
 
 function SUBFIX_AUDIO_ALIGN.resolve_normalize_align_engine(paths)
     local configured = tostring(os.getenv("SUBFIX_ALIGN_ENGINE") or "")
-    if configured ~= "" then
-        return configured
+    if configured ~= "" and configured ~= "qwen3_cpp" then
+        return nil, "规整字幕长度只支持 Qwen3 Forced Aligner"
     end
     if SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths) then
         return "qwen3_cpp"
     end
-    return "ctc"
+    return nil, "未找到 Qwen3 Forced Aligner，请先安装本地 Qwen 对齐组件"
 end
 
 function SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
@@ -10045,19 +10089,13 @@ function SUBFIX_AUDIO_ALIGN.protected_ctc_candidate_start(row_start, candidate_s
     local move_frames = ctc_candidate - original_start
     local move_distance = math.abs(move_frames)
 
+    -- Qwen 字级强制对齐在真实时间线中可能将相邻句错配；仅保留其诊断结果，
+    -- 绝不能据此重写字幕位置。
+    if alignment_mode == "qwen3_forced_aligner" then
+        return original_start, false, "preserved_qwen_timing", nil, row_remap_score, nil
+    end
     if move_distance <= origin_guard_frames then
         return original_start, false, "preserved_already_aligned", 0, ctc_confidence, nil
-    end
-    if alignment_mode == "qwen3_forced_aligner" then
-        if row_remap_decision ~= "accepted_local_match" then
-            return original_start, false, "rejected_low_remap_score", nil, row_remap_score, nil
-        end
-        if not row_remap_score or row_remap_score < qwen_remap_min_score then
-            return original_start, false, "rejected_low_remap_score", nil, row_remap_score, nil
-        end
-        if move_distance > large_move_frames and row_remap_score < qwen_remap_large_move_min_score then
-            return original_start, false, "rejected_low_remap_score", nil, row_remap_score, nil
-        end
     end
     local _, original_onset_distance = SUBFIX_AUDIO_ALIGN.nearest_onset_distance(original_start, local_onset_frames, {
         max_before_frames = onset_guard_frames,
@@ -10151,11 +10189,9 @@ end
 function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_position, fps, normalize_bias_frames)
     local candidates = {}
     local candidate_by_row = {}
-    local min_duration = math.max(1, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_min_duration_frames) or math.floor((tonumber(fps) or 24) * 0.25 + 0.5))
     local max_move_frames = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames) or 90
     local large_move_frames = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_ctc_large_move_frames) or 12
     local large_move_min_score = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_large_move_min_score) or 0.92
-    local tail_padding = tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_end_tail_padding_frames) or 0
     local start_bias_frames = tonumber(normalize_bias_frames) or 0
     local qwen_display_lead_frames = math.max(0, tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_qwen_display_lead_frames) or 0)
 
@@ -10166,7 +10202,6 @@ function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_
             local old_start = tonumber(row and row.start_frame) or nil
             local old_end = tonumber(row and row.end_frame) or nil
             local qwen_start = tonumber(result.ctc_start_frame) or tonumber(result.stable_ts_start_frame) or tonumber(result.new_start_frame)
-            local qwen_end = tonumber(result.ctc_end_frame)
             if row_index and old_start and old_end and qwen_start then
                 local move_distance = math.abs(qwen_start - old_start)
                 local row_remap_score = tonumber(result.row_remap_score) or 0
@@ -10193,11 +10228,8 @@ function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_
                         row_index = row_index,
                         old_start = old_start,
                         old_end = old_end,
-                        old_duration = math.max(1, old_end - old_start),
                         qwen_start = qwen_start,
-                        qwen_end = qwen_end,
                         new_start = new_start,
-                        candidate_end = qwen_end and math.floor(qwen_end + start_bias_frames + tail_padding) or nil,
                         start_bias_frames = start_bias_frames,
                         qwen_display_lead_frames = qwen_display_lead_frames,
                         audio_start = audio_start,
@@ -10224,16 +10256,9 @@ function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_
         local prev_row = row_index and rows[row_index - 1] or nil
         local next_row = row_index and rows[row_index + 1] or nil
         local prev_candidate = prev_row and candidate_by_row[prev_row] or nil
-        local next_candidate = next_row and candidate_by_row[next_row] or nil
         local prev_end = prev_row and tonumber(prev_row.end_frame) or nil
         local next_start = next_row and tonumber(next_row.start_frame) or nil
         local prev_limit = prev_candidate and prev_candidate.new_start or prev_end
-        local next_qwen_start_frame = next_candidate and next_candidate.new_start or nil
-        local max_end = next_qwen_start_frame or next_start
-
-        if candidate.audio_end then
-            max_end = max_end and math.min(max_end, candidate.audio_end) or candidate.audio_end
-        end
         if candidate.audio_start and candidate.new_start < candidate.audio_start then
             candidate.new_start = candidate.audio_start
         end
@@ -10241,46 +10266,25 @@ function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_
         local decision = "preserved_already_aligned"
         local should_apply = true
         local new_start = candidate.new_start
-        local new_end = candidate.old_end
-        local end_decision = "rejected_no_ctc_end"
+        local end_decision = "preserved_original_end"
 
         if prev_limit and new_start < prev_limit then
             should_apply = false
             decision = "rejected_order"
-        elseif next_start and not next_qwen_start_frame and new_start >= next_start then
+        elseif next_start and new_start >= next_start then
             should_apply = false
             decision = "rejected_order"
         elseif candidate.audio_end and new_start >= candidate.audio_end then
             should_apply = false
             decision = "rejected_order"
+        elseif new_start >= candidate.old_end then
+            should_apply = false
+            decision = "rejected_duration"
         else
-            local min_end = new_start + min_duration
-            if max_end and max_end < min_end then
-                should_apply = false
-                decision = "rejected_order"
-            else
-                local candidate_end = candidate.candidate_end or (new_start + candidate.old_duration)
-                if next_qwen_start_frame then
-                    candidate_end = math.min(candidate_end, next_qwen_start_frame)
-                    end_decision = "qwen_global_boundary"
-                end
-                if max_end then
-                    candidate_end = math.min(candidate_end, max_end)
-                end
-                new_end = math.max(new_start + 1, math.max(min_end, candidate_end))
-                if max_end then
-                    new_end = math.min(new_end, max_end)
-                end
-                if new_end <= new_start then
-                    should_apply = false
-                    decision = "rejected_order"
-                elseif new_start < candidate.old_start then
-                    decision = "moved_backward_better"
-                elseif new_start > candidate.old_start then
-                    decision = "moved_forward_better"
-                elseif new_end ~= candidate.old_end then
-                    decision = "preserved_already_aligned"
-                end
+            if new_start < candidate.old_start then
+                decision = "moved_backward_better"
+            elseif new_start > candidate.old_start then
+                decision = "moved_forward_better"
             end
         end
 
@@ -10288,12 +10292,11 @@ function SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_
             should_apply = should_apply,
             decision = decision,
             final_start = should_apply and new_start or candidate.old_start,
-            final_end = should_apply and new_end or candidate.old_end,
+            final_end = should_apply and candidate.old_end or candidate.old_end,
             can_move = should_apply,
             start_bias_frames = candidate.start_bias_frames,
             qwen_display_lead_frames = candidate.qwen_display_lead_frames,
             end_decision = end_decision,
-            next_qwen_start_frame = next_qwen_start_frame,
             qwen_candidate_index = index,
             qwen_candidate_count = #candidates
         }
@@ -10708,49 +10711,45 @@ function SUBFIX_AUDIO_ALIGN.run_whisperx_text_alignment_batches(batch_plan, fps,
     return SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, fps, bias_frames, options)
 end
 
-function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias_frames, options)
+function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, bias_frames, options)
     options = type(options) == "table" and options or {}
     local progress = options.progress
     local batch_total = #(batch_plan and batch_plan.batches or {})
     if batch_total <= 0 then
-        return nil, { diagnostic = "没有 CTC batch" }
+        return nil, { diagnostic = "没有 Qwen 对齐批次" }
     end
 
     local paths = SUBFIX_AUDIO_ALIGN.get_asr_paths()
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.helper) then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, "缺少 CTC helper: " .. tostring(paths.helper))
+        return nil, { diagnostic = "缺少 Qwen 对齐 helper: " .. tostring(paths.helper) }
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(paths.python) then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, "CTC 环境未安装，请先在终端运行: " .. shell_quote(paths.setup))
+        return nil, { diagnostic = "Qwen 运行环境未安装，请先在终端运行: " .. shell_quote(paths.setup) }
     end
 
     local ffmpeg_path = SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
     if not ffmpeg_path then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频"))
+        return nil, { diagnostic = SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message("截取音频") }
     end
 
     ensure_backup_directory()
     local output_path = SUBFIX_AUDIO_ALIGN.asr_temp_output_path()
-    local progress_path = "/tmp/subfix_ctc_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    local progress_path = "/tmp/subfix_qwen_align_progress_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
     local batch_plan_path = SUBFIX_AUDIO_ALIGN.alignment_rows_temp_path()
     local plan_ok, plan_err = SUBFIX_AUDIO_ALIGN.write_ctc_batch_plan_json(batch_plan_path, batch_plan, fps)
     if not plan_ok then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, plan_err)
+        return nil, { diagnostic = plan_err }
     end
 
-    local align_engine = SUBFIX_AUDIO_ALIGN.resolve_normalize_align_engine(paths)
-    local helper_mode = "ctc_align_text_batches"
-    local helper_label = "批量 CTC 文本对齐"
-    local progress_stage = "CTC 对齐"
-    local source_label = "主讲轨批量 CTC"
-    local mapping_mode = "ctc_text_alignment_batches"
-    if align_engine == "qwen3_cpp" then
-        helper_mode = "qwen_forced_align_text_batches"
-        helper_label = "批量 Qwen3 forced alignment"
-        progress_stage = "Qwen3 对齐"
-        source_label = "主讲轨批量 Qwen3"
-        mapping_mode = "qwen3_forced_align_text_batches"
+    local align_engine, align_err = SUBFIX_AUDIO_ALIGN.resolve_normalize_align_engine(paths)
+    if not align_engine then
+        return nil, { diagnostic = align_err }
     end
+    local helper_mode = "qwen_forced_align_text_batches"
+    local helper_label = "批量 Qwen3 forced alignment"
+    local progress_stage = "Qwen3 对齐"
+    local source_label = "主讲轨批量 Qwen3"
+    local mapping_mode = "qwen3_forced_align_text_batches"
 
     if progress then
         update_normalize_progress({
@@ -10783,13 +10782,14 @@ function SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, bias
     local payload_text = read_text_file(output_path)
     local payload, decode_err = decode_json_text(payload_text or "")
     if not payload then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, helper_label .. "输出解析失败: " .. tostring(decode_err or output))
+        return nil, { diagnostic = helper_label .. "输出解析失败: " .. tostring(decode_err or output) }
     end
-    if payload.ok == false then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, tostring(payload.error or output or helper_label .. "失败"))
+    local has_batch_payloads = type(payload.batches) == "table" and #payload.batches > 0
+    if payload.ok == false and not has_batch_payloads then
+        return nil, { diagnostic = tostring(payload.error or output or helper_label .. "失败") }
     end
-    if not ok then
-        return SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches_fallback(batch_plan, fps, bias_frames, options, helper_label .. "执行失败: " .. tostring(output or ""))
+    if not ok and not has_batch_payloads then
+        return nil, { diagnostic = helper_label .. "执行失败: " .. tostring(output or "") }
     end
 
     local summary = {
@@ -11895,7 +11895,7 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
         })
     end
 
-    local results, reference_info = SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, fps, 0, {
+    local results, reference_info = SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, 0, {
         max_stable_ts_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames,
         allow_non_monotonic_candidates = true,
         progress = normalize_progress
@@ -11904,7 +11904,7 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
         return nil, false, "已取消", {cancelled = true}
     end
     if not results or #results == 0 then
-        return nil, false, "没有 CTC 文本对齐结果", nil
+        return nil, false, "没有 Qwen3 强制对齐结果", nil
     end
 
     if is_normalize_progress_cancelled() then
@@ -11928,7 +11928,7 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
                 log = string.format("开始可疑片段 CTC 复核，共 %d 个小窗口", #(review_plan.batches or {}))
             })
         end
-        local review_results, review_info = SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(review_plan, fps, 0, {
+        local review_results, review_info = SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(review_plan, fps, 0, {
             max_stable_ts_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames,
             allow_non_monotonic_candidates = true,
             progress = normalize_progress
@@ -12018,7 +12018,8 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
         review_rejected_count = tonumber(reference_info and reference_info.review_rejected_count) or 0
 	    }
 	    local diagnostic_records = {}
-	    local qwen_global_plan_by_row = SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_position, fps, normalize_bias_frames)
+    -- 只有通过文本匹配、位移、顺序、音频范围与时长保护的 Qwen 候选才允许写回。
+    local qwen_global_plan_by_row = SUBFIX_AUDIO_ALIGN.build_qwen_global_writeback_plan(results, rows, row_position, fps, normalize_bias_frames)
 
 	    for _, result in ipairs(results or {}) do
         if is_normalize_progress_cancelled() then
@@ -12169,12 +12170,8 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
 	                if next_start and new_end > next_start then
 	                    new_end = next_start
 	                end
-	                local can_use_ctc_end = tonumber(result.ctc_end_frame) ~= nil
-	                if result.alignment_mode == "qwen3_forced_aligner" then
-	                    local end_remap_score = tonumber(result.row_remap_score) or 0
-	                    can_use_ctc_end = result.row_remap_decision == "accepted_local_match"
-	                        and end_remap_score >= SUBFIX_AUDIO_ALIGN.normalize_length_qwen_remap_min_score
-	                end
+                local can_use_ctc_end = result.alignment_mode ~= "qwen3_forced_aligner"
+                    and tonumber(result.ctc_end_frame) ~= nil
 	                local ctc_candidate_end = nil
 	                if can_use_ctc_end and tonumber(result.ctc_end_frame) then
 	                    ctc_candidate_end = tonumber(result.ctc_end_frame) + applied_start_bias_frames + (tonumber(SUBFIX_AUDIO_ALIGN.normalize_length_end_tail_padding_frames) or 0)
@@ -12233,11 +12230,11 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
     if matched_count == 0 then
         local first_diagnostic_line = tostring(reference_info and reference_info.diagnostic or ""):match("([^\r\n]+)")
         local diagnostic_suffix = first_diagnostic_line and first_diagnostic_line ~= "" and ("；" .. first_diagnostic_line) or ""
-        return nil, false, "音频修正未生效: CTC batch 全部失败或未覆盖字幕" .. diagnostic_suffix, decision_counts
+        return nil, false, "Qwen3 对齐未生效：批次全部失败或未覆盖字幕" .. diagnostic_suffix, decision_counts
     end
     if aligned_count == 0 then
         return 0, false, string.format(
-            "音频修正未生效: CTC 返回 %d 条，修正 0 条（已对齐 %d 条，无 onset %d 条，方向不可信 %d 条，大跳动 %d 条，不更好 %d 条，低置信 %d 条，邻接空洞 %d 条，顺序限制 %d 条）",
+            "Qwen3 对齐返回无效时间戳或没有安全候选：返回 %d 条，修正 0 条（已对齐 %d 条，无 onset %d 条，方向不可信 %d 条，大跳动 %d 条，不更好 %d 条，低置信 %d 条，邻接空洞 %d 条，顺序限制 %d 条）",
             matched_count,
             tonumber(decision_counts.preserved_already_aligned) or 0,
             tonumber(decision_counts.rejected_no_onset) or 0,
@@ -12452,83 +12449,8 @@ end
 function SUBFIX_AUDIO_ALIGN.run(target_window)
     local window = resolve_window(target_window)
     local status = window and window:Find("StatusLabel") or (win and win:Find("StatusLabel"))
-    if not current_rows or #current_rows == 0 then
-        if status then status:Set("Text", "没有字幕数据，请先刷新字幕") end
-        return false
-    end
-
-    local bias_input = win and win:Find("AudioAlignBiasInput")
-    local bias_frames = SUBFIX_AUDIO_ALIGN.clamp_bias_frames(bias_input and bias_input.Text or 0)
-    if bias_input then
-        bias_input.Text = tostring(bias_frames)
-    end
-
-    if status then status:Set("Text", "正在用 stable-ts 对齐现有字幕文本...") end
-    LogMsg("开始自动对齐声音，偏移帧: " .. tostring(bias_frames))
-
-    local resolve_obj = get_resolve()
-    if not resolve_obj then
-        if status then status:Set("Text", "无法获取 Resolve") end
-        return false
-    end
-
-    local pm = resolve_obj:GetProjectManager()
-    local project = pm and pm:GetCurrentProject()
-    local timeline = project and project:GetCurrentTimeline()
-    if not timeline then
-        if status then status:Set("Text", "没有时间线") end
-        return false
-    end
-
-    current_fps = parse_fps(timeline:GetSetting("timelineFrameRate") or current_fps)
-    current_tl_start_frame = timeline:GetStartFrame() or current_tl_start_frame or 0
-
-    local batch_plan, batch_plan_err = SUBFIX_AUDIO_ALIGN.find_primary_audio_track_batches(timeline, current_rows, current_fps)
-    if not batch_plan then
-        local err_msg = "自动对齐失败: " .. tostring(batch_plan_err or "没有可用音频源")
-        if status then status:Set("Text", err_msg) end
-        LogMsg(err_msg)
-        return false
-    end
-    batch_plan = SUBFIX_AUDIO_ALIGN.split_alignment_batch_plan_for_accuracy(batch_plan, current_fps)
-    if batch_plan.accuracy_split_enabled then
-        LogMsg(string.format(
-            "自动对齐已拆分长音频批次：%d -> %d",
-            tonumber(batch_plan.original_batch_count) or 0,
-            #(batch_plan.batches or {})
-        ))
-    end
-
-    local results, reference_info = SUBFIX_AUDIO_ALIGN.run_stable_ts_alignment_batches(batch_plan, current_fps, bias_frames)
-    if not results or #results == 0 then
-        local err_msg = "自动对齐失败: 没有 stable-ts 对齐结果"
-        if status then status:Set("Text", err_msg) end
-        LogMsg(err_msg)
-        return false
-    end
-    local summary = SUBFIX_AUDIO_ALIGN.apply_matches(results, bias_frames, reference_info)
-
-    local msg = string.format(
-        "stable-ts 对齐完成：A%d 音频片段 %d 个，成功 %d 个，失败 %d 个，更新 %d 条，起点校正 %d 条，平均移动 %.1f 帧。点“更新时间线”写回。",
-        tonumber(summary.audio_track_index) or 0,
-        tonumber(summary.processed_batch_count) or 0,
-        tonumber(summary.successful_batch_count) or 0,
-        tonumber(summary.failed_batch_count) or 0,
-        tonumber(summary.matched_count) or 0,
-        tonumber(summary.onset_corrected_count) or 0,
-        tonumber(summary.avg_move_frames) or 0
-    )
-    if (tonumber(summary.matched_count) or 0) == 0 then
-        msg = string.format(
-            "stable-ts 对齐完成：未更新字幕；A%d 音频片段 %d 个全部失败或未覆盖字幕。",
-            tonumber(summary.audio_track_index) or 0,
-            tonumber(summary.processed_batch_count) or 0
-        )
-    end
-    if status then status:Set("Text", msg) end
-    LogMsg(msg .. " 音频源: " .. tostring(summary.audio_source_name or "") .. " A" .. tostring(summary.audio_track_index or ""))
-    SUBFIX_AUDIO_ALIGN.show_report("自动对齐声音", results, summary)
-    return true
+    if status then status:Set("Text", "自动对齐声音已移除，请使用规整字幕长度") end
+    return false
 end
 
 -- ========== 刷新字幕列表 ==========
@@ -13783,6 +13705,23 @@ function write_rows_to_update_srt(srt_path, rows, timeline, base_frame)
     return index > 1, index - 1, index > 1 and nil or "没有可导入的字幕"
 end
 
+function cleanup_imported_subtitle_media_item(media_pool, media_pool_item, context)
+    if not media_pool or not media_pool_item then
+        return false
+    end
+
+    local ok, result = pcall(function() return media_pool:DeleteClips({media_pool_item}) end)
+    if ok and result ~= false then
+        LogMsg(tostring(context or "字幕写回") .. "后已清理媒体池临时字幕")
+        return true
+    end
+
+    local message = tostring(context or "字幕写回") .. "后清理媒体池临时字幕失败: " .. tostring(result)
+    print("[Hooper AI 2.0] " .. message)
+    LogMsg(message)
+    return false
+end
+
 function capture_timeline_playhead_timecode(timeline)
     if not timeline then
         return nil
@@ -14162,6 +14101,8 @@ update_timeline = function()
         end
         return finish_timeline_update()
     end
+
+    cleanup_imported_subtitle_media_item(mediaPool, mediaPoolItem, "更新时间线")
 
     local final_after_snapshot, after_err = snapshot_subtitle_tracks(timeline)
     if not final_after_snapshot then
@@ -17726,6 +17667,7 @@ local main_content = ui:VGroup({
                 })
             }),
             ui:Button({ID = "RefreshBtn", Text = "刷新字幕", Weight = 0}),
+            ui:Button({ID = "CheckUpdateBtn", Text = "检查更新", Weight = 0}),
             -- 加载状态标签已删除（底部「已加载 N 条」更准确）。HGap 保留右侧空间。
             ui:HGap(0, 1.0),
             ui:Button({
@@ -18026,39 +17968,36 @@ function show_normalize_length_config_dialog(target_window)
         NormalizeLengthConfigWin = dispatcher:AddWindow({
             ID = "NormalizeLengthConfigWin",
             WindowTitle = "规整字幕长度配置",
-            Geometry = {360, 240, 520, 190}
+            Geometry = {360, 240, 320, 170}
         },
         ui:VGroup{
             ContentsMargins = 10,
-            Spacing = 8,
+            Spacing = 6,
             ui:Label{
-                Text = "负数=字幕提前，正数=字幕延后。",
+                Text = "字幕对齐音频偏移",
                 Weight = 0,
-                WordWrap = true
+                MinimumSize = {0, 24}
             },
-            ui:HGroup{
+            ui:LineEdit{
+                ID = "NormalizeLengthBiasInput",
+                Text = "自动",
                 Weight = 0,
-                Spacing = 6,
-                ui:Label{Text = "字幕对齐音频偏移帧数", Weight = 0, MinimumSize = {150, 24}},
-                ui:LineEdit{
-                    ID = "NormalizeLengthBiasInput",
-                    Text = "自动",
-                    Weight = 1,
-                    Alignment = {AlignHCenter = true, AlignVCenter = true}
-                }
+                MinimumSize = {0, 32},
+                Alignment = {AlignHCenter = true, AlignVCenter = true}
             },
+            ui:VGap(4),
             ui:Label{
-                Text = "自动：按本次 CTC 对齐结果校准。\n手动：输入 -10..10 整数（负数提前，正数延后）。",
+                Text = "自动：按本次 Qwen 对齐结果校准。\n手动：-10～10 帧（负数提前，正数延后）",
                 Weight = 0,
-                MinimumSize = {0, 44},
+                MinimumSize = {0, 36},
                 WordWrap = true
             },
             ui:HGroup{
                 Weight = 0,
                 Spacing = 8,
-                ui:HGap(0, 1),
-                ui:Button{ID = "NormalizeLengthCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}},
-                ui:Button{ID = "NormalizeLengthStartBtn", Text = "开始规整", Weight = 0, MinimumSize = {88, 28}}
+                MinimumSize = {0, 28},
+                ui:Button{ID = "NormalizeLengthCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}},
+                ui:Button{ID = "NormalizeLengthStartBtn", Text = "开始规整", Weight = 1, MinimumSize = {0, 28}}
             }
         })
 
@@ -18991,14 +18930,25 @@ function show_chinese_number_conversion_direction_dialog(target_window)
         WindowTitle = "中文数字互转",
         Geometry = {420, 320, 300, 130},
         ui:VGroup {
+            ContentsMargins = 10,
             Spacing = 8,
-            ui:Label { ID = "ChineseNumberConversionHint_" .. uid, Text = "选择转换方向", Alignment = { AlignHCenter = true } },
-            ui:HGroup {
-                Spacing = 8,
-                ui:Button { ID = "ChineseToArabicBtn_" .. uid, Text = "中文数字 → 123" },
-                ui:Button { ID = "ArabicToChineseBtn_" .. uid, Text = "123 → 中文数字" },
+            ui:VGap(2),
+            ui:Label {
+                ID = "ChineseNumberConversionHint_" .. uid,
+                Text = "选择转换方向",
+                Weight = 0,
+                MinimumSize = {0, 28},
+                Alignment = { AlignHCenter = true, AlignVCenter = true },
+                Font = ui:Font{PixelSize = 18}
             },
-            ui:Button { ID = "ChineseNumberCancelBtn_" .. uid, Text = "取消" },
+            ui:HGroup {
+                Weight = 0,
+                Spacing = 8,
+                MinimumSize = {0, 28},
+                ui:Button { ID = "ChineseToArabicBtn_" .. uid, Text = "中文数字 → 123", Weight = 1, MinimumSize = {0, 28} },
+                ui:Button { ID = "ArabicToChineseBtn_" .. uid, Text = "123 → 中文数字", Weight = 1, MinimumSize = {0, 28} },
+            },
+            ui:Button { ID = "ChineseNumberCancelBtn_" .. uid, Text = "取消", Weight = 1, MinimumSize = {0, 28} },
         }
     })
 
@@ -19062,17 +19012,17 @@ function run_normalize_subtitle_length(target_window, options)
         if audio_aligned_count == nil then
             LogMsg("受保护音频修正失败，继续执行纯规整空隙: " .. tostring(stable_align_err or "未知错误"))
             update_normalize_progress({
-                stage = "音频修正未生效",
-                message = "音频修正失败，继续执行纯空隙规整",
-                log = "音频修正失败，继续执行纯空隙规整: " .. tostring(stable_align_err or "未知错误")
+                stage = "Qwen3 对齐未生效",
+                message = "Qwen3 对齐失败，继续执行纯空隙规整",
+                log = "Qwen3 对齐失败，继续执行纯空隙规整: " .. tostring(stable_align_err or "未知错误")
             })
             audio_alignment_effective = false
         elseif not audio_alignment_effective then
             LogMsg(tostring(stable_align_err or "音频修正未生效"))
             update_normalize_progress({
-                stage = "音频修正未生效",
-                message = tostring(stable_align_err or "音频修正未生效，继续规整空隙"),
-                log = tostring(stable_align_err or "音频修正未生效")
+                stage = "Qwen3 对齐未生效",
+                message = tostring(stable_align_err or "Qwen3 对齐未生效，继续规整空隙"),
+                log = tostring(stable_align_err or "Qwen3 对齐未生效")
             })
         end
     else
@@ -19083,7 +19033,6 @@ function run_normalize_subtitle_length(target_window, options)
         })
     end
     audio_aligned_count = tonumber(audio_aligned_count) or 0
-
     if is_normalize_progress_cancelled() then
         local cancel_msg = "规整字幕长度已取消，未应用本次音频对齐结果"
         update_shared_status(window, cancel_msg)
@@ -19144,7 +19093,7 @@ function run_normalize_subtitle_length(target_window, options)
     if audio_alignment_effective then
         msg = string.format("[Hooper AI 2.0] 🧲 规整字幕长度完成：保持原位 %d 条，后移修正 %d 条，前移修正 %d 条，填补 %d 处小空隙。%s 点“更新时间线”写回。", preserved_count, moved_forward_count, moved_backward_count, count, diagnostic_suffix)
     else
-        msg = string.format("[Hooper AI 2.0] 🧲 仅规整空隙，音频修正未生效：%s；保持原位 %d 条，填补 %d 处小空隙。%s 点“更新时间线”写回。", tostring(stable_align_err or "未移动字幕"), preserved_count, count, diagnostic_suffix)
+        msg = string.format("[Hooper AI 2.0] 🧲 仅规整空隙，Qwen3 对齐未生效：%s；保持原位 %d 条，填补 %d 处小空隙。%s 点“更新时间线”写回。", tostring(stable_align_err or "未移动字幕"), preserved_count, count, diagnostic_suffix)
     end
     update_shared_status(window, msg)
     print(msg)
@@ -19275,21 +19224,31 @@ function show_english_typography_config_dialog(target_window)
         EnglishTypographyConfigWin = dispatcher:AddWindow({
             ID = "EnglishTypographyConfigWin",
             WindowTitle = "修改英文排版",
-            Geometry = {390, 260, 380, 180}
+            Geometry = {390, 260, 380, 130}
         },
         ui:VGroup{
             ContentsMargins = 10,
-            Spacing = 8,
-            ui:Label{Text = "大小写：", Weight = 0, MinimumSize = {0, 20}},
-            ui:ComboBox{ID = "EnglishTypographyCaseMode", Weight = 0, MinimumSize = {0, 26}},
-            ui:Label{Text = "间距：", Weight = 0, MinimumSize = {0, 20}},
-            ui:CheckBox{ID = "EnglishTypographySpacingCheckbox", Text = "中英/数字之间加空格", Checked = true, Weight = 0},
+            Spacing = 6,
+            ui:HGroup{
+                Weight = 0,
+                Spacing = 6,
+                ui:Label{Text = "大小写：", Weight = 0, MinimumSize = {0, 26}},
+                ui:ComboBox{ID = "EnglishTypographyCaseMode", Weight = 1, MinimumSize = {0, 26}}
+            },
+            ui:VGap(2),
+            ui:HGroup{
+                Weight = 0,
+                Spacing = 6,
+                MinimumSize = {0, 26},
+                ui:Label{Text = "间距：", Weight = 0, MinimumSize = {0, 26}},
+                ui:CheckBox{ID = "EnglishTypographySpacingCheckbox", Text = "中英/数字之间加空格", Checked = true, Weight = 0}
+            },
             ui:HGroup{
                 Weight = 0,
                 Spacing = 8,
-                ui:HGap(0, 1),
-                ui:Button{ID = "EnglishTypographyCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}},
-                ui:Button{ID = "EnglishTypographyStartBtn", Text = "开始处理", Weight = 0, MinimumSize = {96, 28}}
+                MinimumSize = {0, 28},
+                ui:Button{ID = "EnglishTypographyCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}},
+                ui:Button{ID = "EnglishTypographyStartBtn", Text = "开始处理", Weight = 1, MinimumSize = {0, 28}}
             }
         })
 
@@ -19342,8 +19301,9 @@ end
 
 -- 4️⃣ 最终交付检查
 PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND = 11
+PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS = 6
 PRE_DELIVERY_MAX_SUBTITLE_CHARS = 24
-PRE_DELIVERY_MIN_SUBTITLE_GAP_FRAMES = 3
+PRE_DELIVERY_SUBTITLE_GAP_WARNING_FRAMES = 3
 PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES = 6
 PRE_DELIVERY_SPEECH_CONSISTENCY_ENABLED = true
 PRE_DELIVERY_SPEECH_CONSISTENCY_MIN_SCORE = 0.72
@@ -19424,7 +19384,95 @@ function collect_timeline_video_cut_frames(timeline, track_indices)
 end
 
 function collect_visible_timeline_cut_frames(timeline)
-    return collect_timeline_video_cut_frames(timeline, 1)
+    if not timeline then return {} end
+
+    local ok_count, track_count = pcall(function() return timeline:GetTrackCount("video") end)
+    track_count = ok_count and tonumber(track_count) or 0
+    if track_count <= 0 then
+        return collect_timeline_video_cut_frames(timeline, 1)
+    end
+
+    local ranges_by_track = {}
+    for track_index = 1, track_count do
+        local ok_enabled, enabled = pcall(function() return timeline:GetIsTrackEnabled("video", track_index) end)
+        if not ok_enabled or enabled ~= false then
+            local ok_items, items = pcall(function() return timeline:GetItemListInTrack("video", track_index) end)
+            if ok_items and type(items) == "table" then
+                local item_ranges = {}
+                for _, item in ipairs(items) do
+                    local ok_start, start_frame = pcall(function() return item:GetStart() end)
+                    local ok_end, end_frame = pcall(function() return item:GetEnd() end)
+                    start_frame = ok_start and tonumber(start_frame) or nil
+                    end_frame = ok_end and tonumber(end_frame) or nil
+                    if start_frame and end_frame then
+                        item_ranges[#item_ranges + 1] = {
+                            start_frame = math.floor(start_frame + 0.5),
+                            end_frame = math.floor(end_frame + 0.5)
+                        }
+                    end
+                end
+                table.sort(item_ranges, function(a, b)
+                    if a.start_frame == b.start_frame then return a.end_frame < b.end_frame end
+                    return a.start_frame < b.start_frame
+                end)
+                ranges_by_track[track_index] = item_ranges
+            end
+        end
+    end
+
+    -- Resolve composites higher-numbered video tracks above lower tracks; a lower cut hidden on both sides is not visible.
+    local cuts = {}
+    for track_index, item_ranges in pairs(ranges_by_track) do
+        for item_index, item_range in ipairs(item_ranges) do
+            if not is_timeline_transition_bridge(item_ranges, item_index) then
+                for _, cut_frame in ipairs({item_range.start_frame, item_range.end_frame}) do
+                    if not timeline_video_cut_is_covered_by_higher_track(
+                        track_index,
+                        cut_frame,
+                        ranges_by_track,
+                        track_count
+                    ) then
+                        cuts[cut_frame] = true
+                    end
+                end
+            end
+        end
+    end
+
+    local result = {}
+    for frame in pairs(cuts) do
+        result[#result + 1] = frame
+    end
+    table.sort(result)
+    return result
+end
+
+function timeline_video_cut_is_covered_by_higher_track(track_index, cut_frame, ranges_by_track, track_count)
+    local normalized_track_index = tonumber(track_index) or 1
+    local normalized_cut_frame = tonumber(cut_frame)
+    local max_track_index = tonumber(track_count) or 0
+    if not normalized_cut_frame or max_track_index <= normalized_track_index then
+        return false
+    end
+
+    local function track_covers_frame(item_ranges, frame)
+        for _, item_range in ipairs(item_ranges or {}) do
+            if item_range.start_frame <= frame and frame <= item_range.end_frame then
+                return true
+            end
+        end
+        return false
+    end
+
+    for higher_track_index = normalized_track_index + 1, max_track_index do
+        local higher_ranges = ranges_by_track[higher_track_index]
+        local covered_before = track_covers_frame(higher_ranges, normalized_cut_frame - 1)
+        local covered_after = track_covers_frame(higher_ranges, normalized_cut_frame)
+        if covered_before and covered_after then
+            return true
+        end
+    end
+    return false
 end
 
 function collect_timeline_transition_alignment_cuts(timeline)
@@ -19527,8 +19575,9 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     local rate = tonumber(fps) or tonumber(current_fps) or 24
     fps = rate
     local fast_reading_cps = tonumber(PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND) or 11
+    local max_subtitle_duration_seconds = tonumber(PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS) or 6
     local max_subtitle_chars = tonumber(PRE_DELIVERY_MAX_SUBTITLE_CHARS) or 24
-    local min_subtitle_gap_frames = tonumber(PRE_DELIVERY_MIN_SUBTITLE_GAP_FRAMES) or 3
+    local subtitle_gap_warning_frames = tonumber(PRE_DELIVERY_SUBTITLE_GAP_WARNING_FRAMES) or 3
     local cut_tolerance_frames = tonumber(PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES) or 6
     local cut_frames = collect_visible_timeline_cut_frames(timeline)
     local transition_alignment_cuts = collect_timeline_transition_alignment_cuts(timeline)
@@ -19538,7 +19587,7 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     local previous_text = nil
     local previous_end = nil
 
-    local function add_issue(row, row_index, kind, reason, cut_frame)
+    local function add_issue(row, row_index, kind, reason, cut_frame, marker_frame)
         issues[#issues + 1] = {
             kind = kind,
             reason = reason,
@@ -19547,7 +19596,7 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             start_frame = tonumber(row.start_frame) or 0,
             end_frame = tonumber(row.end_frame) or tonumber(row.start_frame) or 0,
             cut_frame = cut_frame,
-            marker_frame = cut_frame or tonumber(row.start_frame) or 0
+            marker_frame = tonumber(marker_frame) or cut_frame or tonumber(row.start_frame) or 0
         }
     end
 
@@ -19591,6 +19640,9 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             if duration_seconds > 0 and effective_chars > 0 and effective_chars / duration_seconds > fast_reading_cps then
                 add_issue(row, i, "阅读速度过快", string.format("阅读速度 %.1f 字/秒，高于 %d", effective_chars / duration_seconds, fast_reading_cps))
             end
+            if duration_seconds > max_subtitle_duration_seconds and effective_chars > 0 then
+                add_issue(row, i, "字幕显示过久", string.format("字幕持续 %.1f 秒，超过 %d 秒", duration_seconds, max_subtitle_duration_seconds))
+            end
             if effective_chars > max_subtitle_chars then
                 add_issue(row, i, "单条字幕过长", string.format("有效字数 %d，超过 %d", effective_chars, max_subtitle_chars))
             end
@@ -19599,8 +19651,16 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             end
             if previous_row and previous_end then
                 local gap_frames = row_start - previous_end
-                if gap_frames > 0 and gap_frames <= min_subtitle_gap_frames then
-                    add_issue(row, i, "字幕间隔过短", string.format("距离上一条字幕 %d 帧", gap_frames), row_start)
+                if gap_frames > subtitle_gap_warning_frames then
+                    local gap_marker_frame = math.floor(((previous_end + row_start) / 2) + 0.5)
+                    add_issue(
+                        row,
+                        i,
+                        "字幕间隔过长",
+                        string.format("距离上一条字幕 %d 帧", gap_frames),
+                        nil,
+                        gap_marker_frame
+                    )
                 end
                 if trim_text(row_text) ~= "" and trim_text(row_text) == trim_text(previous_text or "") then
                     add_issue(row, i, "相邻重复字幕", "与上一条字幕文本相同", row_start)
@@ -20736,21 +20796,9 @@ function collect_pre_delivery_speech_consistency_issues(rows, timeline, fps, opt
     end
 
     if PRE_DELIVERY_SPEECH_CTC_DIAGNOSTIC_ENABLED == true then
-        update_shared_status(window, "正在最终交付检查：正在执行 CTC 口播一致性校验...")
-        local ctc_results, ctc_summary = SUBFIX_AUDIO_ALIGN.run_ctc_text_alignment_batches(batch_plan, rate, 0, {
-            progress = false,
-            allow_non_monotonic_candidates = true
-        })
-        if ctc_summary and ctc_summary.cancelled then
-            summary.cancelled = true
-            summary.failed_reasons[#summary.failed_reasons + 1] = "CTC 已取消"
-            return issues, summary
-        end
-        for _, ctc_issue in ipairs(collect_pre_delivery_ctc_consistency_issues(ctc_results, ctc_issue_row_seen)) do
-            LogMsg("最终交付检查 CTC 诊断: " .. tostring(ctc_issue.reason or "") .. " " .. tostring(ctc_issue.note or ""))
-        end
+        LogMsg("最终交付检查：CTC 诊断已移除，不再执行旧对齐链路")
     else
-        LogMsg("最终交付检查跳过 CTC 诊断：最终口播一致性以局部 ASR 为准")
+        LogMsg("最终交付检查跳过已移除的 CTC 诊断")
     end
 
     local total_batches = #(batch_plan.batches or {})
@@ -21072,14 +21120,15 @@ function pre_delivery_issue_summary_text(issues, marker_count)
         counts[kind] = (counts[kind] or 0) + 1
     end
     return string.format(
-        "发现问题：%d\n已打 marker：%d\n空字幕：%d\n阅读速度过快：%d\n单条字幕过长：%d\n字幕尾部空格：%d\n字幕间隔过短：%d\n相邻重复字幕：%d\n字幕边界未贴剪辑点：%d",
+        "发现问题：%d\n已打 marker：%d\n空字幕：%d\n阅读速度过快：%d\n字幕显示过久：%d\n单条字幕过长：%d\n字幕尾部空格：%d\n字幕间隔过长：%d\n相邻重复字幕：%d\n字幕边界未贴剪辑点：%d",
         #(issues or {}),
         tonumber(marker_count) or 0,
         counts["空字幕"] or 0,
         counts["阅读速度过快"] or 0,
+        counts["字幕显示过久"] or 0,
         counts["单条字幕过长"] or 0,
         counts["字幕尾部空格"] or 0,
-        counts["字幕间隔过短"] or 0,
+        counts["字幕间隔过长"] or 0,
         counts["相邻重复字幕"] or 0,
         counts["字幕边界未贴剪辑点"] or 0
     )
@@ -21176,7 +21225,7 @@ function add_pre_delivery_check_marker(timeline, issue, timeline_start_frame)
     if trim_text(issue.note or "") ~= "" then
         note = tostring(issue.note or "")
     end
-    local color = (issue.kind == "阅读速度过快" or issue.kind == "单条字幕过长" or issue.kind == "字幕边界未贴剪辑点" or issue.kind == "字幕间隔过短" or issue.kind == "口播字幕小差异" or issue.kind == "口播字幕疑似字词替换") and "Yellow" or "Red"
+    local color = (issue.kind == "阅读速度过快" or issue.kind == "字幕显示过久" or issue.kind == "单条字幕过长" or issue.kind == "字幕边界未贴剪辑点" or issue.kind == "字幕间隔过长" or issue.kind == "口播字幕小差异" or issue.kind == "口播字幕疑似字词替换") and "Yellow" or "Red"
 
     local ok, ret = pcall(function()
         return timeline:AddMarker(frame, color, name, note, duration, custom_data)
@@ -21638,6 +21687,88 @@ end
 -- 设置备份路径按钮
 function win.On.SetPathBtn.Clicked(ev)
     return win.On.BackupFolderBtn.Clicked(ev)
+end
+
+function subfix_update_helper_path()
+    local home = os.getenv("HOME") or ""
+    local user_path = home ~= "" and (home .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py") or nil
+    local system_path = "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/subfix_update.py"
+    local file = user_path and io.open(user_path, "r") or nil
+    if file then file:close(); return user_path end
+    file = io.open(system_path, "r")
+    if file then file:close(); return system_path end
+    return nil
+end
+
+function subfix_update_python_path(helper)
+    local bundled_python = tostring(helper or ""):gsub("/subfix_update%.py$", "/runtime/python/bin/python3")
+    local file = bundled_python ~= "" and io.open(bundled_python, "r") or nil
+    if file then file:close(); return bundled_python end
+    local ok_python, python = run_shell_capture("command -v python3 2>/dev/null")
+    python = trim_text(python or "")
+    return ok_python and python ~= "" and python or nil
+end
+
+function show_subfix_update_confirm(payload)
+    local dialog = dispatcher:AddWindow({ID = "SubFixUpdateConfirm", WindowTitle = "SubFix 更新", Geometry = {480, 300, 460, 220}},
+        ui:VGroup{ContentsMargins = 18, Spacing = 8,
+            ui:Label{Text = "发现新版本 v" .. tostring(payload.version or "?"), Weight = 0},
+            ui:TextEdit{ID = "SubFixUpdateNotes", Text = tostring(payload.notes or ""), ReadOnly = true, Weight = 1},
+            ui:HGroup{Weight = 0, Spacing = 8,
+                ui:Button{ID = "SubFixUpdateInstall", Text = "下载并安装", Weight = 1},
+                ui:Button{ID = "SubFixUpdateCancel", Text = "取消", Weight = 1}
+            }
+        })
+    local action = "cancel"
+    function dialog.On.SubFixUpdateInstall.Clicked(ev) action = "install"; dialog:Hide(); dispatcher:ExitLoop() end
+    function dialog.On.SubFixUpdateCancel.Clicked(ev) dialog:Hide(); dispatcher:ExitLoop() end
+    function dialog.On.SubFixUpdateConfirm.Close(ev) dialog:Hide(); dispatcher:ExitLoop() end
+    dialog:Show(); dispatcher:RunLoop(); pcall(function() dialog:Hide() end)
+    return action
+end
+
+function run_subfix_update(payload)
+    local helper = subfix_update_helper_path()
+    if not helper then return false, "缺少更新器，请先安装包含更新功能的 SubFix 版本" end
+    local python = subfix_update_python_path(helper)
+    if not python then return false, "未找到 Python 3，无法安装更新" end
+    local output_path = "/tmp/subfix_update_install_" .. tostring(os.time()) .. ".json"
+    local cmd = table.concat({
+        shell_quote(python), shell_quote(helper),
+        "install", "--zip-url", shell_quote(tostring(payload.zip_url or "")),
+        "--sha256-url", shell_quote(tostring(payload.sha256_url or "")),
+        "--version", shell_quote(tostring(payload.version or "")),
+        "--output", shell_quote(output_path)
+    }, " ")
+    local ok, output = run_subfix_background_command(cmd, {status_window = win, status_prefix = "正在下载并安装更新"})
+    local result = decode_json_text(read_text_file(output_path) or "")
+    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    if not ok or type(result) ~= "table" or result.ok ~= true then
+        return false, tostring(type(result) == "table" and result.error or output or "更新安装失败")
+    end
+    return true, "更新已安装。请完全退出并重新启动 DaVinci Resolve 后使用 v" .. tostring(payload.version)
+end
+
+function win.On.CheckUpdateBtn.Clicked(ev)
+    local helper = subfix_update_helper_path()
+    if not helper then update_shared_status(win, "缺少更新器；请先安装含更新功能的版本"); return end
+    local python = subfix_update_python_path(helper)
+    if not python then update_shared_status(win, "未找到 Python 3，无法检查更新"); return end
+    local output_path = "/tmp/subfix_update_check_" .. tostring(os.time()) .. ".json"
+    local cmd = table.concat({shell_quote(python), shell_quote(helper), "check", "--current-version", shell_quote(SUBFIX_VERSION), "--output", shell_quote(output_path)}, " ")
+    update_shared_status(win, "正在检查 SubFix 更新...")
+    local ok, output = run_subfix_background_command(cmd, {status_window = win, status_prefix = "正在检查更新"})
+    local payload = decode_json_text(read_text_file(output_path) or "")
+    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    if not ok or type(payload) ~= "table" or payload.ok ~= true then
+        update_shared_status(win, tostring(type(payload) == "table" and payload.error or output or "检查更新失败")); return
+    end
+    if show_subfix_update_confirm(payload) == "install" then
+        local installed, message = run_subfix_update(payload)
+        update_shared_status(win, message)
+    else
+        update_shared_status(win, "已取消更新")
+    end
 end
 
 -- 更新时间线按钮（自动备份后执行）

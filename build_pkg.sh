@@ -13,6 +13,7 @@ IDENTIFIER="${IDENTIFIER:-com.mediastorm.subfix}"
 SOURCE_FILE="${SOURCE_FILE:-${SCRIPT_DIR}/SubFix.lua}"
 GENERATOR_FILE="${GENERATOR_FILE:-${SCRIPT_DIR}/生成选区字幕.lua}"
 GENERATE_CORE_FILE="${GENERATE_CORE_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_generate_selection_core.lua}"
+UPDATE_HELPER_FILE="${UPDATE_HELPER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_update.py}"
 ASR_HELPER_FILE="${ASR_HELPER_FILE:-${SCRIPT_DIR}/subfix_asr_transcribe.py}"
 GENERATE_V4_FILE="${GENERATE_V4_FILE:-${SCRIPT_DIR}/subfix_generate_v4.py}"
 GENERATE_V5_FILE="${GENERATE_V5_FILE:-${SCRIPT_DIR}/subfix_generate_v5.py}"
@@ -44,7 +45,7 @@ OUTPUT_ZIP_PATH="${RELEASE_ROOT}/${OUTPUT_ZIP_NAME}"
 
 echo "📦 开始构建 ${PKG_NAME} v${VERSION} 安装包..."
 
-for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
+for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
     if [ ! -f "$required" ]; then
         echo "❌ 错误：源文件不存在：$required"
         exit 1
@@ -60,6 +61,7 @@ echo "📄 拷贝源文件到安装载荷目录..."
 cp "$SOURCE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua"
 cp "$GENERATOR_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua"
 cp "$GENERATE_CORE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_selection_core.lua"
+cp "$UPDATE_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_update.py"
 cp "$ASR_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_asr_transcribe.py"
 cp "$GENERATE_V4_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_v4.py"
 cp "$GENERATE_V5_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_v5.py"
@@ -132,6 +134,7 @@ echo "📦 整理分发目录..."
 cp "$SOURCE_FILE" "${RELEASE_DIR}/SubFix/SubFix.lua"
 cp "$GENERATOR_FILE" "${RELEASE_DIR}/SubFix/生成选区字幕.lua"
 cp "$GENERATE_CORE_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_selection_core.lua"
+cp "$UPDATE_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_update.py"
 cp "$ASR_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_asr_transcribe.py"
 cp "$GENERATE_V4_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_v4.py"
 cp "$GENERATE_V5_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_v5.py"

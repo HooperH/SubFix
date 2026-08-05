@@ -167,24 +167,22 @@ LIVE_SPEAKER_SWITCH_HOLD_SECONDS = 0.12
 EXTERNAL_TRANSCRIBE_COMMAND_ENV = {
     "mimo_asr": "SUBFIX_MIMO_ASR_CMD",
 }
-# Volcano Engine (豆包/Doubao) 大模型录音文件极速版识别 -- Strategy A: text-only ASR
-# backend. Word-level timestamps are intentionally NOT requested; the v4/v5
-# main pipeline keeps forcing-aligning text with qwen3 downstream
-# (qwen3_cpp_forced_align_text_rows), so swapping the ASR text source here
-# does not touch alignment/segmentation at all.
+# Volcano Engine (豆包/Doubao) 大模型录音文件极速版识别 backend. Its response
+# carries word timestamps in milliseconds; normalize them to seconds so v4/v5
+# can use them directly and reserve Qwen forced alignment for bad/missing data.
 #
 # Field names / endpoint below follow
 # https://docs.volcengine.com/docs/6561/1631584 (fetched 2026-07-16). Marked
 # "待校准" (to calibrate) where the public docs sample didn't fully pin the
 # field down; verify against a real account response before relying on it.
-DOUBAO_ASR_APPID_ENV = "SUBFIX_DOUBAO_APPID"
-DOUBAO_ASR_TOKEN_ENV = "SUBFIX_DOUBAO_TOKEN"
+DOUBAO_ASR_API_KEY_ENV = "SUBFIX_DOUBAO_API_KEY"
 DOUBAO_ASR_RESOURCE_ID_ENV = "SUBFIX_DOUBAO_RESOURCE_ID"
 DOUBAO_ASR_ENDPOINT_ENV = "SUBFIX_DOUBAO_ENDPOINT"
 # Optional credentials file read as a fallback when the env vars are unset.
 # It sits next to this helper (in the deployed plugin that is
-# .subfix_support/doubao_credentials.json). Keys: "appid" / "token". The real
-# file is gitignored; a doubao_credentials.json.example template is tracked.
+# .subfix_support/doubao_credentials.json). Configuration accepts only
+# "api_key". The real file is gitignored; a doubao_credentials.json.example
+# template is tracked.
 DOUBAO_ASR_CREDENTIALS_FILENAME = "doubao_credentials.json"
 # "录音文件极速版识别" (flash/turbo tier) HTTP endpoint -- synchronous, no
 # submit/query polling needed per the docs.
@@ -325,6 +323,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "hard_boundary_count",
         "overlap_disagreement_count",
         "local_retry_region_count",
+        "local_retry_elapsed_seconds",
         "local_retry_selected_count",
         "local_retry_proposed_count",
         "local_retry_writeback_mode",
@@ -344,6 +343,8 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "failure_code",
         "asr_backend_used",
         "doubao_fallback_count",
+        "doubao_native_timestamp_window_count",
+        "doubao_native_timestamp_fallback_count",
         "doubao_fallback_errors",
         "doubao_log_ids",
         "doubao_resource_ids",
@@ -3892,7 +3893,7 @@ def _doubao_credentials_path() -> Path:
 
 
 def _load_doubao_credentials_file() -> dict[str, Any]:
-    """Read {appid, token} from doubao_credentials.json if present.
+    """Read the single API Key from doubao_credentials.json if present.
 
     Returns an empty dict when the file is missing, unreadable, or not a JSON
     object -- callers fall back to raising a clear "no credentials" error.
@@ -3908,7 +3909,8 @@ def _load_doubao_credentials_file() -> dict[str, Any]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return data
+    api_key = str(data.get("api_key") or "").strip()
+    return {"api_key": api_key} if api_key else {}
 
 
 def _doubao_asr_request_once(
@@ -3938,43 +3940,73 @@ def _doubao_asr_request_once(
     return status_code, response_text, log_id
 
 
+def _doubao_asr_timestamp_seconds(value: Any) -> float | None:
+    try:
+        return float(value) / 1000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _doubao_asr_timestamp_payload(result: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not isinstance(result, dict):
+        return [], []
+    segments: list[dict[str, Any]] = []
+    words: list[dict[str, Any]] = []
+    for utterance in result.get("utterances") or []:
+        if not isinstance(utterance, dict):
+            continue
+        start = _doubao_asr_timestamp_seconds(utterance.get("start_time"))
+        end = _doubao_asr_timestamp_seconds(utterance.get("end_time"))
+        if start is None or end is None or end <= start:
+            continue
+        segment_words: list[dict[str, Any]] = []
+        for item in utterance.get("words") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or item.get("word") or "").strip()
+            word_start = _doubao_asr_timestamp_seconds(item.get("start_time"))
+            word_end = _doubao_asr_timestamp_seconds(item.get("end_time"))
+            if text and word_start is not None and word_end is not None and word_end > word_start:
+                word = {"word": text, "start": word_start, "end": word_end}
+                segment_words.append(word)
+                words.append(word)
+        if segment_words:
+            segments.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": str(utterance.get("text") or "").strip(),
+                    "words": segment_words,
+                }
+            )
+    return segments, words
+
+
 def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
     """Transcribe via Volcano Engine (豆包) 录音文件极速版识别 HTTP API.
 
-    Strategy A only needs the plain text: segments/words are left empty
-    because word-level timestamps still come from the existing qwen3 forced
-    aligner further down the v4/v5 pipeline (untouched by this function).
+    Word timestamps are normalized from the API's milliseconds to seconds.
+    The v4/v5 pipeline validates them before use and falls back to Qwen forced
+    alignment only when they are missing or unreliable.
 
-    Credentials are read with a three-tier priority; nothing is hardcoded and
-    the real credentials file is gitignored:
-      1. Environment variables (highest priority):
-         - SUBFIX_DOUBAO_APPID   (App ID / App Key)
-         - SUBFIX_DOUBAO_TOKEN   (Access Token)
-      2. Otherwise doubao_credentials.json next to this helper, keys
-         "appid" / "token".
-      3. If neither supplies both values, raise RuntimeError with a clear
-         message naming both the env vars and the file path.
+    Configuration uses one API Key only. Legacy App ID / Access Token files
+    are intentionally ignored so an empty API Key can never spend cloud quota.
     Optional (env only): SUBFIX_DOUBAO_RESOURCE_ID, SUBFIX_DOUBAO_ENDPOINT.
 
     Raises RuntimeError with a clear message on missing credentials, HTTP
-    errors, timeouts, or malformed responses -- callers (see
-    transcribe_v4_window_batch) are expected to catch this and fall back to
-    qwen3 rather than aborting subtitle generation.
+    errors, timeouts, or malformed responses. Callers surface these failures
+    to Resolve so the user can retry or explicitly switch to local Qwen.
     """
-    appid = os.getenv(DOUBAO_ASR_APPID_ENV)
-    token = os.getenv(DOUBAO_ASR_TOKEN_ENV)
-    if not appid or not token:
+    api_key = str(os.getenv(DOUBAO_ASR_API_KEY_ENV) or "").strip()
+    if not api_key:
         creds = _load_doubao_credentials_file()
-        if not appid:
-            appid = str(creds.get("appid") or "").strip() or None
-        if not token:
-            token = str(creds.get("token") or "").strip() or None
-    if not appid or not token:
+        api_key = str(creds.get("api_key") or "").strip()
+    if not api_key:
         raise RuntimeError(
             "豆包 ASR 未配置密钥：请设置环境变量 "
-            f"{DOUBAO_ASR_APPID_ENV} 与 {DOUBAO_ASR_TOKEN_ENV}，"
+            f"{DOUBAO_ASR_API_KEY_ENV}，"
             f"或在 {_doubao_credentials_path()} 写入 "
-            '{"appid": "...", "token": "..."} 后重试'
+            '{"api_key": "..."} 后重试'
         )
     resource_id = os.getenv(DOUBAO_ASR_RESOURCE_ID_ENV) or DOUBAO_ASR_DEFAULT_RESOURCE_ID
     endpoint = os.getenv(DOUBAO_ASR_ENDPOINT_ENV) or DOUBAO_ASR_DEFAULT_ENDPOINT
@@ -3987,18 +4019,17 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     # 文档 demo 未展示 audio.format/audio.codec 字段，暂不填写，若真实响应要求
     # 音频格式声明，需要在这里补充（cut_audio 输出固定为 16k/mono/wav）。
     body = {
-        "user": {"uid": appid},
+        "user": {"uid": api_key},
         "audio": {"data": base64.b64encode(audio_bytes).decode("ascii")},
         "request": {"model_name": "bigmodel"},
     }
     headers = {
         "Content-Type": "application/json",
-        "X-Api-App-Key": appid,
-        "X-Api-Access-Key": token,
         "X-Api-Resource-Id": resource_id,
         "X-Api-Request-Id": str(uuid.uuid4()),
         "X-Api-Sequence": "-1",
     }
+    headers["X-Api-Key"] = api_key
     body_bytes = json.dumps(body).encode("utf-8")
 
     last_error: Exception | None = None
@@ -4025,12 +4056,13 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
             else:
                 result = response_payload.get("result")
                 text = str((result or {}).get("text") or "").strip()
+                segments, words = _doubao_asr_timestamp_payload(result)
                 return {
                     "backend": "doubao_asr",
                     "model": model,
                     "language": language,
-                    "segments": [],
-                    "words": [],
+                    "segments": segments,
+                    "words": words,
                     "text": text,
                     "diagnostic": {
                         "resource_id": resource_id,
@@ -4054,17 +4086,18 @@ def transcribe_v4_window_batch(
 
     This is the single dispatch point that keeps
     run_generate_subtitles_batch_plan_v4's first-step transcription
-    switchable by backend while leaving everything else (forced alignment,
-    segmentation, profiles, SUBFIX_V5_WRITEBACK) untouched:
+    switchable by backend while leaving segmentation, profiles, and
+    SUBFIX_V5_WRITEBACK untouched:
       - default / any backend other than "doubao_asr": calls
         transcribe_qwen3_asr_batch exactly as before (zero behavior change).
       - backend == "doubao_asr": transcribes each window individually via
         Volcano's flash-recognize HTTP API (one HTTP request per window --
         there is no native batch endpoint documented, so mind QPS limits and
-        the ~0.8 CNY/hour billing when testing on long batches). Any
-        per-window failure (auth/network/timeout) falls back to a single
-        qwen3 transcription for *that* window only, so a flaky Doubao call
-        never aborts subtitle generation.
+        the ~0.8 CNY/hour billing when testing on long batches). A per-window
+        failure is surfaced to Resolve with the affected filename and original
+        cause; valid word timestamps are consumed by the existing alignment
+        validator, otherwise it falls back to Qwen. Resolve then lets the
+        user explicitly retry or switch to Qwen for request failures.
 
     Returns (payloads, diagnostic) where diagnostic carries
     asr_backend_used / doubao_fallback_count (+ error detail) for the
@@ -4077,7 +4110,6 @@ def transcribe_v4_window_batch(
         return payloads, {"asr_backend_used": "qwen3_asr", "doubao_fallback_count": 0}
 
     payloads = []
-    fallback_errors: list[str] = []
     doubao_log_ids: list[str] = []
     doubao_resource_ids: list[str] = []
     doubao_status_codes: list[str] = []
@@ -4094,11 +4126,12 @@ def transcribe_v4_window_batch(
             if call_diag.get("status_code"):
                 doubao_status_codes.append(str(call_diag["status_code"]))
         except Exception as exc:
-            fallback_errors.append(f"{Path(window_audio_path).name}: {exc}")
-            payloads.append(transcribe_qwen3_asr(window_audio_path, args.model, args.language))
+            raise RuntimeError(
+                f"豆包 ASR 失败（{Path(window_audio_path).name}）: {exc}"
+            ) from exc
     diagnostic: dict[str, Any] = {
         "asr_backend_used": "doubao_asr",
-        "doubao_fallback_count": len(fallback_errors),
+        "doubao_fallback_count": 0,
     }
     if doubao_log_ids:
         diagnostic["doubao_log_ids"] = doubao_log_ids
@@ -4107,8 +4140,6 @@ def transcribe_v4_window_batch(
         diagnostic["doubao_resource_ids"] = list(dict.fromkeys(doubao_resource_ids))
     if doubao_status_codes:
         diagnostic["doubao_status_codes"] = list(dict.fromkeys(doubao_status_codes))
-    if fallback_errors:
-        diagnostic["doubao_fallback_errors"] = fallback_errors
     return payloads, diagnostic
 
 
@@ -4798,7 +4829,7 @@ def run_generate_subtitles_batch_plan_v4(
     # requested ASR backend (识别模型) so the progress window doesn't always
     # read "Qwen" even when the user picked 豆包. Actual dispatch happens in
     # transcribe_v4_window_batch; forced alignment further downstream is still
-    # Qwen regardless, but that's a separate step not shown by this label.
+    # Qwen is used only when the selected ASR has no reliable timestamps.
     asr_label = "豆包" if str(getattr(args, "backend", "auto") or "auto") == "doubao_asr" else "Qwen"
     if not batches:
         raise RuntimeError(f"缺少 generate_subtitles {engine_label} batch plan")
@@ -4839,11 +4870,14 @@ def run_generate_subtitles_batch_plan_v4(
         "asr_subwindow_retry_count": 0,
         "asr_recovered_window_count": 0,
         "asr_unrecovered_window_count": 0,
+        "local_retry_elapsed_seconds": 0.0,
         "overlong_tail_reclaimed_count": 0,
         "tail_extended_row_count": 0,
         "textnorm_changed_row_count": 0,
         "asr_backend_used": "qwen3_asr",
         "doubao_fallback_count": 0,
+        "doubao_native_timestamp_window_count": 0,
+        "doubao_native_timestamp_fallback_count": 0,
     }
     profile: dict[str, Any] | None = None
     active_mode_profile: dict[str, Any] | None = None
@@ -4984,7 +5018,7 @@ def run_generate_subtitles_batch_plan_v4(
                 f"{engine_label} 转写校验 {recovery_index}/{len(windows)}",
                 batch_index=recovery_index,
                 total_batches=len(windows),
-                progress_index=v4_progress_point(55, 65, recovery_index - 1, len(windows)),
+                progress_index=v4_progress_point(55, 60, recovery_index - 1, len(windows)),
                 progress_total=100,
             )
             track = track_by_index[int(window["track_index"])]
@@ -5015,7 +5049,7 @@ def run_generate_subtitles_batch_plan_v4(
             recovery_diagnostics.append(recovery_diagnostic)
         raw_payloads = recovered_payloads
         retry_regions: list[dict[str, Any]] = []
-        if v5_mode:
+        if v5_mode and v5_writeback == "live":
             retry_regions, retry_detection = generate_v5.detect_ambiguous_regions(
                 windows,
                 raw_payloads,
@@ -5028,6 +5062,16 @@ def run_generate_subtitles_batch_plan_v4(
                 track = track_by_index.get(track_index)
                 if track is None:
                     continue
+                write_progress(
+                    progress_path,
+                    "repair_overlap_batch",
+                    f"{engine_label} 正在修复相邻窗口差异 {retry_index}/{len(retry_regions)}",
+                    batch_index=retry_index - 1,
+                    total_batches=len(retry_regions),
+                    progress_index=v4_progress_point(60, 65, retry_index - 1, len(retry_regions)),
+                    progress_total=100,
+                )
+                local_retry_started_at = time.monotonic()
                 retry_path = tmp_path / "asr_local_retry" / f"track_{track_index:03d}_retry_{retry_index:04d}.wav"
                 generate_v4.write_context_window_audio(
                     Path(track["audio_path"]),
@@ -5038,6 +5082,16 @@ def run_generate_subtitles_batch_plan_v4(
                     float(track["fps"]),
                 )
                 retry_payload = transcribe_qwen3_asr(retry_path, args.model, args.language)
+                diagnostic["local_retry_elapsed_seconds"] += time.monotonic() - local_retry_started_at
+                write_progress(
+                    progress_path,
+                    "repair_overlap_batch",
+                    f"{engine_label} 正在修复相邻窗口差异 {retry_index}/{len(retry_regions)}",
+                    batch_index=retry_index,
+                    total_batches=len(retry_regions),
+                    progress_index=v4_progress_point(60, 65, retry_index, len(retry_regions)),
+                    progress_total=100,
+                )
                 if not generate_v4.normalize_text(retry_payload.get("text")):
                     diagnostic["low_confidence_region_count"] = int(diagnostic.get("low_confidence_region_count") or 0) + 1
                     continue
@@ -5098,10 +5152,14 @@ def run_generate_subtitles_batch_plan_v4(
         model = args.model
         alignment_retry_regions: list[dict[str, Any]] = []
         for align_index, (window, raw_payload) in enumerate(zip(windows, raw_payloads), start=1):
+            has_doubao_words = (
+                str(raw_payload.get("backend") or "") == "doubao_asr"
+                and any(bool(segment.get("words")) for segment in raw_payload.get("segments") or [] if isinstance(segment, dict))
+            )
             write_progress(
                 progress_path,
                 "align_subtitle_batch",
-                f"{engine_label} Forced Alignment {align_index}/{len(windows)}",
+                f"{engine_label} {'豆包时间戳校验' if has_doubao_words else 'Forced Alignment'} {align_index}/{len(windows)}",
                 batch_index=align_index,
                 total_batches=len(windows),
                 progress_index=v4_progress_point(65, 85, align_index - 1, len(windows)),
@@ -5171,6 +5229,10 @@ def run_generate_subtitles_batch_plan_v4(
                 )
                 continue
             diagnostic["forced_align_retry_count"] += int(align_diagnostic.get("forced_align_retry_count") or 0)
+            native_timestamp_fallback_count = int(align_diagnostic.get("native_timestamp_fallback_count") or 0)
+            diagnostic["doubao_native_timestamp_fallback_count"] += native_timestamp_fallback_count
+            if has_doubao_words and native_timestamp_fallback_count == 0:
+                diagnostic["doubao_native_timestamp_window_count"] += 1
             diagnostic["alignment_repaired_unit_count"] += int(
                 align_diagnostic.get("alignment_repaired_unit_count") or 0
             )
@@ -5257,7 +5319,7 @@ def run_generate_subtitles_batch_plan_v4(
             backend = str(raw_payload.get("backend") or backend)
             model = str(raw_payload.get("model") or model)
 
-        if v5_mode and alignment_retry_regions:
+        if v5_mode and v5_writeback == "live" and alignment_retry_regions:
             merged_alignment_regions: list[dict[str, Any]] = []
             for region in sorted(
                 alignment_retry_regions,
@@ -5529,7 +5591,7 @@ def run_generate_subtitles_batch_plan_v4(
         diagnostic["tail_extended_row_count"] = tail_extended_row_count
         subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
         diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
-        if v5_mode and subtitle_rows:
+        if v5_mode and v5_writeback == "live" and subtitle_rows:
             refined_rows: list[dict[str, Any]] = []
             refinement_diagnostic = {
                 "audio_refinement_mode": v5_writeback,
@@ -5968,6 +6030,14 @@ def qwen3_cpp_forced_align_text_rows(
     timestamp_items = qwen3_timestamp_words(qwen_payload)
     if not timestamp_items:
         raise RuntimeError("Qwen3 forced align 输出没有词/字时间戳")
+    latest_timestamp = max(
+        max(float(item.get("start") or 0.0), float(item.get("end") or 0.0))
+        for item in timestamp_items
+    )
+    if latest_timestamp <= 0.001:
+        raise RuntimeError(
+            "Qwen3 forced align 时间戳无效：所有词/字均停留在 0 秒"
+        )
     row_segments = qwen3_remap_timestamp_items_to_rows(
         rows,
         timestamp_items,
@@ -6336,6 +6406,13 @@ def run_qwen_forced_align_batch_plan(
     diagnostic["qwen_output_path"] = ",".join(qwen_output_paths)
     diagnostic["successful_batch_count"] = sum(1 for batch in output_batches if batch.get("ok") is True)
     diagnostic["failed_batch_count"] = total_batches - diagnostic["successful_batch_count"]
+    failed_batch_errors = [
+        f"第 {batch.get('batch_id')} 批：{batch.get('error')}"
+        for batch in output_batches
+        if batch.get("ok") is False and str(batch.get("error") or "").strip()
+    ]
+    if failed_batch_errors:
+        diagnostic["failed_batch_errors"] = failed_batch_errors[:3]
     write_progress(
         progress_path,
         "done",
@@ -6344,12 +6421,15 @@ def run_qwen_forced_align_batch_plan(
         total_batches=total_batches,
         align_engine="qwen3_cpp",
     )
-    return {
+    payload = {
         "ok": diagnostic["failed_batch_count"] == 0,
         "model": os.getenv(QWEN3_CPP_ALIGNER_GGUF_ENV) or args.model,
         "batches": output_batches,
         "diagnostic": diagnostic,
     }
+    if failed_batch_errors:
+        payload["error"] = "；".join(failed_batch_errors[:3])
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -6385,11 +6465,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mode",
         choices=(
-            "align",
-            "align_text",
-            "whisperx_align_text",
-            "ctc_align_text",
-            "ctc_align_text_batches",
             "qwen_forced_align_text_batches",
             "transcribe",
             "generate_subtitles",
@@ -6397,7 +6472,7 @@ def main(argv: list[str] | None = None) -> int:
             "learn_segmentation_profile",
             "onsets",
         ),
-        default="align",
+        default="transcribe",
     )
     parser.add_argument("--fixture-json")
     parser.add_argument("--progress-json")
@@ -6441,10 +6516,6 @@ def main(argv: list[str] | None = None) -> int:
             profile = profile_builders[args.generate_engine](calibration_payloads)
             write_payload(output_path, profile)
             return 0 if profile.get("diagnostic", {}).get("training_region_count") else 1
-        if args.mode == "ctc_align_text_batches":
-            payload = run_ctc_batch_plan(load_batch_plan(args.batch_plan_json), args, progress_path)
-            write_payload(output_path, payload)
-            return 0 if payload.get("ok") else 1
         if args.mode == "qwen_forced_align_text_batches":
             payload = run_qwen_forced_align_batch_plan(load_batch_plan(args.batch_plan_json), args, progress_path)
             write_payload(output_path, payload)

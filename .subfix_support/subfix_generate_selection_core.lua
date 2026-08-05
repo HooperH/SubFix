@@ -287,27 +287,70 @@ local function resolve_asr_paths()
     local home_dir = os.getenv("HOME") or ""
     local user_support_dir = home_dir ~= "" and (home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support") or helper_dir
     local user_python = user_support_dir .. "/.subfix_asr_env/bin/python"
+    local user_runtime_python = user_support_dir .. "/runtime/python/bin/python3"
     local paths = {
         helper = helper_dir .. "/subfix_asr_transcribe.py",
+        qwen_manager = helper_dir .. "/subfix_qwen_local_manager.py",
         setup = helper_dir .. "/setup_asr_env.sh",
         python = helper_dir .. "/.subfix_asr_env/bin/python",
+        runtime_python = helper_dir .. "/runtime/python/bin/python3",
         diagnostic = user_support_dir .. "/last_generate_diagnostic.json"
     }
     if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
         paths.helper = root .. "/subfix_asr_transcribe.py"
+        paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
         paths.setup = root .. "/setup_asr_env.sh"
         paths.python = root .. "/.subfix_asr_env/bin/python"
+        paths.runtime_python = root .. "/runtime/python/bin/python3"
     end
     local module_dir = script_dir()
     if not file_exists(paths.helper) and file_exists(module_dir .. "/subfix_asr_transcribe.py") then
         paths.helper = module_dir .. "/subfix_asr_transcribe.py"
+        paths.qwen_manager = module_dir .. "/subfix_qwen_local_manager.py"
         paths.setup = module_dir .. "/setup_asr_env.sh"
         paths.python = module_dir .. "/.subfix_asr_env/bin/python"
+        paths.runtime_python = module_dir .. "/runtime/python/bin/python3"
     end
     if not file_exists(paths.python) and file_exists(user_python) then
         paths.python = user_python
     end
+    if not file_exists(paths.runtime_python) and file_exists(user_runtime_python) then
+        paths.runtime_python = user_runtime_python
+    end
     return paths
+end
+
+local function build_qwen_status_command(paths, output_path)
+    if not paths or not file_exists(paths.runtime_python) or not file_exists(paths.qwen_manager) then
+        return nil, "未找到本地 Qwen 安装管理器"
+    end
+    return table.concat({
+        shell_quote(paths.runtime_python), shell_quote(paths.qwen_manager),
+        "--action", "status", "--output", shell_quote(output_path),
+    }, " "), nil
+end
+
+local function inspect_local_qwen(paths)
+    local temporary_root = os.getenv("TMPDIR") or "/tmp"
+    local output_path = temporary_root .. "/subfix_qwen_status_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    local cmd = build_qwen_status_command(paths, output_path)
+    if not cmd then return {state = "missing", ready = false} end
+    os.execute(cmd .. " >/dev/null 2>&1")
+    local payload = decode_json_text(read_text_file(output_path) or "")
+    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    if type(payload) ~= "table" then return {state = "missing", ready = false} end
+    payload.ready = payload.ready == true
+    return payload
+end
+
+local function build_qwen_install_command(paths, output_path, progress_path)
+    if not file_exists(paths.runtime_python) then return nil, "未找到 SubFix 内置 Python" end
+    if not file_exists(paths.qwen_manager) then return nil, "缺少本地 Qwen 安装管理器" end
+    return table.concat({
+        shell_quote(paths.runtime_python), shell_quote(paths.qwen_manager),
+        "--action", "install", "--output", shell_quote(output_path),
+        "--progress-json", shell_quote(progress_path),
+    }, " "), nil
 end
 
 -- 豆包（火山引擎）云端 ASR 密钥文件路径：必须与「实际被执行的」
@@ -323,30 +366,26 @@ local function doubao_credentials_file_path()
     return dir .. "/doubao_credentials.json"
 end
 
--- 读回已存的 appid/token（缺失/解析失败/字段空 → 返回空串），用于预填与「是否已配置」判断。
-local function read_doubao_credentials()
+-- 读回已存 API Key（缺失/解析失败/字段空 → 返回空串），用于单字段预填。
+local function read_doubao_api_key()
     local text = read_text_file(doubao_credentials_file_path())
-    if not text or text == "" then return "", "" end
+    if not text or text == "" then return "" end
     local data = decode_json_text(text)
-    if type(data) ~= "table" then return "", "" end
-    return trim_text(tostring(data.appid or "")), trim_text(tostring(data.token or ""))
+    if type(data) ~= "table" then return "" end
+    return trim_text(tostring(data.api_key or ""))
 end
 
--- 是否已配置豆包密钥：环境变量优先（与 Python 三级读取一致），否则看密钥文件。
+-- 是否已配置豆包密钥：仅接受 API Key，旧 appid/token 永不视为有效。
 local function doubao_credentials_configured()
-    local env_appid = trim_text(os.getenv("SUBFIX_DOUBAO_APPID") or "")
-    local env_token = trim_text(os.getenv("SUBFIX_DOUBAO_TOKEN") or "")
-    if env_appid ~= "" and env_token ~= "" then return true end
-    local appid, token = read_doubao_credentials()
-    return appid ~= "" and token ~= ""
+    local env_api_key = trim_text(os.getenv("SUBFIX_DOUBAO_API_KEY") or "")
+    if env_api_key ~= "" then return true end
+    local api_key = read_doubao_api_key()
+    return api_key ~= ""
 end
 
--- 写入 appid/token 到密钥文件（json_escape 转义，schema 与 doubao_credentials.json.example 一致）。
-local function save_doubao_credentials(appid, token)
-    local content = string.format(
-        '{\n  "appid": "%s",\n  "token": "%s"\n}\n',
-        json_escape(appid), json_escape(token)
-    )
+-- 保存单 API Key；覆盖旧格式，防止界面再次回到两字段。
+local function save_doubao_api_key(api_key)
+    local content = string.format('{\n  "api_key": "%s"\n}\n', json_escape(api_key))
     local path = doubao_credentials_file_path()
     if not write_text_file(path, content) then
         return false, "无法写入密钥文件: " .. path
@@ -1760,6 +1799,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
     local selected_backend = SUBTITLE_ENGINE_OPTIONS[selected_engine_index].backend
     local dialog_cancelled = false
+    local qwen_install_requested = false
     local track_rows = {}
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
@@ -1768,7 +1808,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     },
     ui:VGroup{
         Spacing = 8,
-        ContentsMargins = 12,
+        ContentsMargins = {12, 12, 12, 18},
         ui:Label{ID = "GenerateSelectionInfoLabel", Text = "选择用于识别的音频轨道", Weight = 0},
         ui:Tree{
             ID = "GenerateAudioTrackTree",
@@ -1806,10 +1846,11 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
-            ui:HGap(0, 1),
-            ui:Button{ID = "GenerateSelectionConfirmBtn", Text = "生成", Weight = 0, MinimumSize = {88, 28}},
-            ui:Button{ID = "GenerateSelectionCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}}
-        }
+            MinimumSize = {0, 36},
+            ui:Button{ID = "GenerateSelectionConfirmBtn", Text = "生成", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateSelectionCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
+        },
+        ui:VGap(8, 0)
     })
 
     local items = selection_window:GetItems()
@@ -1879,38 +1920,31 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     -- 避免嵌套事件循环。
     local doubao_key_window = dispatcher:AddWindow({
         ID = "GenerateDoubaoKeyWindow",
-        WindowTitle = "SubFix · 配置豆包密钥",
-        Geometry = {500, 300, 420, 200},
+        WindowTitle = "SubFix · 配置豆包 API Key",
+        Geometry = {500, 300, 420, 145},
     },
     ui:VGroup{
         Spacing = 8,
         ContentsMargins = 12,
-        ui:Label{Text = "填写火山引擎（豆包）语音识别密钥", Weight = 0},
+        ui:Label{Text = "填写火山引擎（豆包）语音识别 API Key", Weight = 0},
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
-            ui:Label{Text = "App ID：", Weight = 0, MinimumSize = {96, 0}},
-            ui:LineEdit{ID = "GenerateDoubaoAppIdInput", PlaceholderText = "火山引擎 App ID", Weight = 1}
-        },
-        ui:HGroup{
-            Weight = 0,
-            Spacing = 8,
-            ui:Label{Text = "Access Token：", Weight = 0, MinimumSize = {96, 0}},
-            ui:LineEdit{ID = "GenerateDoubaoTokenInput", PlaceholderText = "火山引擎 Access Token", Weight = 1}
+            ui:Label{Text = "API Key：", Weight = 0, MinimumSize = {96, 0}},
+            ui:LineEdit{ID = "GenerateDoubaoApiKeyInput", PlaceholderText = "火山引擎 API Key", Weight = 1}
         },
         ui:Label{ID = "GenerateDoubaoKeyStatusLabel", Text = "密钥仅保存在本机，不会上传或进入版本库。", Weight = 0},
         ui:HGroup{
             Weight = 0,
+            MinimumSize = {0, 36},
             Spacing = 8,
-            ui:HGap(0, 1),
-            ui:Button{ID = "GenerateDoubaoKeySaveBtn", Text = "保存", Weight = 0, MinimumSize = {88, 28}},
-            ui:Button{ID = "GenerateDoubaoKeyCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}}
+            ui:Button{ID = "GenerateDoubaoKeySaveBtn", Text = "保存", Weight = 1, MinimumSize = {0, 36}},
+            ui:Button{ID = "GenerateDoubaoKeyCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 36}}
         }
     })
 
     local doubao_key_items = doubao_key_window:GetItems()
-    local doubao_appid_input = doubao_key_items and doubao_key_items.GenerateDoubaoAppIdInput or nil
-    local doubao_token_input = doubao_key_items and doubao_key_items.GenerateDoubaoTokenInput or nil
+    local doubao_api_key_input = doubao_key_items and doubao_key_items.GenerateDoubaoApiKeyInput or nil
     local doubao_key_status_label = doubao_key_items and doubao_key_items.GenerateDoubaoKeyStatusLabel or nil
 
     local function set_doubao_key_status(text)
@@ -1921,21 +1955,19 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     -- 弹出前用已存值预填，方便查看/修改；再 Show（非模态覆盖，父 RunLoop 继续分发事件）。
     local function open_doubao_key_dialog()
-        local appid, token = read_doubao_credentials()
-        if doubao_appid_input then pcall(function() doubao_appid_input.Text = appid end) end
-        if doubao_token_input then pcall(function() doubao_token_input.Text = token end) end
+        local api_key = read_doubao_api_key()
+        if doubao_api_key_input then pcall(function() doubao_api_key_input.Text = api_key end) end
         set_doubao_key_status("密钥仅保存在本机，不会上传或进入版本库。")
         pcall(function() doubao_key_window:Show() end)
     end
 
     function doubao_key_window.On.GenerateDoubaoKeySaveBtn.Clicked(ev)
-        local appid = trim_text(doubao_appid_input and doubao_appid_input.Text or "")
-        local token = trim_text(doubao_token_input and doubao_token_input.Text or "")
-        if appid == "" or token == "" then
-            set_doubao_key_status("App ID 和 Access Token 都要填写")
+        local api_key = trim_text(doubao_api_key_input and doubao_api_key_input.Text or "")
+        if api_key == "" then
+            set_doubao_key_status("请输入 API Key")
             return
         end
-        local ok, err = save_doubao_credentials(appid, token)
+        local ok, err = save_doubao_api_key(api_key)
         if not ok then
             set_doubao_key_status(tostring(err or "保存失败"))
             return
@@ -1971,7 +2003,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         Spacing = 8,
         ContentsMargins = 12,
         ui:Label{Text = "已选择「豆包（云端）」，但尚未配置密钥。", Weight = 0},
-        ui:Label{Text = "请双击「豆包（云端）」按钮填写 App ID / Access Token。", Weight = 0},
+        ui:Label{Text = "请双击「豆包（云端）」按钮填写 API Key。", Weight = 0},
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
@@ -1988,9 +2020,124 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         pcall(function() doubao_reminder_window:Hide() end)
     end
 
+    local qwen_download_window = dispatcher:AddWindow({
+        ID = "GenerateQwenDownloadWindow",
+        WindowTitle = "SubFix · 安装本地 Qwen",
+        Geometry = {560, 330, 420, 100},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 14,
+        ui:Label{ID = "GenerateQwenDownloadStatusLabel", Text = "本地 Qwen 识别需要下载运行环境与 Qwen3-ASR-1.7B 模型。", Weight = 0},
+        ui:Label{ID = "GenerateQwenDownloadDetailLabel", Text = "下载完成后会自动选中 Qwen；规整字幕长度无需下载。", Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            MinimumSize = {0, 34},
+            ui:Button{ID = "GenerateQwenDownloadConfirmBtn", Text = "下载并使用", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateQwenDownloadCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+
+    local qwen_download_items = qwen_download_window:GetItems()
+    local qwen_download_status_label = qwen_download_items and qwen_download_items.GenerateQwenDownloadStatusLabel or nil
+    local qwen_download_detail_label = qwen_download_items and qwen_download_items.GenerateQwenDownloadDetailLabel or nil
+    local qwen_download_confirm_btn = qwen_download_items and qwen_download_items.GenerateQwenDownloadConfirmBtn or nil
+    local qwen_download_is_ready = false
+    local qwen_status_poll_timer = nil
+    local qwen_status_poll_timer_id = nil
+
+    local function stop_qwen_status_poll()
+        if qwen_status_poll_timer then pcall(function() qwen_status_poll_timer:Stop() end) end
+        if qwen_status_poll_timer_id then ui_timer_handlers[qwen_status_poll_timer_id] = nil end
+        qwen_status_poll_timer = nil
+        qwen_status_poll_timer_id = nil
+    end
+
+    local function show_qwen_status(qwen_status)
+        qwen_download_is_ready = qwen_status and qwen_status.ready == true
+        if qwen_download_is_ready then
+            if qwen_download_status_label then qwen_download_status_label.Text = "本地 Qwen 已安装，可直接开始生成。" end
+            if qwen_download_detail_label then qwen_download_detail_label.Text = "Qwen3-ASR-1.7B 与运行环境均已就绪，无需重复下载。" end
+            if qwen_download_confirm_btn then
+                qwen_download_confirm_btn.Text = "知道了"
+                qwen_download_confirm_btn.Enabled = true
+            end
+        else
+            if qwen_download_status_label then qwen_download_status_label.Text = "本地 Qwen 识别需要下载运行环境与 Qwen3-ASR-1.7B 模型。" end
+            if qwen_download_detail_label then qwen_download_detail_label.Text = "下载完成后会自动选中 Qwen；规整字幕长度无需下载。" end
+            if qwen_download_confirm_btn then
+                qwen_download_confirm_btn.Text = "下载并使用"
+                qwen_download_confirm_btn.Enabled = true
+            end
+        end
+    end
+
+    local function open_qwen_download_dialog()
+        stop_qwen_status_poll()
+        qwen_download_is_ready = false
+        if qwen_download_status_label then qwen_download_status_label.Text = "正在检查本地 Qwen 安装状态…" end
+        if qwen_download_detail_label then qwen_download_detail_label.Text = "请稍候，窗口会自动更新。" end
+        if qwen_download_confirm_btn then
+            qwen_download_confirm_btn.Text = "检查中…"
+            qwen_download_confirm_btn.Enabled = false
+        end
+        pcall(function() qwen_download_window:Show() end)
+
+        local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+        local root = temp_dir()
+        local output_path = root .. "/qwen_status_" .. uid .. ".json"
+        local done_path = root .. "/qwen_status_done_" .. uid
+        local cmd = build_qwen_status_command(resolve_asr_paths(), output_path)
+        if not cmd then
+            show_qwen_status({state = "missing", ready = false})
+            return
+        end
+        os.execute(string.format("(%s >/dev/null 2>&1; touch %s) &", cmd, shell_quote(done_path)))
+
+        local timer_id = "GenerateQwenStatusPollTimer_" .. uid
+        local timer = ui:Timer({ID = timer_id, Interval = 200, SingleShot = false})
+        qwen_status_poll_timer = timer
+        qwen_status_poll_timer_id = timer_id
+        local timer_registered = register_ui_timer(timer, function()
+            if not file_exists(done_path) then return end
+            local payload = decode_json_text(read_text_file(output_path) or "")
+            os.execute("rm -f " .. shell_quote(output_path) .. " " .. shell_quote(done_path) .. " 2>/dev/null")
+            stop_qwen_status_poll()
+            if type(payload) ~= "table" then payload = {state = "missing", ready = false} end
+            payload.ready = payload.ready == true
+            show_qwen_status(payload)
+        end)
+        if not timer_registered or not pcall(function() timer:Start() end) then
+            stop_qwen_status_poll()
+            show_qwen_status({state = "missing", ready = false})
+        end
+    end
+
+    function qwen_download_window.On.GenerateQwenDownloadConfirmBtn.Clicked(ev)
+        if qwen_download_is_ready then
+            pcall(function() qwen_download_window:Hide() end)
+            return
+        end
+        qwen_install_requested = true
+        pcall(function() qwen_download_window:Hide() end)
+        pcall(function() selection_window:Hide() end)
+        pcall(function() dispatcher:ExitLoop() end)
+    end
+
+    function qwen_download_window.On.GenerateQwenDownloadCancelBtn.Clicked(ev)
+        pcall(function() qwen_download_window:Hide() end)
+    end
+
+    function qwen_download_window.On.GenerateQwenDownloadWindow.Close(ev)
+        stop_qwen_status_poll()
+        pcall(function() qwen_download_window:Hide() end)
+    end
+
     -- 秒级近似双击：Resolve 按钮无原生双击事件，用相邻两次点击的秒差(<=阈值)近似。
     local DOUBAO_DOUBLE_CLICK_SECONDS = 1
     local last_doubao_click_time = nil
+    local last_qwen_click_time = nil
     local doubao_reminder_shown = false
 
     local item_map = {}
@@ -2045,7 +2192,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     -- 识别模型：两个互斥按钮，点击即切换 backend 并高亮当前选择
     function selection_window.On.GenerateSubtitleEngineQwenBtn.Clicked(ev)
+        local now = os.time()
+        local is_double = last_qwen_click_time ~= nil and (now - last_qwen_click_time) <= DOUBAO_DOUBLE_CLICK_SECONDS
+        last_qwen_click_time = now
         select_subtitle_engine(1)
+        if is_double then
+            last_qwen_click_time = nil
+            open_qwen_download_dialog()
+        end
     end
 
     function selection_window.On.GenerateSubtitleEngineDoubaoBtn.Clicked(ev)
@@ -2076,6 +2230,13 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         end
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
+        if selected_backend == "auto" then
+            local qwen_status = inspect_local_qwen(resolve_asr_paths())
+            if not qwen_status.ready then
+                open_qwen_download_dialog()
+                return
+            end
+        end
         -- 记住本次识别模型，下次对话框默认选它。
         save_last_engine_backend(selected_backend)
         pcall(function() selection_window:Hide() end)
@@ -2101,6 +2262,11 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     pcall(function() selection_window:Hide() end)
     pcall(function() doubao_key_window:Hide() end)
     pcall(function() doubao_reminder_window:Hide() end)
+    pcall(function() qwen_download_window:Hide() end)
+
+    if qwen_install_requested then
+        return nil, nil, nil, nil, "__subfix_install_qwen__"
+    end
 
     if not selected_audio_sources and not dialog_cancelled then
         selected_audio_sources = collect_checked_audio_sources()
@@ -2138,11 +2304,35 @@ local function parse_progress_payload(progress_text)
         batch_index = number_field("batch_index"),
         total_batches = number_field("total_batches"),
         progress_index = number_field("progress_index"),
-        progress_total = number_field("progress_total")
+        progress_total = number_field("progress_total"),
+        eta_seconds = number_field("eta_seconds"),
+        indeterminate = text:match('"indeterminate"%s*:%s*true') ~= nil
     }
 end
 
 local function progress_bar_text(progress_state, payload)
+    if payload and payload.indeterminate then
+        local width = GENERATE_PROGRESS_BAR_WIDTH
+        local fraction = math.max(0, math.min(1, tonumber(progress_state.progress_fraction) or 0))
+        if fraction <= 0 then
+            return "ᗧ" .. string.rep("□", width - 1) .. "⚑", 0
+        end
+        local filled_count = math.floor(fraction * width)
+        local available_count = math.max(1, width - filled_count)
+        local phase = filled_count + math.floor((os.time() - (tonumber(progress_state.started_at) or os.time())) % available_count) + 1
+        phase = math.min(width, phase)
+        local cells = {}
+        for cell_index = 1, width do
+            if cell_index < phase then
+                cells[#cells + 1] = "■"
+            elseif cell_index == phase then
+                cells[#cells + 1] = "ᗧ"
+            else
+                cells[#cells + 1] = "□"
+            end
+        end
+        return table.concat(cells) .. "⚑", math.floor(fraction * 100 + 0.5)
+    end
     local total = tonumber(payload and payload.progress_total)
     local index = tonumber(payload and payload.progress_index)
     if not total or not index or total <= 0 then
@@ -2177,6 +2367,14 @@ local function progress_bar_text(progress_state, payload)
         end
     end
     return table.concat(cells) .. "⚑", percent
+end
+
+local function progress_eta_text(seconds)
+    local remaining = math.max(0, math.floor(tonumber(seconds) or 0))
+    if remaining >= 60 then
+        return string.format("%dm%02ds", math.floor(remaining / 60), remaining % 60)
+    end
+    return string.format("%ds", remaining)
 end
 
 local function show_generate_progress_window()
@@ -2253,7 +2451,12 @@ local function update_generate_progress_window(progress_state, payload, extra_lo
     end
     if items.GenerateProgressStatusLabel then items.GenerateProgressStatusLabel.Text = status_text end
     if items.GenerateProgressBarLabel then items.GenerateProgressBarLabel.Text = bar end
-    if items.GenerateProgressMetaLabel then items.GenerateProgressMetaLabel.Text = "进度 " .. tostring(percent) .. "%  ·  用时 " .. elapsed end
+    if items.GenerateProgressMetaLabel then
+        items.GenerateProgressMetaLabel.Text = "进度 " .. tostring(percent) .. "%  ·  用时 " .. elapsed
+        if payload and tonumber(payload.eta_seconds) and tonumber(payload.eta_seconds) > 0 then
+            items.GenerateProgressMetaLabel.Text = items.GenerateProgressMetaLabel.Text .. "  ·  预计剩余 " .. progress_eta_text(payload.eta_seconds)
+        end
+    end
 end
 
 local function show_writeback_progress_overlay(progress_state)
@@ -2280,6 +2483,63 @@ local function finish_generate_progress_window(progress_state, status, message)
     if ok_items and items and items.GenerateProgressCancelBtn then
         items.GenerateProgressCancelBtn.Text = "关闭"
     end
+end
+
+local function summarize_doubao_asr_failure_reason(reason)
+    local text = trim_text(tostring(reason or "豆包 ASR 请求失败"))
+    text = text:gsub("[\r\n]+", " ")
+    local marker_start, marker_end = text:find("豆包 ASR 失败", 1, true)
+    if marker_start then
+        text = trim_text(text:sub(marker_end + 1):gsub("^[（(][^）)]*[）)]%s*[:：]?%s*", ""))
+    end
+    if text == "" then text = "豆包 ASR 请求失败" end
+    if #text > 180 then text = text:sub(1, 177) .. "..." end
+    return text
+end
+
+local function is_doubao_asr_failure(reason)
+    return tostring(reason or ""):find("豆包 ASR 失败", 1, true) ~= nil
+end
+
+-- 云端请求失败不再静默回退：先给出原始原因，再由用户决定是否重试或改用本地 Qwen。
+-- 该窗口运行时没有后台轮询 RunLoop，因此独立 RunLoop 不会嵌套进进度计时器。
+local function show_doubao_asr_failure_action_dialog(reason)
+    if not dispatcher or not ui then return "close" end
+    local action = "close"
+    local dialog = dispatcher:AddWindow({
+        ID = "GenerateDoubaoAsrFailureWindow",
+        WindowTitle = "SubFix · 云端识别失败",
+        Geometry = {520, 320, 470, 170},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 12,
+        ui:Label{Text = "豆包（云端）未完成识别：", Weight = 0},
+        ui:Label{ID = "GenerateDoubaoAsrFailureReason", Text = summarize_doubao_asr_failure_reason(reason), Weight = 0, WordWrap = true},
+        ui:VGap(2),
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Button{ID = "GenerateDoubaoAsrRetryBtn", Text = "重试", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateDoubaoAsrUseQwenBtn", Text = "改用本地 Qwen", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateDoubaoAsrCloseBtn", Text = "关闭", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+
+    local function finish(choice)
+        action = choice or "close"
+        pcall(function() dialog:Hide() end)
+        pcall(function() dispatcher:ExitLoop() end)
+    end
+    function dialog.On.GenerateDoubaoAsrRetryBtn.Clicked(ev) finish("retry") end
+    function dialog.On.GenerateDoubaoAsrUseQwenBtn.Clicked(ev) finish("local_qwen") end
+    function dialog.On.GenerateDoubaoAsrCloseBtn.Clicked(ev) finish("close") end
+    function dialog.On.GenerateDoubaoAsrFailureWindow.Close(ev) finish("close") end
+
+    dialog:Show()
+    dispatcher:RunLoop()
+    pcall(function() dialog:Hide() end)
+    return action
 end
 
 local GENERATE_ENGINE_PROFILE_FILES = {
@@ -2350,15 +2610,28 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     if not file_exists(paths.helper) then
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
     end
-    if not file_exists(paths.python) then
-        return nil, "ASR 环境未安装，请先运行: " .. tostring(paths.setup)
-    end
     subtitle_mode = subtitle_mode == "live" and "live" or "narration"
     -- backend 由生成对话框的"识别模型"选择决定；缺省回退到 DEFAULT_ASR_BACKEND(auto/Qwen 本地)。
     local asr_backend = (type(backend) == "string" and backend ~= "") and backend or DEFAULT_ASR_BACKEND
+    local qwen_status = asr_backend == "auto" and inspect_local_qwen(paths) or nil
+    local python = paths.python
+    if asr_backend == "doubao_asr" then
+        python = paths.runtime_python
+        if not file_exists(python) then
+            return nil, "SubFix 内置 Python 缺失，请重新安装完整 SubFix 测试版"
+        end
+    elseif not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
+        return nil, "本地 Qwen 尚未安装，请先双击“Qwen（本地）”完成下载安装"
+    else
+        python = qwen_status.python
+    end
     local generate_engine = resolve_generate_engine()
-    local cmd_parts = {
-        shell_quote(paths.python),
+    local cmd_parts = {}
+    if asr_backend == "auto" then
+        cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
+    end
+    local command_args = {
+        shell_quote(python),
         shell_quote(paths.helper),
         "--mode", "generate_subtitles_batch",
         "--backend", shell_quote(asr_backend),
@@ -2375,6 +2648,7 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         "--diagnostic-output", shell_quote(paths.diagnostic),
         "--progress-json", shell_quote(progress_path)
     }
+    for _, value in ipairs(command_args) do cmd_parts[#cmd_parts + 1] = value end
     max_chars = tonumber(max_chars) or 25
     cmd_parts[#cmd_parts + 1] = "--max-chars"
     cmd_parts[#cmd_parts + 1] = shell_quote(tostring(max_chars))
@@ -2509,6 +2783,102 @@ local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, jso
         return false, "ASR helper 未生成 JSON"
     end
     return true
+end
+
+local function show_qwen_install_complete_dialog()
+    if not dispatcher or not ui then return end
+    local complete_window = dispatcher:AddWindow({
+        ID = "GenerateQwenInstallCompleteWindow",
+        WindowTitle = "SubFix · 本地 Qwen 安装完成",
+        Geometry = {560, 340, 420, 110},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 14,
+        ui:Label{Text = "本地 Qwen 已安装完成。", Weight = 0},
+        ui:Label{Text = "Qwen3-ASR-1.7B 已就绪，可直接开始生成字幕。", Weight = 0},
+        ui:HGroup{
+            Weight = 0,
+            MinimumSize = {0, 34},
+            ui:Button{ID = "GenerateQwenInstallCompleteBtn", Text = "继续", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+    local function close_complete_window()
+        pcall(function() complete_window:Hide() end)
+    end
+    function complete_window.On.GenerateQwenInstallCompleteBtn.Clicked(ev) close_complete_window() end
+    function complete_window.On.GenerateQwenInstallCompleteWindow.Close(ev) close_complete_window() end
+    complete_window:Show()
+end
+
+local function install_local_qwen_with_progress()
+    local paths = resolve_asr_paths()
+    local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+    local root = temp_dir()
+    local output_path = root .. "/subfix_qwen_install_" .. uid .. ".json"
+    local progress_path = output_path .. ".progress.json"
+    local cmd, cmd_err = build_qwen_install_command(paths, output_path, progress_path)
+    if not cmd then return false, cmd_err end
+    local progress_state, progress_err = show_generate_progress_window()
+    if not progress_state then return false, progress_err end
+    update_generate_progress_window(progress_state, {stage = "准备下载", message = "正在准备本地 Qwen 安装", indeterminate = true})
+    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
+    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    local payload = decode_json_text(read_text_file(output_path) or "")
+    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    if not ok then
+        local message = type(payload) == "table" and tostring(payload.error or "") or ""
+        if message == "" then message = tostring(output or "本地 Qwen 安装失败") end
+        finish_generate_progress_window(progress_state, status == "cancelled" and "已取消" or "失败", message)
+        pcall(function() progress_state.window:Hide() end)
+        return false, message
+    end
+    local qwen_status = inspect_local_qwen(paths)
+    if not qwen_status.ready then
+        local message = "本地 Qwen 安装后校验未通过"
+        finish_generate_progress_window(progress_state, "失败", message)
+        pcall(function() progress_state.window:Hide() end)
+        return false, message
+    end
+    finish_generate_progress_window(progress_state, "完成", "本地 Qwen 已安装")
+    pcall(function() progress_state.window:Hide() end)
+    show_qwen_install_complete_dialog()
+    return true
+end
+
+local function show_qwen_install_failed_dialog(message)
+    if not dispatcher or not ui then return false end
+    local retry = false
+    local failed_window = dispatcher:AddWindow({
+        ID = "GenerateQwenInstallFailedWindow",
+        WindowTitle = "SubFix · 本地 Qwen 安装失败",
+        Geometry = {560, 340, 420, 130},
+    },
+    ui:VGroup{
+        Spacing = 8,
+        ContentsMargins = 14,
+        ui:Label{Text = "本地 Qwen 尚未安装完成：", Weight = 0},
+        ui:Label{Text = tostring(message or "未知错误"), Weight = 0, WordWrap = true},
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            MinimumSize = {0, 34},
+            ui:Button{ID = "GenerateQwenInstallRetryBtn", Text = "重试", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateQwenInstallFailedCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
+        }
+    })
+    local function close_failed_window(value)
+        retry = value == true
+        pcall(function() failed_window:Hide() end)
+        pcall(function() dispatcher:ExitLoop() end)
+    end
+    function failed_window.On.GenerateQwenInstallRetryBtn.Clicked(ev) close_failed_window(true) end
+    function failed_window.On.GenerateQwenInstallFailedCancelBtn.Clicked(ev) close_failed_window(false) end
+    function failed_window.On.GenerateQwenInstallFailedWindow.Close(ev) close_failed_window(false) end
+    failed_window:Show()
+    dispatcher:RunLoop()
+    pcall(function() failed_window:Hide() end)
+    return retry
 end
 
 local function parse_generated_srt_rows(srt_path, fps, base_frame)
@@ -2676,6 +3046,24 @@ local function restore_timeline_playhead_timecode(timeline, timecode)
     return false
 end
 
+local function cleanup_imported_subtitle_media_item(media_pool, media_pool_item, context)
+    if not media_pool or not media_pool_item then
+        return false
+    end
+
+    local ok, result = pcall(function() return media_pool:DeleteClips({media_pool_item}) end)
+    if ok and result ~= false then
+        print("[SubFix Generate] " .. tostring(context or "字幕写回") .. "后已清理媒体池临时字幕")
+        return true
+    end
+
+    print(
+        "[SubFix Generate] " .. tostring(context or "字幕写回") ..
+        "后清理媒体池临时字幕失败: " .. tostring(result)
+    )
+    return false
+end
+
 local function append_rebuild_srt_to_timeline(media_pool, media_pool_item)
     if not media_pool or not media_pool_item then
         return false, "缺少媒体池或字幕媒体项"
@@ -2744,10 +3132,12 @@ local function rebuild_target_subtitle_track_from_rows(project, timeline, rows, 
     if not clear_ok then return finish_rebuild(false, clear_result) end
     print("[SubFix Generate] 已重建目标字幕轨，清空旧字幕 " .. tostring(clear_result or 0) .. " 条，保留选区外字幕")
     print("[SubFix Generate] SRT 时间已按 timeline_start_frame 转相对时间")
-    local append_ok, append_err = append_rebuild_srt_to_timeline(media_pool, items[1])
+    local media_pool_item = items[1]
+    local append_ok, append_err = append_rebuild_srt_to_timeline(media_pool, media_pool_item)
     if not append_ok then
         return finish_rebuild(false, append_err)
     end
+    cleanup_imported_subtitle_media_item(media_pool, media_pool_item, "生成选区字幕")
     print("[SubFix Generate] 已提交写回目标字幕轨 " .. tostring(TARGET_SUBTITLE_TRACK) .. "，SRT 行数 " .. tostring(#rows))
     return finish_rebuild(true)
 end
@@ -2794,7 +3184,16 @@ local function generate_selection_subtitles()
     local selection_err = nil
     -- 始终弹出对话框（含只有 1 个音频候选的情形）：即便只有一条音频轨，用户也需要能
     -- 选择识别模型（Qwen/豆包）与字幕长度，故不再对单候选自动跳过弹窗、直接生成。
-    selected_audio_sources, subtitle_mode, max_chars, backend, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
+    while true do
+        selected_audio_sources, subtitle_mode, max_chars, backend, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
+        if selection_err ~= "__subfix_install_qwen__" then break end
+        local install_ok, install_err = false, nil
+        repeat
+            install_ok, install_err = install_local_qwen_with_progress()
+        until install_ok or not show_qwen_install_failed_dialog(install_err)
+        if not install_ok then error(install_err or "已取消本地 Qwen 安装") end
+        save_last_engine_backend("auto")
+    end
     if not selected_audio_sources then error(selection_err or "已取消") end
     local selected_track_sources = collect_selected_track_sources(selected_audio_sources)
     if type(selected_track_sources) ~= "table" or #selected_track_sources == 0 then
@@ -2857,6 +3256,39 @@ local function generate_selection_subtitles()
         max_chars,
         backend
     )
+    while not helper_ok and helper_status ~= "cancelled" and backend == "doubao_asr" and is_doubao_asr_failure(helper_err) do
+        -- 进度窗口中的错误文本通常包含 Python 完整日志；隐藏它，改由明确操作的短弹窗呈现。
+        pcall(function() progress_state.window:Hide() end)
+        local action = show_doubao_asr_failure_action_dialog(helper_err)
+        if action == "close" then break end
+
+        if action == "local_qwen" then
+            backend = DEFAULT_ASR_BACKEND
+            print("[SubFix Generate] 用户选择云端失败后改用本地 Qwen")
+        else
+            print("[SubFix Generate] 用户选择重试豆包（云端）")
+        end
+
+        local replacement_progress, replacement_err = show_generate_progress_window()
+        if not replacement_progress then
+            helper_ok = false
+            helper_err = replacement_err or "无法重新打开生成进度窗口"
+            break
+        end
+        progress_state = replacement_progress
+        helper_ok, helper_err, helper_status = run_asr_helper_batch_with_progress(
+            batch_plan_path,
+            srt_path,
+            json_path,
+            scope.timeline_start_frame,
+            fps,
+            progress_state,
+            #selected_track_sources,
+            subtitle_mode,
+            max_chars,
+            backend
+        )
+    end
     if not helper_ok then
         finish_generate_progress_window(progress_state, helper_status == "cancelled" and "已取消" or "失败", helper_err)
         error(helper_err)

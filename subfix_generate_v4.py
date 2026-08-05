@@ -643,6 +643,18 @@ def _expand_timestamp_items(
     return units
 
 
+def _timestamp_units_collapsed(units: list[dict[str, Any]]) -> bool:
+    if len(units) < 8:
+        return False
+    start_frames = [int(unit.get("start_frame") or 0) for unit in units]
+    end_frames = [int(unit.get("end_frame") or 0) for unit in units]
+    aligned_span = max(end_frames) - min(start_frames)
+    same_start_counts = Counter(start_frames)
+    minimum_span = max(2, int(math.ceil(len(units) * 0.50)))
+    maximum_same_start = max(4, int(math.ceil(len(units) * 0.25)))
+    return aligned_span < minimum_span or max(same_start_counts.values()) > maximum_same_start
+
+
 def annotate_asr_punctuation(units: list[dict[str, Any]], raw_text: str) -> list[dict[str, Any]]:
     output = [dict(unit) for unit in units or []]
     expected_text = normalize_text(raw_text)
@@ -782,24 +794,31 @@ def require_aligned_units(
     timeline_start_frame: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     items = _timestamp_items(payload)
+    text = str(payload.get("text") or "").strip()
+    expected = normalize_text(text)
     retry_count = 0
+    native_timestamp_fallback_count = 0
+    if items:
+        native_units = _expand_timestamp_items(items, fps, timeline_start_frame)
+        native_text = "".join(unit["text"] for unit in native_units)
+        native_coverage = difflib.SequenceMatcher(None, expected, native_text, autojunk=False).ratio() if expected else 1.0
+        if not native_units or native_coverage < 0.90 or _timestamp_units_collapsed(native_units):
+            items = []
+            native_timestamp_fallback_count = 1
     if not items:
-        text = str(payload.get("text") or "").strip()
-        if not normalize_text(text):
+        if not expected:
             return [], {
                 "forced_align_retry_count": 0,
                 "aligned_unit_count": 0,
                 "alignment_coverage": 1.0,
                 "empty_silence_window": True,
             }
-        if text:
-            retry_count = 1
-            try:
-                items = list(align_fn(Path(audio_path), text, language) or [])
-            except Exception as exc:
-                raise V4AlignmentError("v4 Forced Aligner 执行失败，已终止写回") from exc
+        retry_count = 1
+        try:
+            items = list(align_fn(Path(audio_path), text, language) or [])
+        except Exception as exc:
+            raise V4AlignmentError("v4 Forced Aligner 执行失败，已终止写回") from exc
     units = _expand_timestamp_items(items, fps, timeline_start_frame)
-    expected = normalize_text(payload.get("text"))
     actual = "".join(unit["text"] for unit in units)
     raw_coverage = difflib.SequenceMatcher(None, expected, actual, autojunk=False).ratio() if expected else 1.0
     if not units or raw_coverage < 0.90:
@@ -809,19 +828,15 @@ def require_aligned_units(
     coverage = difflib.SequenceMatcher(None, expected, repaired_text, autojunk=False).ratio() if expected else 1.0
     if repaired_text != expected:
         raise V4AlignmentError("v4 Forced Aligner 文本守恒修复失败，已终止写回")
-    if len(units) >= 8:
+    if _timestamp_units_collapsed(units):
         start_frames = [int(unit.get("start_frame") or 0) for unit in units]
         end_frames = [int(unit.get("end_frame") or 0) for unit in units]
         aligned_span = max(end_frames) - min(start_frames)
-        same_start_counts = Counter(start_frames)
-        minimum_span = max(2, int(math.ceil(len(units) * 0.50)))
-        maximum_same_start = max(4, int(math.ceil(len(units) * 0.25)))
-        maximum_observed_same_start = max(same_start_counts.values())
-        if aligned_span < minimum_span or maximum_observed_same_start > maximum_same_start:
-            raise V4AlignmentError(
-                "v4 Forced Aligner 时间戳坍缩: "
-                f"字符={len(units)}, 跨度={aligned_span}帧, 同帧最多={maximum_observed_same_start}"
-            )
+        maximum_observed_same_start = max(Counter(start_frames).values())
+        raise V4AlignmentError(
+            "v4 Forced Aligner 时间戳坍缩: "
+            f"字符={len(units)}, 跨度={aligned_span}帧, 同帧最多={maximum_observed_same_start}"
+        )
     units = annotate_asr_punctuation(units, str(payload.get("text") or ""))
     return units, {
         "forced_align_retry_count": retry_count,
@@ -829,6 +844,7 @@ def require_aligned_units(
         "alignment_coverage": coverage,
         "raw_alignment_coverage": raw_coverage,
         "alignment_repaired_unit_count": repaired_count,
+        "native_timestamp_fallback_count": native_timestamp_fallback_count,
     }
 
 
