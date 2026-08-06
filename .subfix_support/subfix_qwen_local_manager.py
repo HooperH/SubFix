@@ -32,6 +32,7 @@ ProgressReporter = Callable[..., None]
 @dataclass(frozen=True)
 class SubFixQwenPaths:
     root: Path
+    data_root: Path
 
     @property
     def base_python(self) -> Path:
@@ -47,6 +48,10 @@ class SubFixQwenPaths:
 
     @property
     def model_dir(self) -> Path:
+        return self.data_root / "models" / "qwen3-asr-1.7b"
+
+    @property
+    def legacy_model_dir(self) -> Path:
         return self.root / "models" / "qwen3-asr-1.7b"
 
     @property
@@ -55,12 +60,12 @@ class SubFixQwenPaths:
 
     @property
     def legacy_ready_marker(self) -> Path:
-        return self.model_dir / ".subfix-ready.json"
+        return self.legacy_model_dir / ".subfix-ready.json"
 
 
     @property
     def install_log(self) -> Path:
-        return self.root / "logs" / "qwen-local-install.log"
+        return self.data_root / "logs" / "qwen-local-install.log"
 
 
 def python_can_import_qwen_asr(python: Path) -> bool:
@@ -96,6 +101,8 @@ def huggingface_cache_roots() -> list[Path]:
 def existing_model_dir(paths: SubFixQwenPaths) -> Path | None:
     if model_directory_is_complete(paths.model_dir):
         return paths.model_dir
+    if model_directory_is_complete(paths.legacy_model_dir):
+        return paths.legacy_model_dir
     for cache_root in huggingface_cache_roots():
         snapshots_dir = cache_root / "models--Qwen--Qwen3-ASR-1.7B" / "snapshots"
         if not snapshots_dir.is_dir():
@@ -111,7 +118,7 @@ def existing_model_dir(paths: SubFixQwenPaths) -> Path | None:
 
 
 def has_model_artifacts(paths: SubFixQwenPaths) -> bool:
-    if paths.model_dir.is_dir():
+    if paths.model_dir.is_dir() or paths.legacy_model_dir.is_dir():
         return True
     return any((root / "models--Qwen--Qwen3-ASR-1.7B" / "snapshots").is_dir() for root in huggingface_cache_roots())
 
@@ -139,6 +146,19 @@ def inspect_install(paths: SubFixQwenPaths) -> dict[str, object]:
 def ensure_base_python(python: Path) -> None:
     if not python.is_file():
         raise RuntimeError(f"未找到 SubFix 内置 Python：{python}")
+
+
+def ensure_model_dir_writable(model_dir: Path) -> None:
+    if model_dir.is_symlink() or model_dir.parent.is_symlink():
+        raise RuntimeError(f"本地 Qwen 模型目录不能是软链接：{model_dir}")
+    target_dir = model_dir if model_dir.exists() else model_dir.parent
+    probe_path = target_dir / f".subfix-write-test-{os.getpid()}-{time.time_ns()}"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        probe_path.write_bytes(b"")
+        probe_path.unlink()
+    except OSError as exc:
+        raise RuntimeError(f"本地 Qwen 模型目录不可写：{target_dir}（{exc}）") from exc
 
 
 def append_command_log(log_path: Path | None, command: list[str], output: str) -> None:
@@ -386,6 +406,7 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
         report("复用模型", "正在复用已下载的 Qwen3-ASR-1.7B")
     else:
         try:
+            ensure_model_dir_writable(paths.model_dir)
             report("下载模型", "正在下载 Qwen3-ASR-1.7B")
             download_model(paths.env_python, paths.model_dir, report, paths.install_log)
             model_dir = paths.model_dir
@@ -427,7 +448,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--progress-json", type=Path)
     args = parser.parse_args(argv)
-    paths = SubFixQwenPaths(args.root.resolve())
+    paths = SubFixQwenPaths(
+        args.root.resolve(),
+        Path.home() / "Library" / "Application Support" / "SubFix",
+    )
     try:
         if args.action == "install":
             payload = install(paths, make_progress_reporter(args.progress_json))
