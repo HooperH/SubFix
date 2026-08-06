@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.1.1"
+SUBFIX_VERSION = "3.1.3"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -37,6 +37,41 @@ local ui = fusion.UIManager
 local dispatcher = bmd.UIDispatcher(ui)
 disp = dispatcher  -- 全局别名，确保弹窗函数内 disp 不为 nil
 print(string.format("[Hooper AI 2.0] [STARTUP] Lua 主 chunk 起步: +%d ms", startup_elapsed_ms()))
+
+-- 使用全局命名空间以避开主 chunk 的 Lua 5.1 local 槽位上限。
+SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
+
+function SUBFIX_WINDOW_GEOMETRY.primary_screen_bounds()
+    if not (io and io.popen) then return nil end
+
+    local jxa = [[ObjC.import("AppKit");$.NSApplication.sharedApplication;const screen=$.NSScreen.screens.objectAtIndex(0);if(!screen){throw new Error("primary screen unavailable");}const frame=screen.frame;const visible=screen.visibleFrame;const left=Number(visible.origin.x);const top=Number(frame.size.height)-Number(visible.origin.y)-Number(visible.size.height);console.log([left,top,Number(visible.size.width),Number(visible.size.height)].join(","));]]
+    local escaped = jxa:gsub("'", "'\\\"'\\\"'")
+    local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
+    if not pipe then return nil end
+    local output = pipe:read("*a") or ""
+    pipe:close()
+    local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
+    x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
+    if not x or not y or not width or not height or width <= 0 or height <= 0 then return nil end
+    return {x = x, y = y, width = width, height = height}
+end
+
+function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
+    local fallback_x = tonumber(fallback_geometry and fallback_geometry[1])
+    local fallback_y = tonumber(fallback_geometry and fallback_geometry[2])
+    local width = tonumber(fallback_geometry and fallback_geometry[3])
+    local height = tonumber(fallback_geometry and fallback_geometry[4])
+    if not fallback_x or not fallback_y or not width or not height then return fallback_geometry end
+
+    local screen = SUBFIX_WINDOW_GEOMETRY.primary_screen_bounds()
+    if not screen then return fallback_geometry end
+
+    local x = screen.x
+    local y = screen.y
+    if width <= screen.width then x = math.floor(screen.x + (screen.width - width) / 2) end
+    if height <= screen.height then y = math.floor(screen.y + (screen.height - height) / 2) end
+    return {x, y, width, height}
+end
 
 -- ========== 全局状态 ==========
 local subtitle_data_map = {}      -- {node_ptr = {target_abs_frame, fps, row_index, text}}
@@ -2693,7 +2728,7 @@ local report_helpers = (function()
         local report_win = dispatcher:AddWindow({
             ID = "ReportWindow",
             WindowTitle = task_name .. "报告",
-            Geometry = {400, 200, 600, 500},
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({400, 200, 600, 500}),
         },
         ui:VGroup{
             Spacing = 10,
@@ -2815,7 +2850,7 @@ local report_helpers = (function()
         local report_win = ui_dispatcher:AddWindow({
             ID = "BatchReportWindow_" .. uid,
             WindowTitle = tostring(task_name or "修改结果") .. "报告",
-            Geometry = report_geometry,
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry(report_geometry),
         },
         ui:VGroup{
             Spacing = 10,
@@ -3961,7 +3996,7 @@ function show_pending_detail_window_for_item(item)
         pending_detail_window = dispatcher:AddWindow({
             ID = "PendingDetailWindow",
             WindowTitle = "待审核详情",
-            Geometry = {440, 170, 520, 320},
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({440, 170, 520, 320}),
         },
         ui:VGroup{
             Spacing = 8,
@@ -4029,7 +4064,7 @@ function show_applied_report_detail_window(task_name, applied_report_entries, fi
         applied_report_detail_window = dispatcher:AddWindow({
             ID = "AppliedReportDetailWindow",
             WindowTitle = tostring(task_name or "AI 纠错") .. "报告 · 已自动应用详情",
-            Geometry = {440, 170, 520, 360},
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({440, 170, 520, 360}),
         },
         ui:VGroup{
             Spacing = 8,
@@ -4335,7 +4370,7 @@ function open_preview_edit_dialog(target_window, ev, preset_row)
     local edit_win = dispatcher:AddWindow({
         ID = "PreviewEditDialog",
         WindowTitle = title,
-        Geometry = {460, 220, 360, 170}
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 220, 360, 170})
     },
     ui:VGroup{
         ContentsMargins = 10,
@@ -4844,7 +4879,7 @@ function show_revert_applied_dialog(report_entries)
     local revert_dlg = dispatcher:AddWindow({
         ID = "RevertAppliedDialog",
         WindowTitle = "取消部分自动应用",
-        Geometry = {460, 200, 480, dlg_height},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 200, 480, dlg_height}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -5021,7 +5056,7 @@ function show_batch_review_dialog(task_name, report_entries)
     local review_dlg = dispatcher:AddWindow({
         ID = dlg_id,
         WindowTitle = title,
-        Geometry = {440, 220, 520, dlg_height},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({440, 220, 520, dlg_height}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -5368,7 +5403,7 @@ function show_ai_fix_report_window(task_name, fix_count, pending_count, report_e
     pending_report_window = dispatcher:AddWindow({
         ID = "ReportWindow",
         WindowTitle = task_name .. "报告",
-        Geometry = report_geometry,
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry(report_geometry),
     },
     ui:VGroup(report_contents))
 
@@ -6027,7 +6062,7 @@ function show_long_task_progress_window(options)
     local progress_window = dispatcher:AddWindow({
         ID = "LongTaskProgressWindow",
         WindowTitle = tostring(options.title or "SubFix · 正在处理"),
-        Geometry = {520, 380, 430, 200},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 380, 430, 200}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -11830,7 +11865,7 @@ function SUBFIX_AUDIO_ALIGN.show_report(task_name, results, summary)
     local report_win = dispatcher:AddWindow({
         ID = "AudioAlignReportWindow_" .. uid,
         WindowTitle = tostring(task_name or "自动对齐声音") .. "报告",
-        Geometry = {420, 180, 720, 460},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({420, 180, 720, 460}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -12728,7 +12763,7 @@ local function show_log_window()
     workflow_log_window = dispatcher:AddWindow({
         ID = "WorkflowLogWindow",
         WindowTitle = "Hooper AI 2.0 · 运行日志",
-        Geometry = {260, 180, 700, 460},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({260, 180, 700, 460}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -17863,7 +17898,7 @@ local function create_mini_window()
     return dispatcher:AddWindow({
         ID = WINDOW_META.mini_window_id,
         WindowTitle = WINDOW_META.mini_window_title,
-        Geometry = {500, 120, 435, 382}
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 435, 382})
     }, mini_content)
 end
 
@@ -17871,7 +17906,7 @@ local function create_full_window()
     return dispatcher:AddWindow({
         ID = WINDOW_META.main_window_id,
         WindowTitle = WINDOW_META.main_window_title,
-        Geometry = {500, 120, 500, 700}
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})
     }, main_content)
 end
 
@@ -17887,7 +17922,7 @@ ensure_ai_config_window = function()
     AIConfigPopWin = dispatcher:AddWindow({
         ID = "AIConfigPopWin",
         WindowTitle = "AI 配置",
-        Geometry = {320, 180, 520, 420}
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({320, 180, 520, 420})
     },
     ui:VGroup{
         ContentsMargins = 10,
@@ -17968,7 +18003,7 @@ function show_normalize_length_config_dialog(target_window)
         NormalizeLengthConfigWin = dispatcher:AddWindow({
             ID = "NormalizeLengthConfigWin",
             WindowTitle = "规整字幕长度配置",
-            Geometry = {360, 240, 320, 170}
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({360, 240, 320, 170})
         },
         ui:VGroup{
             ContentsMargins = 10,
@@ -18211,7 +18246,7 @@ local function open_full_window()
     activate_preview_tree_maps_for_window(win)
     pcall(function()
         if win.SetAttrs then
-            win:SetAttrs({Geometry = {500, 120, 500, 700}})
+            win:SetAttrs({Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})})
         end
     end)
 
@@ -18928,7 +18963,7 @@ function show_chinese_number_conversion_direction_dialog(target_window)
     ChineseNumberConversionWin = disp:AddWindow({
         ID = "ChineseNumberConversionWin_" .. uid,
         WindowTitle = "中文数字互转",
-        Geometry = {420, 320, 300, 130},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({420, 320, 300, 130}),
         ui:VGroup {
             ContentsMargins = 10,
             Spacing = 8,
@@ -19224,7 +19259,7 @@ function show_english_typography_config_dialog(target_window)
         EnglishTypographyConfigWin = dispatcher:AddWindow({
             ID = "EnglishTypographyConfigWin",
             WindowTitle = "修改英文排版",
-            Geometry = {390, 260, 380, 130}
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({390, 260, 380, 130})
         },
         ui:VGroup{
             ContentsMargins = 10,
@@ -21373,7 +21408,7 @@ function win.On.BtnStep6.Clicked(ev)
     local dlg = disp:AddWindow({
         ID = "CensorDlg_" .. uid,
         WindowTitle = "发现违禁词",
-        Geometry = {400, 300, 300, 160},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({400, 300, 300, 160}),
         ui:VGroup {
             Spacing = 10, Weight = 1,
             ui:Label { Text = "检出以下违禁词，请选择并替换：" },
@@ -21710,7 +21745,7 @@ function subfix_update_python_path(helper)
 end
 
 function show_subfix_update_confirm(payload)
-    local dialog = dispatcher:AddWindow({ID = "SubFixUpdateConfirm", WindowTitle = "SubFix 更新", Geometry = {480, 300, 460, 220}},
+    local dialog = dispatcher:AddWindow({ID = "SubFixUpdateConfirm", WindowTitle = "SubFix 更新", Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({480, 300, 460, 220})},
         ui:VGroup{ContentsMargins = 18, Spacing = 8,
             ui:Label{Text = "发现新版本 v" .. tostring(payload.version or "?"), Weight = 0},
             ui:TextEdit{ID = "SubFixUpdateNotes", Text = tostring(payload.notes or ""), ReadOnly = true, Weight = 1},

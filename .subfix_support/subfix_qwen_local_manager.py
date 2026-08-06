@@ -24,6 +24,8 @@ QWEN_ASR_REQUIRED_MODEL_FILES = (
 )
 MODEL_DOWNLOAD_ETA_MIN_ELAPSED_SECONDS = 10
 MODEL_DOWNLOAD_ETA_MIN_DOWNLOADED_BYTES = 8 * 1024 * 1024
+COMMAND_HEARTBEAT_INTERVAL_SECONDS = 1
+COMMAND_ERROR_TAIL_MAX_CHARS = 1200
 ProgressReporter = Callable[..., None]
 
 
@@ -54,6 +56,11 @@ class SubFixQwenPaths:
     @property
     def legacy_ready_marker(self) -> Path:
         return self.model_dir / ".subfix-ready.json"
+
+
+    @property
+    def install_log(self) -> Path:
+        return self.root / "logs" / "qwen-local-install.log"
 
 
 def python_can_import_qwen_asr(python: Path) -> bool:
@@ -134,11 +141,85 @@ def ensure_base_python(python: Path) -> None:
         raise RuntimeError(f"未找到 SubFix 内置 Python：{python}")
 
 
-def run_checked(command: list[str], *, error_prefix: str) -> None:
+def append_command_log(log_path: Path | None, command: list[str], output: str) -> None:
+    if log_path is None:
+        return
     try:
-        subprocess.run(command, check=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"{error_prefix}：{exc}") from exc
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(f"\n[{timestamp}] $ {' '.join(command)}\n")
+            log_file.write(output)
+            if output and not output.endswith("\n"):
+                log_file.write("\n")
+    except OSError:
+        # Logging must never hide the original install error.
+        pass
+
+
+def command_error_message(error_prefix: str, output: str, log_path: Path | None) -> str:
+    tail = output.strip()[-COMMAND_ERROR_TAIL_MAX_CHARS:].strip()
+    message = f"{error_prefix}：{tail or '命令未返回可用错误信息'}"
+    if log_path is not None:
+        message += f"\n完整日志：{log_path}"
+    return message
+
+
+def start_command_heartbeat(
+    report: ProgressReporter | None,
+    heartbeat: tuple[str, str] | None,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    if report is None or heartbeat is None:
+        return None, None
+    stop_event = threading.Event()
+    stage, message = heartbeat
+    started_at = time.monotonic()
+
+    def report_heartbeat() -> None:
+        while not stop_event.is_set():
+            elapsed_seconds = max(0, int(time.monotonic() - started_at))
+            try:
+                report(stage, f"{message}（已用时 {elapsed_seconds}s）")
+            except Exception:
+                return
+            stop_event.wait(COMMAND_HEARTBEAT_INTERVAL_SECONDS)
+
+    monitor = threading.Thread(target=report_heartbeat, daemon=True)
+    monitor.start()
+    return stop_event, monitor
+
+
+def run_checked(
+    command: list[str],
+    *,
+    error_prefix: str,
+    log_path: Path | None = None,
+    report: ProgressReporter | None = None,
+    heartbeat: tuple[str, str] | None = None,
+) -> None:
+    stop_event, monitor = start_command_heartbeat(report, heartbeat)
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+    except OSError as exc:
+        output = str(exc)
+        append_command_log(log_path, command, output)
+        raise RuntimeError(command_error_message(error_prefix, output, log_path)) from exc
+    finally:
+        if stop_event is not None:
+            stop_event.set()
+        if monitor is not None:
+            monitor.join(timeout=2)
+    output = result.stdout or ""
+    append_command_log(log_path, command, output)
+    if result.returncode != 0:
+        raise RuntimeError(command_error_message(error_prefix, output, log_path))
 
 
 def create_or_reuse_venv(base_python: Path, env_dir: Path) -> None:
@@ -146,7 +227,7 @@ def create_or_reuse_venv(base_python: Path, env_dir: Path) -> None:
         run_checked([str(base_python), "-m", "venv", str(env_dir)], error_prefix="创建本地 Qwen 环境失败")
 
 
-def install_qwen_dependencies(env_python: Path) -> None:
+def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_path: Path) -> None:
     run_checked(
         [
             str(env_python),
@@ -160,6 +241,9 @@ def install_qwen_dependencies(env_python: Path) -> None:
             "huggingface_hub",
         ],
         error_prefix="安装本地 Qwen 依赖失败",
+        log_path=log_path,
+        report=report,
+        heartbeat=("安装依赖", "正在安装 qwen-asr 与 PyTorch，请保持网络连接"),
     )
 
 
@@ -248,7 +332,7 @@ def report_model_download_progress(
         stop_event.wait(1)
 
 
-def download_model(env_python: Path, model_dir: Path, report: ProgressReporter) -> None:
+def download_model(env_python: Path, model_dir: Path, report: ProgressReporter, log_path: Path) -> None:
     script = (
         "from huggingface_hub import snapshot_download\n"
         "import sys\n"
@@ -264,7 +348,8 @@ def download_model(env_python: Path, model_dir: Path, report: ProgressReporter) 
     try:
         run_checked(
             [str(env_python), "-c", script, QWEN_ASR_MODEL_ID, str(model_dir)],
-            error_prefix="下载模型失败",
+            error_prefix="下载 Qwen3-ASR 模型失败",
+            log_path=log_path,
         )
     finally:
         stop_event.set()
@@ -293,7 +378,7 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
     create_or_reuse_venv(paths.base_python, paths.env_dir)
     if not python_can_import_qwen_asr(paths.env_python):
         report("安装依赖", "正在安装 qwen-asr 与 PyTorch")
-        install_qwen_dependencies(paths.env_python)
+        install_qwen_dependencies(paths.env_python, report, paths.install_log)
     else:
         report("检查依赖", "本地 Qwen 运行环境已就绪")
     model_dir = existing_model_dir(paths)
@@ -302,7 +387,7 @@ def install(paths: SubFixQwenPaths, report: ProgressReporter) -> dict[str, objec
     else:
         try:
             report("下载模型", "正在下载 Qwen3-ASR-1.7B")
-            download_model(paths.env_python, paths.model_dir, report)
+            download_model(paths.env_python, paths.model_dir, report, paths.install_log)
             model_dir = paths.model_dir
         except Exception as exc:
             paths.ready_marker.unlink(missing_ok=True)

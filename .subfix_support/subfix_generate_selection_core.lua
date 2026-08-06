@@ -32,6 +32,41 @@ local function shell_quote(value)
     return "'" .. text:gsub("'", "'\\''") .. "'"
 end
 
+-- 模块可独立加载；复用全局命名空间也避免主脚本的 local 槽位上限。
+SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
+
+function SUBFIX_WINDOW_GEOMETRY.primary_screen_bounds()
+    if not (io and io.popen) then return nil end
+
+    local jxa = [[ObjC.import("AppKit");$.NSApplication.sharedApplication;const screen=$.NSScreen.screens.objectAtIndex(0);if(!screen){throw new Error("primary screen unavailable");}const frame=screen.frame;const visible=screen.visibleFrame;const left=Number(visible.origin.x);const top=Number(frame.size.height)-Number(visible.origin.y)-Number(visible.size.height);console.log([left,top,Number(visible.size.width),Number(visible.size.height)].join(","));]]
+    local escaped = jxa:gsub("'", "'\\\"'\\\"'")
+    local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
+    if not pipe then return nil end
+    local output = pipe:read("*a") or ""
+    pipe:close()
+    local x, y, width, height = output:match("^%s*([%-%.%d]+),([%-%.%d]+),([%-%.%d]+),([%-%.%d]+)%s*$")
+    x, y, width, height = tonumber(x), tonumber(y), tonumber(width), tonumber(height)
+    if not x or not y or not width or not height or width <= 0 or height <= 0 then return nil end
+    return {x = x, y = y, width = width, height = height}
+end
+
+function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
+    local fallback_x = tonumber(fallback_geometry and fallback_geometry[1])
+    local fallback_y = tonumber(fallback_geometry and fallback_geometry[2])
+    local width = tonumber(fallback_geometry and fallback_geometry[3])
+    local height = tonumber(fallback_geometry and fallback_geometry[4])
+    if not fallback_x or not fallback_y or not width or not height then return fallback_geometry end
+
+    local screen = SUBFIX_WINDOW_GEOMETRY.primary_screen_bounds()
+    if not screen then return fallback_geometry end
+
+    local x = screen.x
+    local y = screen.y
+    if width <= screen.width then x = math.floor(screen.x + (screen.width - width) / 2) end
+    if height <= screen.height then y = math.floor(screen.y + (screen.height - height) / 2) end
+    return {x, y, width, height}
+end
+
 local function read_text_file(path)
     local file = io.open(tostring(path or ""), "r")
     if not file then return nil end
@@ -1804,7 +1839,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = {460, 250, 420, 284},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 420, 284}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -1918,10 +1953,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     -- 豆包密钥配置子窗口：点"豆包（云端）"且未配置密钥时按需弹出。复用父对话框
     -- 已在跑的 dispatcher:RunLoop() 作非模态覆盖，子窗口自身不 RunLoop/ExitLoop，
     -- 避免嵌套事件循环。
+    local DOUBAO_API_KEY_GUIDE_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default"
     local doubao_key_window = dispatcher:AddWindow({
         ID = "GenerateDoubaoKeyWindow",
         WindowTitle = "SubFix · 配置豆包 API Key",
-        Geometry = {500, 300, 420, 145},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 300, 420, 177}),
+        MinimumSize = {420, 0},
     },
     ui:VGroup{
         Spacing = 8,
@@ -1933,7 +1970,23 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             ui:Label{Text = "API Key：", Weight = 0, MinimumSize = {96, 0}},
             ui:LineEdit{ID = "GenerateDoubaoApiKeyInput", PlaceholderText = "火山引擎 API Key", Weight = 1}
         },
-        ui:Label{ID = "GenerateDoubaoKeyStatusLabel", Text = "密钥仅保存在本机，不会上传或进入版本库。", Weight = 0},
+        ui:VGroup{
+            Weight = 0,
+            Spacing = 0,
+            ui:HGroup{
+                Weight = 0,
+                MinimumSize = {0, 28},
+                ui:Button{
+                    ID = "GenerateDoubaoApiKeyGuideBtn",
+                    Text = "获取豆包语音 API Key ↗",
+                    Weight = 1,
+                    MinimumSize = {0, 28},
+                },
+            },
+            ui:VGap(12),
+            ui:Label{ID = "GenerateDoubaoKeyStatusLabel", Text = "密钥仅保存在本机，不会上传或进入版本库。", Weight = 0, MinimumSize = {0, 18}},
+            ui:VGap(4),
+        },
         ui:HGroup{
             Weight = 0,
             MinimumSize = {0, 36},
@@ -1951,6 +2004,20 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         if doubao_key_status_label then
             pcall(function() doubao_key_status_label.Text = tostring(text or "") end)
         end
+    end
+
+    local function open_doubao_api_key_guide()
+        local ok, result = pcall(
+            os.execute,
+            "/usr/bin/open " .. shell_quote(DOUBAO_API_KEY_GUIDE_URL) .. " >/dev/null 2>&1"
+        )
+        if not ok or (result ~= true and result ~= 0) then
+            set_doubao_key_status("无法打开浏览器，请手动访问火山引擎豆包语音控制台")
+        end
+    end
+
+    function doubao_key_window.On.GenerateDoubaoApiKeyGuideBtn.Clicked(ev)
+        open_doubao_api_key_guide()
     end
 
     -- 弹出前用已存值预填，方便查看/修改；再 Show（非模态覆盖，父 RunLoop 继续分发事件）。
@@ -1997,7 +2064,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local doubao_reminder_window = dispatcher:AddWindow({
         ID = "GenerateDoubaoReminderWindow",
         WindowTitle = "SubFix · 豆包密钥未配置",
-        Geometry = {520, 320, 380, 150},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 320, 380, 150}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -2023,7 +2090,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local qwen_download_window = dispatcher:AddWindow({
         ID = "GenerateQwenDownloadWindow",
         WindowTitle = "SubFix · 安装本地 Qwen",
-        Geometry = {560, 330, 420, 100},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 330, 420, 100}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -2384,7 +2451,7 @@ local function show_generate_progress_window()
     local progress_window = dispatcher:AddWindow({
         ID = "GenerateProgressWindow",
         WindowTitle = "SubFix · 正在生成选区字幕",
-        Geometry = {520, 380, 430, 200},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 380, 430, 200}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -2463,7 +2530,7 @@ local function show_writeback_progress_overlay(progress_state)
     local progress_window = progress_state and progress_state.window
     if not progress_window then return false end
     local ok = pcall(function()
-        progress_window:SetAttrs({Geometry = GENERATE_WRITEBACK_OVERLAY_GEOMETRY})
+        progress_window:SetAttrs({Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry(GENERATE_WRITEBACK_OVERLAY_GEOMETRY)})
         progress_window:Show()
     end)
     return ok
@@ -2509,17 +2576,24 @@ local function show_doubao_asr_failure_action_dialog(reason)
     local dialog = dispatcher:AddWindow({
         ID = "GenerateDoubaoAsrFailureWindow",
         WindowTitle = "SubFix · 云端识别失败",
-        Geometry = {520, 320, 470, 170},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({520, 320, 520, 300}),
     },
     ui:VGroup{
         Spacing = 8,
         ContentsMargins = 12,
         ui:Label{Text = "豆包（云端）未完成识别：", Weight = 0},
-        ui:Label{ID = "GenerateDoubaoAsrFailureReason", Text = summarize_doubao_asr_failure_reason(reason), Weight = 0, WordWrap = true},
+        ui:TextEdit{
+            ID = "GenerateDoubaoAsrFailureReason",
+            Text = summarize_doubao_asr_failure_reason(reason),
+            ReadOnly = true,
+            Weight = 1,
+            MinimumSize = {0, 84}
+        },
         ui:VGap(2),
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
+            MinimumSize = {0, 44},
             ui:Button{ID = "GenerateDoubaoAsrRetryBtn", Text = "重试", Weight = 1, MinimumSize = {0, 28}},
             ui:Button{ID = "GenerateDoubaoAsrUseQwenBtn", Text = "改用本地 Qwen", Weight = 1, MinimumSize = {0, 28}},
             ui:Button{ID = "GenerateDoubaoAsrCloseBtn", Text = "关闭", Weight = 1, MinimumSize = {0, 28}}
@@ -2790,7 +2864,7 @@ local function show_qwen_install_complete_dialog()
     local complete_window = dispatcher:AddWindow({
         ID = "GenerateQwenInstallCompleteWindow",
         WindowTitle = "SubFix · 本地 Qwen 安装完成",
-        Geometry = {560, 340, 420, 110},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 420, 110}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -2852,7 +2926,7 @@ local function show_qwen_install_failed_dialog(message)
     local failed_window = dispatcher:AddWindow({
         ID = "GenerateQwenInstallFailedWindow",
         WindowTitle = "SubFix · 本地 Qwen 安装失败",
-        Geometry = {560, 340, 420, 130},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 560, 240}),
     },
     ui:VGroup{
         Spacing = 8,
