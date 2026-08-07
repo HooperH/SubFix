@@ -13,6 +13,7 @@ PKG_SCRIPTS_DIR="$BUILD_ROOT/pkg-scripts"
 UNINSTALLER_BUILD_DIR="$BUILD_ROOT/uninstaller"
 RUNTIME_DIR="$BUILD_ROOT/runtime/python"
 QWEN_BIN_DIR="$BUILD_ROOT/qwen-bin"
+FFMPEG_STAGE_DIR="$BUILD_ROOT/ffmpeg"
 PKG_PATH="$RELEASE_DIR/SubFix-v${VERSION}-macOS.pkg"
 ZIP_PATH="$RELEASE_ROOT/$RELEASE_NAME.zip"
 INSTALL_PATH="Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
@@ -22,6 +23,8 @@ PYTHON_RUNTIME_URL="https://github.com/astral-sh/python-build-standalone/release
 PYTHON_RUNTIME_SHA256="62aeee6161d57303a71a138b75fd5cc6fb8c89c4b1d9c7f0a052d89fa0b6652b"
 ALIGNER_MODEL="$SCRIPT_DIR/.subfix_support/models/qwen3-forced-aligner-0.6b-f16.gguf"
 QWEN_BUILD="$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp/build"
+USER_INSTALL_SCRIPT="$SCRIPT_DIR/scripts/install_subfix_for_user.sh"
+FFMPEG_BUILD_SCRIPT="$SCRIPT_DIR/scripts/build_bundled_ffmpeg.sh"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "❌ 当前版本仅支持 Apple Silicon Mac（arm64）。" >&2
@@ -39,6 +42,8 @@ for required in \
   "$SCRIPT_DIR/subfix_generate_v5.py" \
   "$SCRIPT_DIR/subfix_generate_textnorm.py" \
   "$SCRIPT_DIR/setup_asr_env.sh" \
+  "$USER_INSTALL_SCRIPT" \
+  "$FFMPEG_BUILD_SCRIPT" \
   "$ALIGNER_MODEL" \
   "$QWEN_BUILD/qwen3-asr-cli"; do
   [[ -f "$required" ]] || { echo "❌ 缺少发行文件：$required" >&2; exit 1; }
@@ -54,6 +59,9 @@ fi
 
 echo "📦 暂存 Qwen 强制对齐运行时…"
 "$SCRIPT_DIR/scripts/stage_qwen3_cpp_runtime.sh" "$QWEN_BUILD" "$QWEN_BIN_DIR"
+
+echo "📦 构建内置 FFmpeg…"
+"$FFMPEG_BUILD_SCRIPT" "$FFMPEG_STAGE_DIR"
 
 rm -rf "$PAYLOAD_DIR" "$PKG_SCRIPTS_DIR" "$UNINSTALLER_BUILD_DIR" "$RELEASE_DIR"
 rm -f "$ZIP_PATH"
@@ -72,8 +80,14 @@ cp -R "$RUNTIME_DIR" "$SUPPORT_PAYLOAD/runtime/python"
 cp -R "$QWEN_BIN_DIR" "$SUPPORT_PAYLOAD/bin"
 mkdir -p "$SUPPORT_PAYLOAD/models"
 cp "$ALIGNER_MODEL" "$SUPPORT_PAYLOAD/models/qwen3-forced-aligner-0.6b-f16.gguf"
+mkdir -p "$SUPPORT_PAYLOAD/licenses" "$RELEASE_DIR/第三方许可"
+cp "$FFMPEG_STAGE_DIR/ffmpeg" "$SUPPORT_PAYLOAD/bin/ffmpeg"
+cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$SUPPORT_PAYLOAD/licenses/FFmpeg-LGPL-2.1.txt"
+cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$RELEASE_DIR/第三方许可/FFmpeg-LGPL-2.1.txt"
+cp "$FFMPEG_STAGE_DIR/FFmpeg-BUILD-INFO.txt" "$RELEASE_DIR/第三方许可/FFmpeg-BUILD-INFO.txt"
+cp "$FFMPEG_STAGE_DIR/ffmpeg-9.0.tar.xz" "$RELEASE_DIR/第三方许可/ffmpeg-9.0.tar.xz"
 chmod 755 "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua" \
-  "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli"
+  "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli" "$SUPPORT_PAYLOAD/bin/ffmpeg"
 
 cat > "$PKG_SCRIPTS_DIR/preinstall" <<'EOF'
 #!/bin/bash
@@ -84,6 +98,8 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 EOF
 chmod 755 "$PKG_SCRIPTS_DIR/preinstall"
+cp "$USER_INSTALL_SCRIPT" "$PKG_SCRIPTS_DIR/postinstall"
+chmod 755 "$PKG_SCRIPTS_DIR/postinstall"
 
 pkgbuild --root "$PAYLOAD_DIR" --scripts "$PKG_SCRIPTS_DIR" --identifier com.mediastorm.subfix.beta \
   --version "$VERSION" --install-location / --quiet "$PKG_PATH"

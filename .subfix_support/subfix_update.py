@@ -31,6 +31,8 @@ UPDATE_FILE_PATHS = frozenset(
         ".subfix_support/subfix_generate_v5.py",
         ".subfix_support/subfix_generate_textnorm.py",
         ".subfix_support/subfix_qwen_local_manager.py",
+        ".subfix_support/bin/ffmpeg",
+        ".subfix_support/licenses/FFmpeg-LGPL-2.1.txt",
         ".subfix_support/setup_asr_env.sh",
         ".subfix_support/segmentation_profile.json",
         ".subfix_support/segmentation_profile_v3.json",
@@ -194,6 +196,8 @@ def install_archive(archive_path: Path, expected_sha256: str, version: str, targ
                     replacement = destination.with_name(destination.name + ".subfix-new")
                     shutil.copy2(stage_root / relative_path, replacement)
                     os.replace(replacement, destination)
+                    if relative_path == ".subfix_support/bin/ffmpeg":
+                        destination.chmod(0o755)
                     replaced.append(destination)
             except Exception as exc:
                 for destination in reversed(replaced):

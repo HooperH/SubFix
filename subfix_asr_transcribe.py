@@ -210,7 +210,8 @@ QWEN_ROW_REMAP_MIN_SCORE = 0.86
 QWEN_ROW_REMAP_MAX_START_LOOKBACK = 2
 QWEN_ROW_REMAP_MAX_START_LOOKAHEAD = 12
 DEFAULT_FFMPEG_CANDIDATES = (
-    os.path.expanduser("~/.local/bin/ffmpeg"),
+    str(Path(__file__).resolve().parent / "bin" / "ffmpeg"),
+    str(Path.home() / ".local" / "bin" / "ffmpeg"),
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
 )
@@ -3663,7 +3664,7 @@ def resolve_ffmpeg(requested: str | None) -> str:
     raise RuntimeError(
         "未找到 ffmpeg；已检查: "
         + checked_text
-        + "；请运行 which ffmpeg 确认路径，或安装/链接到 ~/.local/bin/ffmpeg"
+        + "；请重新安装/更新 SubFix 以恢复内置 ffmpeg，或运行 which ffmpeg 确认系统路径"
     )
 
 
