@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1.6 - 2026-08-13
+
+- 加快 SubFix 主窗口首次打开速度：完整界面按需初始化。
+- 修复连续编辑字幕时弹窗叠加、无法关闭的问题。
+- 在 AI 参考文稿输入区增加“清空”按钮，一键清空参考文本。
+- 加快“生成选区字幕”脚本启动：不再扫描整条视频轨来计算可选的匹配画面标记。
+- 保留 3.1.5 的内置 FFmpeg 更新与首次安装支持。
+
 ## Latest working copy - 2026-07-03
 
 This is the version intended for the GitHub sharing project. It uses the root
