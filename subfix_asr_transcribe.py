@@ -196,6 +196,7 @@ DOUBAO_ASR_RETRY_BACKOFF_SECONDS = 0.5
 # 待校准: 文档 demo 中响应头 X-Api-Status-Code 的成功值；响应体 JSON 内未见到顶层
 # code/message 字段（区别于旧版录音文件标准版接口）。
 DOUBAO_ASR_SUCCESS_STATUS_CODE = "20000000"
+DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE = "20000003"
 QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 QWEN3_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN3_CPP_BIN_ENV = "SUBFIX_QWEN3_ASR_CPP_BIN"
@@ -4050,11 +4051,12 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
                 raise RuntimeError(f"豆包 ASR 响应不是合法 JSON: {exc}") from exc
             if not isinstance(response_payload, dict):
                 raise RuntimeError("豆包 ASR 响应 JSON 必须是对象")
-            if status_code and status_code != DOUBAO_ASR_SUCCESS_STATUS_CODE:
+            silent_audio = status_code == DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE
+            if status_code and status_code != DOUBAO_ASR_SUCCESS_STATUS_CODE and not silent_audio:
                 message = str(response_payload.get("message") or response_text[:300])
                 last_error = RuntimeError(f"豆包 ASR 返回错误状态 {status_code}: {message}")
             else:
-                result = response_payload.get("result")
+                result = {} if silent_audio else response_payload.get("result")
                 text = str((result or {}).get("text") or "").strip()
                 segments, words = _doubao_asr_timestamp_payload(result)
                 return {
@@ -4070,6 +4072,7 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
                         "status_code": status_code,
                         "log_id": log_id,
                         "attempt": attempt,
+                        "silent_audio": silent_audio,
                     },
                 }
         if attempt < DOUBAO_ASR_MAX_ATTEMPTS:

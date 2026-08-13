@@ -22,6 +22,7 @@ PYTHON_RUNTIME_URL="https://github.com/astral-sh/python-build-standalone/release
 PYTHON_RUNTIME_SHA256="62aeee6161d57303a71a138b75fd5cc6fb8c89c4b1d9c7f0a052d89fa0b6652b"
 ALIGNER_MODEL="$SCRIPT_DIR/.subfix_support/models/qwen3-forced-aligner-0.6b-f16.gguf"
 QWEN_BUILD="$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp/build"
+USER_INSTALL_SCRIPT="$SCRIPT_DIR/scripts/install_subfix_for_user.sh"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
   echo "❌ 当前版本仅支持 Apple Silicon Mac（arm64）。" >&2
@@ -39,6 +40,7 @@ for required in \
   "$SCRIPT_DIR/subfix_generate_v5.py" \
   "$SCRIPT_DIR/subfix_generate_textnorm.py" \
   "$SCRIPT_DIR/setup_asr_env.sh" \
+  "$USER_INSTALL_SCRIPT" \
   "$ALIGNER_MODEL" \
   "$QWEN_BUILD/qwen3-asr-cli"; do
   [[ -f "$required" ]] || { echo "❌ 缺少发行文件：$required" >&2; exit 1; }
@@ -84,6 +86,8 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 EOF
 chmod 755 "$PKG_SCRIPTS_DIR/preinstall"
+cp "$USER_INSTALL_SCRIPT" "$PKG_SCRIPTS_DIR/postinstall"
+chmod 755 "$PKG_SCRIPTS_DIR/postinstall"
 
 pkgbuild --root "$PAYLOAD_DIR" --scripts "$PKG_SCRIPTS_DIR" --identifier com.mediastorm.subfix.beta \
   --version "$VERSION" --install-location / --quiet "$PKG_PATH"

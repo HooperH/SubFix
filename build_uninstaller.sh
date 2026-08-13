@@ -47,7 +47,10 @@ set supportDir to "/Library/Application Support/Blackmagic Design/DaVinci Resolv
 set generateCorePath to supportDir & "/subfix_generate_selection_core.lua"
 set asrHelperPath to supportDir & "/subfix_asr_transcribe.py"
 set asrSetupPath to supportDir & "/setup_asr_env.sh"
-set commandText to "rm -f " & quoted form of targetPath & " " & quoted form of legacyMainPath & " " & quoted form of generatorPath & " " & quoted form of legacySubfixGeneratorPath & " " & quoted form of legacyGeneratorPath & " " & quoted form of generateCorePath & " " & quoted form of asrHelperPath & " " & quoted form of asrSetupPath & "; rmdir " & quoted form of subfixMenuDir & " 2>/dev/null || true; rm -rf " & quoted form of supportDir
+set userHome to POSIX path of (path to home folder)
+set userUtility to userHome & "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+set userSupport to userUtility & "/.subfix_support"
+set commandText to "rm -f " & quoted form of targetPath & " " & quoted form of legacyMainPath & " " & quoted form of generatorPath & " " & quoted form of legacySubfixGeneratorPath & " " & quoted form of legacyGeneratorPath & " " & quoted form of generateCorePath & " " & quoted form of asrHelperPath & " " & quoted form of asrSetupPath & "; rmdir " & quoted form of subfixMenuDir & " 2>/dev/null || true; rm -rf " & quoted form of supportDir & " " & quoted form of (userUtility & "/SubFix") & " " & quoted form of userSupport
 do shell script commandText with administrator privileges
 EOF
 
@@ -69,6 +72,8 @@ SUPPORT_DIR="$SUPPORT_DIR"
 GENERATE_CORE_PATH="$GENERATE_CORE_PATH"
 ASR_HELPER_PATH="$ASR_HELPER_PATH"
 ASR_SETUP_PATH="$ASR_SETUP_PATH"
+USER_UTILITY="\$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+USER_SUPPORT="\$USER_UTILITY/.subfix_support"
 
 echo "即将删除："
 echo "\$TARGET_PATH"
@@ -80,7 +85,9 @@ echo "\$GENERATE_CORE_PATH"
 echo "\$ASR_HELPER_PATH"
 echo "\$ASR_SETUP_PATH"
 echo "\$SUPPORT_DIR"
-if sudo rm -f "\$TARGET_PATH" "\$LEGACY_MAIN_PATH" "\$GENERATOR_PATH" "\$LEGACY_SUBFIX_GENERATOR_PATH" "\$LEGACY_GENERATOR_PATH" "\$GENERATE_CORE_PATH" "\$ASR_HELPER_PATH" "\$ASR_SETUP_PATH" && { sudo rmdir "\$SUBFIX_MENU_DIR" 2>/dev/null || true; } && sudo rm -rf "\$SUPPORT_DIR"; then
+echo "\$USER_UTILITY/SubFix"
+echo "\$USER_SUPPORT"
+if sudo rm -f "\$TARGET_PATH" "\$LEGACY_MAIN_PATH" "\$GENERATOR_PATH" "\$LEGACY_SUBFIX_GENERATOR_PATH" "\$LEGACY_GENERATOR_PATH" "\$GENERATE_CORE_PATH" "\$ASR_HELPER_PATH" "\$ASR_SETUP_PATH" && { sudo rmdir "\$SUBFIX_MENU_DIR" 2>/dev/null || true; } && sudo rm -rf "\$SUPPORT_DIR" "\$USER_UTILITY/SubFix" "\$USER_SUPPORT"; then
     echo ""
     echo "✅ SubFix 卸载成功，请重启 DaVinci Resolve。"
 else

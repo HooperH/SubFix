@@ -1059,54 +1059,6 @@ function timeline_item_is_selected(item)
     return false
 end
 
-local function add_media_name_tokens(tokens, file_path)
-    local name = basename(file_path):gsub("%.[^%.]+$", "")
-    local preferred = name:match("(R%d+C%d+)") or name:match("([A-Za-z]+%d+)")
-    if preferred and #preferred >= 4 then
-        tokens[preferred] = true
-    end
-    for token in name:gmatch("([%w_]+)") do
-        if #token >= 6 then
-            tokens[token] = true
-        end
-    end
-end
-
-local function collect_video_match_tokens_for_scope(timeline, scope)
-    local tokens = {}
-    local ok_track_count, track_count = pcall(function() return timeline:GetTrackCount("video") end)
-    track_count = ok_track_count and tonumber(track_count) or 0
-    for track_index = 1, track_count do
-        local ok_items, items = pcall(function() return timeline:GetItemListInTrack("video", track_index) end)
-        items = ok_items and items or {}
-        for _, item in ipairs(items or {}) do
-            local ok_start, item_start = pcall(function() return item:GetStart() end)
-            local ok_end, item_end = pcall(function() return item:GetEnd() end)
-            if ok_start and ok_end and range_intersects_selection(item_start, item_end, scope) then
-                local ok_media, media_item = pcall(function() return item:GetMediaPoolItem() end)
-                if ok_media and media_item then
-                    local ok_path, raw_path = pcall(function() return media_item:GetClipProperty("File Path") end)
-                    if ok_path and raw_path and tostring(raw_path) ~= "" then
-                        add_media_name_tokens(tokens, tostring(raw_path))
-                    end
-                end
-            end
-        end
-    end
-    return tokens
-end
-
-local function score_audio_video_match(file_path, tokens)
-    local name = basename(file_path)
-    local score = 0
-    for token in pairs(tokens or {}) do
-        if token ~= "" and name:find(token, 1, true) then
-            score = score + #token
-        end
-    end
-    return score
-end
-
 local function get_audio_track_display_name(timeline, track_index)
     local ok_name, raw_name = pcall(function() return timeline:GetTrackName("audio", track_index) end)
     local name = ok_name and trim_text(raw_name) or ""
@@ -1121,9 +1073,6 @@ local function compare_audio_source_priority(a, b)
     local a_muted = a.audio_mapping_muted == true
     local b_muted = b.audio_mapping_muted == true
     if a_muted ~= b_muted then return a_muted == false end
-    local a_match = tonumber(a.video_match_score) or 0
-    local b_match = tonumber(b.video_match_score) or 0
-    if a_match ~= b_match then return a_match > b_match end
     local a_overlap = tonumber(a.overlap_frames) or 0
     local b_overlap = tonumber(b.overlap_frames) or 0
     if a_overlap ~= b_overlap then return a_overlap > b_overlap end
@@ -1146,7 +1095,6 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
     end
 
     local audio_sources = {}
-    local video_tokens = collect_video_match_tokens_for_scope(timeline, scope)
     local effective_fps = math.max(1, tonumber(fps) or 30)
     for track_index = 1, track_count do
         local track_display_name = get_audio_track_display_name(timeline, track_index)
@@ -1193,7 +1141,6 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
                         candidate.audio_channel_index = mapped_audio.audio_channel_index
                         candidate.audio_mapping_muted = mapped_audio.audio_mapping_muted == true
                         candidate.is_selected = timeline_item_is_selected(item)
-                        candidate.video_match_score = score_audio_video_match(file_path, video_tokens)
                         audio_sources[#audio_sources + 1] = candidate
                     end
                 end
@@ -1420,7 +1367,6 @@ local function format_audio_source_label(audio_source, fps)
     local overlap_seconds = (tonumber(audio_source.overlap_frames) or 0) / math.max(1, tonumber(fps) or 30)
     local marks = {}
     if audio_source.is_selected then marks[#marks + 1] = "选中" end
-    if (tonumber(audio_source.video_match_score) or 0) > 0 then marks[#marks + 1] = "匹配画面" end
     if audio_source.audio_mapping_muted == true then marks[#marks + 1] = "mute" end
     if tostring(audio_source.audio_mapping_source or "") ~= "" then marks[#marks + 1] = tostring(audio_source.audio_mapping_source) end
     if tonumber(audio_source.audio_channel_index) then marks[#marks + 1] = "ch" .. tostring(math.floor(tonumber(audio_source.audio_channel_index) or 0)) end

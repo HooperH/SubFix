@@ -27,11 +27,11 @@ SOURCE_DOUBAO_CREDENTIALS="$SCRIPT_DIR/.subfix_support/doubao_credentials.json"
 validate_confirmed_dialog_layouts() {
   local marker
   local required_markers=(
-    'Geometry = {360, 240, 320, 170}'
+    'Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({360, 240, 320, 170})'
     'Text = "字幕对齐音频偏移"'
-    'Geometry = {390, 260, 380, 130}'
+    'Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({390, 260, 380, 130})'
     'Text = "大小写："'
-    'Geometry = {420, 320, 300, 130}'
+    'Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({420, 320, 300, 130})'
     'Text = "选择转换方向"'
   )
 

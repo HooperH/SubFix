@@ -93,6 +93,7 @@ local workflow_log_window = nil
 local AIConfigPopWin = nil
 NormalizeLengthConfigWin = nil
 local mini_win = nil
+win = nil
 local active_window = nil
 local is_subtitle_loaded = false
 local current_search_query = ""
@@ -110,7 +111,6 @@ ai_config_popup_visible = false
 ui_timer_handlers = {}
 startup_refresh_timer = nil
 full_window_deferred_sync_timer = nil
-full_window_warmup_timer = nil  -- 空闲时段把字幕树渲染到完整版窗口，避免切换时同步渲染卡顿
 normalize_length_timer = nil
 pre_delivery_final_check_timer = nil
 pending_normalize_length_window = nil
@@ -143,6 +143,7 @@ pending_report_detail_view = nil
 pending_detail_window = nil
 applied_report_detail_view = nil
 applied_report_detail_window = nil
+preview_edit_window = nil
 local pending_report_summary_text = ""
 local is_releasing_pending_report_ui = false
 applied_toggle_tree = nil
@@ -4312,11 +4313,8 @@ function save_preview_edit_dialog_changes(target_window, row_id, new_text)
         sync_current_preview_tree(window, dirty_row_ids)
     end
 
-    if is_mini_window(window) and win then
+    if is_mini_window(window) then
         full_window_tree_dirty = true
-        if full_window_warmup_timer then
-            restart_ui_timer(full_window_warmup_timer)
-        end
     end
 
     current_selected_row_id = trim_text(row.id)
@@ -4353,6 +4351,11 @@ end
 
 function open_preview_edit_dialog(target_window, ev, preset_row)
     local window = resolve_window(target_window)
+    if preview_edit_window then
+        update_shared_status(window, "请先完成当前字幕编辑")
+        return false
+    end
+
     local row = preset_row or handle_preview_tree_item_clicked(window, ev)
     if not row then
         update_shared_status(window, "请先选中一条字幕")
@@ -4385,19 +4388,27 @@ function open_preview_edit_dialog(target_window, ev, preset_row)
             ui:Button{ID = "PreviewEditDialogSaveBtn", Text = "保存", Weight = 0, MinimumSize = {80, 28}}
         }
     })
+    preview_edit_window = edit_win
+
+    local function close_preview_edit_dialog()
+        if preview_edit_window == edit_win then
+            preview_edit_window = nil
+        end
+        pcall(function() edit_win:Hide() end)
+    end
 
     function edit_win.On.PreviewEditDialog.Close(close_ev)
-        edit_win:Hide()
+        close_preview_edit_dialog()
     end
 
     function edit_win.On.PreviewEditDialogCancelBtn.Clicked(click_ev)
-        edit_win:Hide()
+        close_preview_edit_dialog()
     end
 
     function edit_win.On.PreviewEditDialogSaveBtn.Clicked(click_ev)
         local editor = edit_win:Find("PreviewEditDialogText")
         save_preview_edit_dialog_changes(window, row_id, get_textedit_content(editor))
-        edit_win:Hide()
+        close_preview_edit_dialog()
     end
 
     local editor = edit_win:Find("PreviewEditDialogText")
@@ -12655,7 +12666,7 @@ local function refresh_subtitles(target_window, options)
     -- 但实测会在初次刷新时多花一倍渲染时间，让用户感觉"刷新很慢"）。
     -- rebuild_tree_from_rows 已经把 full_window_tree_dirty 置为 true，
     -- 真正切换到完整窗口时会按需渲染（见 toggle/switch 时的 dirty 检查）。
-    if is_mini_window(window) and win then
+    if is_mini_window(window) then
         full_window_tree_dirty = true
     end
 
@@ -12671,13 +12682,7 @@ local function refresh_subtitles(target_window, options)
         set_mini_subtitle_area_state(window, true)
     end
 
-    -- 完整版预热改走异步路径（见 full_window_warmup_timer，间隔 50 ms）。
-    -- 之前在这里同步预热是为了让「已加载」=完全就绪，但实测会让用户感知的
-    -- 「正在自动加载」状态多 70 ms（同步 render_rows_to_window 阻塞 RunLoop）。
-    -- 现在的折中：「已加载」尽早出现 → mini 立刻可交互 → 50 ms 后异步铺完整版。
-    -- 50 ms 内用户若已点切换，open_full_window 的 dirty 检查会兜底同步渲染。
-    -- rebuild_tree_from_rows 已经调过 restart_ui_timer(full_window_warmup_timer)，
-    -- 这里不重复 schedule。
+    -- 完整版窗口与字幕树都延后到用户首次切换时创建，避免首次加载时抢占 UI 线程。
 
     current_work_scope.row_count = current_rows and #current_rows or 0
     sync_work_scope_ui(window)
@@ -12906,12 +12911,8 @@ rebuild_tree_from_rows = function(rows, target_window, options)
     SEARCH_VIEW.render_current_view(target_window or resolve_window())
     -- 标记另一个窗口的字幕树需要刷新（延迟到切换时再渲染，避免每次操作都双重渲染）
     local current_window = target_window or resolve_window()
-    if current_window and is_mini_window(current_window) and win then
+    if current_window and is_mini_window(current_window) then
         full_window_tree_dirty = true
-        -- 顺便给完整版字幕树排一次空闲预热，下次切换零等待
-        if full_window_warmup_timer then
-            restart_ui_timer(full_window_warmup_timer)
-        end
     end
 end
 
@@ -17664,7 +17665,8 @@ local mini_content = ui:VGroup({
     })
 })
 
-local main_content = ui:VGroup({
+local function create_full_content()
+return ui:VGroup({
     Weight = 1,
     ID = "MainRoot",
     ContentsMargins = 8,
@@ -17893,6 +17895,7 @@ local main_content = ui:VGroup({
         })
     })
 })
+end
 
 local function create_mini_window()
     return dispatcher:AddWindow({
@@ -17907,12 +17910,11 @@ local function create_full_window()
         ID = WINDOW_META.main_window_id,
         WindowTitle = WINDOW_META.main_window_title,
         Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})
-    }, main_content)
+    }, create_full_content())
 end
 
 -- 创建窗口
 mini_win = create_mini_window()
-win = create_full_window()
 
 ensure_ai_config_window = function()
     if AIConfigPopWin then
@@ -17962,7 +17964,8 @@ ensure_ai_config_window = function()
                 Weight = 0,
                 Spacing = 8,
                 ui:Label{Text = "参考文稿 / 关键词（可选）", Weight = 0},
-                ui:Label{ID = "ReferenceScriptRiskLabel", Text = "<font color='#00AA55'>当前字数：0 · 影响较小</font>", Weight = 1, Alignment = {AlignLeft = true, AlignVCenter = true}}
+                ui:Label{ID = "ReferenceScriptRiskLabel", Text = "<font color='#00AA55'>当前字数：0 · 影响较小</font>", Weight = 1, Alignment = {AlignLeft = true, AlignVCenter = true}},
+                ui:Button{ID = "ClearReferenceScriptBtn", Text = "清空", Weight = 0, MinimumSize = {88, 28}}
             },
             ui:TextEdit{ID = "ReferenceScriptInput", Text = "", PlaceholderText = "每行一个关键词，或粘贴完整文稿", Weight = 1, MinimumSize = {0, 180}},
         },
@@ -17987,6 +17990,12 @@ ensure_ai_config_window = function()
         save_ai_popup_config_state()
         pcall(function() win.Enabled = true end)
         AIConfigPopWin:Hide()
+    end
+
+    function AIConfigPopWin.On.ClearReferenceScriptBtn.Clicked(ev)
+        set_textedit_content(find_ui_item("ReferenceScriptInput"), "")
+        save_ai_popup_config_state()
+        update_reference_script_risk_label("")
     end
 
     function AIConfigPopWin.On.ReferenceScriptInput.TextChanged(ev)
@@ -18116,18 +18125,6 @@ full_window_deferred_sync_timer = ui:Timer({
     SingleShot = true
 })
 
--- 完整版字幕树空闲预热：极简版加载完字幕后稍等片刻，
--- 在用户还在看极简版的间隙把完整版字幕树先铺好，
--- 这样真正切换时不会再卡住主线程渲染 480 行。
--- 50 ms：初始加载完 mini 立刻显示「已加载」，再过 ~50 ms 让 RunLoop 回到空闲，
--- 此时同步渲染完整版。50 ms 内用户若已点切换，open_full_window 的 dirty 检查兜底。
--- 之前是 250 ms（保守的"等用户看完 mini 再静默渲染"），现在初始加载和编辑后共用此值。
-full_window_warmup_timer = ui:Timer({
-    ID = "FullWindowWarmupTimer",
-    Interval = 50,
-    SingleShot = true
-})
-
 -- 搜索防抖：连续输入或退格时只在停顿后真正重渲染一次
 search_debounce_timer = ui:Timer({
     ID = "SearchDebounceTimer",
@@ -18170,23 +18167,6 @@ register_ui_timer(full_window_deferred_sync_timer, function()
     apply_lightweight_shared_state_to_window(win)
 end)
 
-register_ui_timer(full_window_warmup_timer, function()
-    -- 仅在完整版窗口还没渲染、用户还没切过去的情况下做预热
-    if not win then return end
-    if active_window == win then return end
-    if not full_window_tree_dirty then return end
-    if not current_rows or #current_rows == 0 then return end
-
-    local context = SEARCH_VIEW.build_current_view_context()
-    if not (context and context.visible_rows) then return end
-
-    local started_at = os.clock()
-    render_rows_to_window(win, context.visible_rows)
-    full_window_tree_dirty = false
-    print(string.format("[Hooper AI 2.0] 完整版字幕树空闲预热: %d ms (后台静默)",
-        math.floor(((os.clock() - started_at) * 1000) + 0.5)))
-end)
-
 register_ui_timer(search_debounce_timer, function()
     local target_window = pending_search_window or active_window or mini_win or win
     pending_search_window = nil
@@ -18215,6 +18195,12 @@ function schedule_debounced_search(target_window)
 end
 
 local function open_full_window()
+    local full_window = ensure_full_window_initialized()
+    if not full_window then
+        update_shared_status(mini_win, "无法打开完整版窗口")
+        return
+    end
+    win = full_window
     update_search_query_from_window(mini_win)
     get_row_from_tree_selection(mini_win)
 
@@ -18252,12 +18238,7 @@ local function open_full_window()
 
     local switch_started_at = os.clock()
 
-    -- 如果空闲预热定时器还没来得及跑（用户切得很快），先取消它避免之后做无用功
-    if full_window_warmup_timer then
-        pcall(function() full_window_warmup_timer:Stop() end)
-    end
-
-    -- 如果字幕树有变更（撤回/重做/AI 操作等）且预热没赶上，在切换时同步渲染
+    -- 字幕树在首次打开、或撤回/重做/AI 操作后按需渲染。
     if full_window_tree_dirty then
         local render_start = os.clock()
         local context = SEARCH_VIEW.build_current_view_context()
@@ -18359,6 +18340,8 @@ function mini_win.On.MiniSubtitleTree.ItemDoubleClicked(ev)
     go_to_subtitle(mini_win, row)
 end
 
+-- 完整版事件在首次打开完整版后才绑定，避免启动阶段要求提前创建完整窗口。
+function bind_full_window_events()
 -- 轨道选择变化（LineEdit + ▲▼，与极简窗口、目标轨控件统一样式）
 function win.On.TrackSpin.TextChanged(ev)
     if suppress_track_change_events then return end
@@ -21828,6 +21811,8 @@ function win.On.SubtitleTree.ItemDoubleClicked(ev)
     go_to_subtitle(win, row)
 end
 
+end
+
 handle_main_window_close = function()
     -- 关窗 = 退出 SubFix（单实例插件）。直接复用 force_quit_subfix，
     -- 这样可以同时取消正在跑的 AI 流程（设置 AI_CANCEL_REQUESTED + kill 后台 curl）
@@ -21907,6 +21892,8 @@ function force_quit_subfix()
     end
 end
 
+-- 完整版关闭与强制退出事件同样延迟到窗口创建后注册。
+function bind_full_window_close_events()
 -- 窗口关闭时退出事件循环
 function win.On.HooperAI_v2_compact_narrow500_final.Close(ev)
     handle_main_window_close()
@@ -21976,6 +21963,73 @@ end
 function win.On.ForceQuitBtn.Clicked(ev)
     force_quit_subfix()
 end
+end
+
+ensure_full_window_initialized = function()
+    if win then
+        return win
+    end
+
+    win = create_full_window()
+    local itm = {
+        MainTabs = win:Find("MainTabs"),
+        TabStack = win:Find("TabStack"),
+        PresetCombo = win:Find("PresetCombo"),
+        BackupPathInput = win:Find("BackupPathInput")
+    }
+
+    if itm.MainTabs then
+        itm.MainTabs:AddTab("精修工具")
+        itm.MainTabs:AddTab("AI 工作台")
+        itm.MainTabs.CurrentIndex = 0
+    end
+    if itm.TabStack then
+        switch_stack_page_index_only(win, "TabStack", 0)
+    end
+
+    apply_provider_config_to_ui(current_ai_provider_id, LoadConfig(current_ai_provider_id))
+    apply_shared_config_to_ui(LoadSharedConfig())
+
+    function win.On.PresetCombo.CurrentIndexChanged(ev)
+        if not full_window_ai_controls_initialized then return end
+        if suppress_provider_change_events or provider_sync_in_progress or provider_combo_bootstrap_in_progress then return end
+
+        local combo = win and win:Find("PresetCombo")
+        if not combo then return end
+        local live_index = tonumber(combo.CurrentIndex)
+        if live_index == nil or live_index < 0 then return end
+
+        local event_index = tonumber(ev and ev.Index)
+        if event_index ~= nil and event_index ~= live_index then
+            print(string.format("[Hooper AI 2.0] PresetCombo stale event ignored: ev=%d, live=%d", event_index, live_index))
+            return
+        end
+
+        local target_provider_id = get_provider_id_by_index(live_index)
+        if target_provider_id == current_ai_provider_id then return end
+        save_shared_config_from_ui()
+        switch_ai_provider(target_provider_id, {save_current = true})
+    end
+
+    function win.On.MainTabs.CurrentChanged(ev)
+        if itm.TabStack then
+            switch_stack_page_index_only(win, "TabStack", ev and ev.Index or 0)
+        end
+    end
+
+    bind_full_window_events()
+    bind_full_window_close_events()
+    local full_items = win:GetItems()
+    if full_items and full_items.TargetTrackSpin then
+        sync_target_track_control()
+    end
+    sync_track_control(win)
+    sync_search_control(win)
+    set_subtitle_loaded_state(is_subtitle_loaded, shared_status_text, win)
+    update_target_track_hint()
+    update_shared_status(win, shared_status_text)
+    return win
+end
 
 -- ========== 启动前初始化 ==========
 sync_backup_path_display()
@@ -21989,95 +22043,13 @@ print(string.format("[Hooper AI 2.0] [STARTUP] 备份系统初始化完成: +%d 
 
 -- ========== 启动 ==========
 
--- 注册选项卡
-local itm = {
-    MainTabs = win:Find("MainTabs"),
-    TabStack = win:Find("TabStack"),
-    PresetCombo = win:Find("PresetCombo"),
-    ApiUrlInput = find_ui_item("ApiUrlInput"),
-    ApiKeyInput = find_ui_item("ApiKeyInput"),
-    ModelInput = find_ui_item("ModelInput"),
-    EnableScriptAssistCheckbox = find_ui_item("EnableScriptAssistCheckbox"),
-    ReferenceScriptInput = find_ui_item("ReferenceScriptInput"),
-    ReferenceScriptRiskLabel = find_ui_item("ReferenceScriptRiskLabel"),
-    BackupPathInput = win:Find("BackupPathInput")
-}
-
-if itm.MainTabs then
-    itm.MainTabs:AddTab("精修工具")
-    itm.MainTabs:AddTab("AI 工作台")
-    itm.MainTabs.CurrentIndex = 0
-end
-if itm.TabStack then
-    switch_stack_page_index_only(win, "TabStack", 0)
-end
-
--- 加载 API 配置并填充到输入框
 current_ai_provider_id = LoadActiveProviderId()
-itm.config = LoadConfig(current_ai_provider_id)
-itm.shared_config = LoadSharedConfig()
-apply_provider_config_to_ui(current_ai_provider_id, itm.config)
-apply_shared_config_to_ui(itm.shared_config)
-
--- 绑定下拉框切换事件：自动填写 URL 和模型名称
-function win.On.PresetCombo.CurrentIndexChanged(ev)
-    if not full_window_ai_controls_initialized then
-        return
-    end
-    if suppress_provider_change_events or provider_sync_in_progress or provider_combo_bootstrap_in_progress then
-        return
-    end
-
-    local combo = win and win:Find("PresetCombo")
-    if not combo then
-        return
-    end
-
-    local live_index = tonumber(combo.CurrentIndex)
-    if live_index == nil or live_index < 0 then
-        return
-    end
-
-    local event_index = tonumber(ev and ev.Index)
-    if event_index ~= nil and event_index ~= live_index then
-        print(string.format(
-            "[Hooper AI 2.0] PresetCombo stale event ignored: ev=%d, live=%d",
-            event_index,
-            live_index
-        ))
-        return
-    end
-
-    local target_provider_id = get_provider_id_by_index(live_index)
-    if target_provider_id == current_ai_provider_id then
-        return
-    end
-    save_shared_config_from_ui()
-    switch_ai_provider(target_provider_id, {save_current = true})
-end
-
--- TabBar 联动逻辑 (强制让 Stack 切换 Index)
-function win.On.MainTabs.CurrentChanged(ev)
-    if itm.TabStack then
-        switch_stack_page_index_only(win, "TabStack", ev and ev.Index or 0)
-    end
-end
-
--- 初始化 AI 任务选项
-itm.items = win:GetItems()
-if itm.items and itm.items.TargetTrackSpin then
-    sync_target_track_control()
-end
 
 active_window = mini_win
-sync_track_control(win)
 sync_track_control(mini_win)
-sync_search_control(win)
 sync_search_control(mini_win)
-set_subtitle_loaded_state(false, nil, win)
 set_subtitle_loaded_state(false, nil, mini_win)
 update_target_track_hint()
-update_shared_status(win, shared_status_text)
 update_shared_status(mini_win, shared_status_text)
 
 print(string.format("[Hooper AI 2.0] [STARTUP] 即将 Show 极简版窗口: +%d ms", startup_elapsed_ms()))
