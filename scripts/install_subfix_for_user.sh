@@ -6,9 +6,10 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 SYSTEM_UTILITY="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
 SYSTEM_SUPPORT="$SYSTEM_UTILITY/.subfix_support"
 RUNTIME_PYTHON="$SYSTEM_SUPPORT/runtime/python/bin/python3"
+BUNDLED_FFMPEG="$SYSTEM_SUPPORT/bin/ffmpeg"
 
-if [[ ! -x "$RUNTIME_PYTHON" || ! -d "$SYSTEM_UTILITY/SubFix" ]]; then
-  echo "SubFix 安装不完整：未找到内置运行时或主脚本目录。" >&2
+if [[ ! -x "$RUNTIME_PYTHON" || ! -x "$BUNDLED_FFMPEG" || ! -d "$SYSTEM_UTILITY/SubFix" ]]; then
+  echo "SubFix 安装不完整：未找到内置运行时、ffmpeg 或主脚本目录。" >&2
   exit 1
 fi
 

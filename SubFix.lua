@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.1.3"
+SUBFIX_VERSION = "3.1.5"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -8454,9 +8454,16 @@ function SUBFIX_AUDIO_ALIGN.merge_speech_segments(segments, merge_gap_seconds, m
 end
 
 function SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
-    local preferred = (os.getenv("HOME") or "") .. "/.local/bin/ffmpeg"
-    if SUBFIX_AUDIO_ALIGN.file_exists(preferred) then
-        return preferred
+    local support_root = SUBFIX_AUDIO_ALIGN.resolve_support_root()
+    local bundled = support_root .. "/.subfix_support/bin/ffmpeg"
+    if SUBFIX_AUDIO_ALIGN.file_exists(bundled) then
+        return bundled
+    end
+
+    local home_dir = os.getenv("HOME") or ""
+    local user_local = home_dir ~= "" and (home_dir .. "/.local/bin/ffmpeg") or ""
+    if user_local ~= "" and SUBFIX_AUDIO_ALIGN.file_exists(user_local) then
+        return user_local
     end
 
     local ok, output = run_shell_capture("command -v ffmpeg")
@@ -8470,7 +8477,7 @@ function SUBFIX_AUDIO_ALIGN.resolve_ffmpeg_binary()
 end
 
 function SUBFIX_AUDIO_ALIGN.ffmpeg_missing_message(action)
-    return "未找到 ffmpeg: ~/.local/bin/ffmpeg 不可用，无法" .. tostring(action or "处理音频")
+    return "未找到内置 ffmpeg 或系统 ffmpeg；请重新安装/更新 SubFix 后重试，无法" .. tostring(action or "处理音频")
 end
 
 function SUBFIX_AUDIO_ALIGN.timeline_audio_mix_temp_dir()
