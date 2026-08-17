@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import importlib.util
 import math
 import re
 import wave
@@ -8,7 +9,17 @@ from array import array
 from pathlib import Path
 from typing import Any
 
-import subfix_generate_v4 as v4
+try:
+    import subfix_generate_v4 as v4
+except ModuleNotFoundError as exc:
+    if exc.name != "subfix_generate_v4":
+        raise
+    _v4_path = Path(__file__).resolve().with_name("subfix_generate_v4.py")
+    _v4_spec = importlib.util.spec_from_file_location("subfix_generate_v4", _v4_path)
+    if _v4_spec is None or _v4_spec.loader is None:
+        raise RuntimeError("v4 生成模块无法加载")
+    v4 = importlib.util.module_from_spec(_v4_spec)
+    _v4_spec.loader.exec_module(v4)
 
 
 PROFILE_SCHEMA = "subfix_segmentation_profile_v4"
