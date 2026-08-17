@@ -219,6 +219,89 @@ DEFAULT_FFMPEG_CANDIDATES = (
 _QWEN3_ASR_MODEL_CACHE: dict[tuple[str, str, str, str | None], tuple[Any, str, str]] = {}
 _QWEN3_FORCED_ALIGNER_CACHE: dict[tuple[str, str, str], Any] = {}
 _OPENAI_WHISPER_MODEL_CACHE: dict[str, Any] = {}
+HOTWORD_MAX_ENTRIES = 200
+HOTWORD_CHINESE_DIGITS = str.maketrans("0123456789", "零一二三四五六七八九")
+
+
+def load_hotword_entries(path: str | Path | None) -> list[dict[str, Any]]:
+    """Load valid user hotwords without exposing malformed configuration to ASR."""
+    if not path:
+        return []
+    try:
+        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    seen_terms: set[str] = set()
+    for raw_entry in payload["entries"]:
+        if not isinstance(raw_entry, dict):
+            continue
+        raw_term = raw_entry.get("term")
+        if not isinstance(raw_term, str):
+            continue
+        term = raw_term.strip()
+        term_key = term.casefold()
+        if not term or term_key in seen_terms:
+            continue
+        aliases: list[str] = []
+        seen_aliases: set[str] = set()
+        raw_aliases = raw_entry.get("aliases")
+        if isinstance(raw_aliases, list):
+            for raw_alias in raw_aliases:
+                alias = str(raw_alias or "").strip()
+                if alias and alias != term and alias not in seen_aliases:
+                    aliases.append(alias)
+                    seen_aliases.add(alias)
+        entries.append({"term": term, "aliases": aliases})
+        seen_terms.add(term_key)
+    return entries
+
+
+def build_hotword_context(entries: list[dict[str, Any]]) -> str:
+    terms = [str(entry.get("term") or "").strip() for entry in entries[:HOTWORD_MAX_ENTRIES]]
+    terms = [term for term in terms if term]
+    return "请严格使用以下专有名词的标准写法；英文和数字不要改写为中文：" + "、".join(terms) if terms else ""
+
+
+def implicit_hotword_aliases(term: str) -> list[str]:
+    """Return non-UI aliases for ASR's common Arabic-to-Chinese digit conversion."""
+    if not any(character.isdigit() for character in term):
+        return []
+    chinese_digit_alias = term.translate(HOTWORD_CHINESE_DIGITS)
+    return [chinese_digit_alias] if chinese_digit_alias != term else []
+
+
+def apply_hotword_replacements_to_units(
+    units: list[dict[str, Any]], entries: list[dict[str, Any]]
+) -> int:
+    replacements: list[tuple[str, str]] = []
+    seen_aliases: set[str] = set()
+    for entry in entries:
+        term = str(entry.get("term") or "").strip()
+        for alias in [*(entry.get("aliases") or []), *implicit_hotword_aliases(term)]:
+            alias_text = str(alias or "").strip()
+            alias_key = alias_text.casefold()
+            if term and alias_text and alias_key not in seen_aliases:
+                replacements.append((alias_text, term))
+                seen_aliases.add(alias_key)
+    replacements.sort(key=lambda item: len(item[0]), reverse=True)
+
+    changed_count = 0
+    for unit in units:
+        text = str(unit.get("text") or "")
+        for alias, term in replacements:
+            if re.search(r"[A-Za-z0-9]", alias):
+                pattern = r"(?<![A-Za-z0-9_])" + re.escape(alias) + r"(?![A-Za-z0-9_])"
+                text, replaced = re.subn(pattern, term, text, flags=re.IGNORECASE)
+            else:
+                replaced = text.count(alias)
+                text = text.replace(alias, term)
+            changed_count += replaced
+        unit["text"] = text
+    return changed_count
 
 
 def generate_subtitles_batch_max_seconds() -> float:
@@ -283,6 +366,11 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "live_fallback_no_word_timing",
         "live_fallback_no_activity",
         "qwen_batch_used",
+        "hotword_enabled",
+        "hotword_entry_count",
+        "hotword_injected_count",
+        "hotword_replacement_count",
+        "hotword_context_supported",
         "segmentation_profile_used",
         "segmentation_profile_schema",
         "generate_engine",
@@ -3825,6 +3913,7 @@ def qwen3_result_to_payload(
     model_name: str,
     aligner_name: str,
     device_map: str,
+    hotword_context_status: str = "not_requested",
 ) -> dict[str, Any]:
     text = str(qwen3_timestamp_value(result, "text") or "").strip()
     language_name = qwen3_timestamp_value(result, "language")
@@ -3849,33 +3938,56 @@ def qwen3_result_to_payload(
             "requested_model": requested_model,
             "forced_align_item_count": len(words),
             "uses_word_timing": bool(words),
+            "hotword_context_status": hotword_context_status,
         },
     }
 
 
-def transcribe_qwen3_asr(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
+def _transcribe_qwen3_model(
+    qwen_model: Any, audio: str | list[str], language: str | None, context: str | None
+) -> tuple[Any, str]:
+    kwargs: dict[str, Any] = {
+        "audio": audio,
+        "language": qwen3_language_name(language),
+        "return_time_stamps": True,
+    }
+    if not context:
+        return qwen_model.transcribe(**kwargs), "not_requested"
+    kwargs["context"] = context
+    try:
+        return qwen_model.transcribe(**kwargs), "used"
+    except TypeError as exc:
+        if "context" not in str(exc).lower():
+            raise
+        kwargs.pop("context", None)
+        return qwen_model.transcribe(**kwargs), "unsupported"
+
+
+def transcribe_qwen3_asr(
+    audio_path: Path, model: str, language: str | None, context: str | None = None
+) -> dict[str, Any]:
     qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
     try:
-        results = qwen_model.transcribe(
-            audio=str(audio_path),
-            language=qwen3_language_name(language),
-            return_time_stamps=True,
+        results, hotword_context_status = _transcribe_qwen3_model(
+            qwen_model, str(audio_path), language, context
         )
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
         raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
     first_result = results[0] if isinstance(results, list) and results else results
-    return qwen3_result_to_payload(first_result, audio_path, model, model_name, aligner_name, device_map)
+    return qwen3_result_to_payload(
+        first_result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
+    )
 
 
-def transcribe_qwen3_asr_batch(audio_paths: list[Path], model: str, language: str | None) -> list[dict[str, Any]]:
+def transcribe_qwen3_asr_batch(
+    audio_paths: list[Path], model: str, language: str | None, context: str | None = None
+) -> list[dict[str, Any]]:
     if not audio_paths:
         return []
     qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
     try:
-        results = qwen_model.transcribe(
-            audio=[str(path) for path in audio_paths],
-            language=qwen3_language_name(language),
-            return_time_stamps=True,
+        results, hotword_context_status = _transcribe_qwen3_model(
+            qwen_model, [str(path) for path in audio_paths], language, context
         )
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
         raise RuntimeError(f"Qwen3-ASR 批量转写失败: {exc}") from exc
@@ -3884,7 +3996,9 @@ def transcribe_qwen3_asr_batch(audio_paths: list[Path], model: str, language: st
     if len(results) != len(audio_paths):
         raise RuntimeError(f"Qwen3-ASR 批量结果数量不匹配: audio={len(audio_paths)} result={len(results)}")
     return [
-        qwen3_result_to_payload(result, audio_path, model, model_name, aligner_name, device_map)
+        qwen3_result_to_payload(
+            result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
+        )
         for result, audio_path in zip(results, audio_paths)
     ]
 
@@ -4110,8 +4224,23 @@ def transcribe_v4_window_batch(
     """
     backend = str(getattr(args, "backend", "auto") or "auto")
     if backend != "doubao_asr":
-        payloads = transcribe_qwen3_asr_batch(window_audio_paths, args.model, args.language)
-        return payloads, {"asr_backend_used": "qwen3_asr", "doubao_fallback_count": 0}
+        hotword_context = str(getattr(args, "hotword_context", "") or "")
+        payloads = (
+            transcribe_qwen3_asr_batch(
+                window_audio_paths, args.model, args.language, context=hotword_context
+            )
+            if hotword_context
+            else transcribe_qwen3_asr_batch(window_audio_paths, args.model, args.language)
+        )
+        context_statuses = {
+            str((payload.get("diagnostic") or {}).get("hotword_context_status") or "not_requested")
+            for payload in payloads
+        }
+        return payloads, {
+            "asr_backend_used": "qwen3_asr",
+            "doubao_fallback_count": 0,
+            "hotword_context_supported": "unsupported" not in context_statuses,
+        }
 
     payloads = []
     doubao_log_ids: list[str] = []
@@ -4182,7 +4311,13 @@ def transcribe_external_backend(audio_path: Path, model: str, language: str | No
         return payload
 
 
-def transcribe_with_backend(audio_path: Path, model: str, language: str | None, backend: str = "auto") -> dict[str, Any]:
+def transcribe_with_backend(
+    audio_path: Path,
+    model: str,
+    language: str | None,
+    backend: str = "auto",
+    context: str | None = None,
+) -> dict[str, Any]:
     requested_backend = backend or "auto"
     # "auto" never silently tries doubao_asr (paid/credential-gated); it must
     # be requested explicitly. See AUTO_TRANSCRIBE_BACKENDS definition.
@@ -4196,7 +4331,11 @@ def transcribe_with_backend(audio_path: Path, model: str, language: str | None, 
             elif candidate == "openai_whisper":
                 payload = transcribe_openai_whisper(audio_path, model, language)
             elif candidate == "qwen3_asr":
-                payload = transcribe_qwen3_asr(audio_path, model, language)
+                payload = (
+                    transcribe_qwen3_asr(audio_path, model, language, context=context)
+                    if context
+                    else transcribe_qwen3_asr(audio_path, model, language)
+                )
             elif candidate == "doubao_asr":
                 payload = transcribe_doubao_asr(audio_path, model, language)
             elif candidate in EXTERNAL_TRANSCRIBE_COMMAND_ENV:
@@ -4454,6 +4593,10 @@ def run_generate_subtitles_batch_plan_v3(
     subtitle_mode = str(getattr(args, "subtitle_mode", "narration") or "narration")
     if subtitle_mode not in {"narration", "live"}:
         subtitle_mode = "narration"
+    configured_hotword_entries = load_hotword_entries(getattr(args, "hotwords_json", None))
+    hotword_entries = configured_hotword_entries[:HOTWORD_MAX_ENTRIES]
+    hotword_context = build_hotword_context(hotword_entries)
+    args.hotword_context = hotword_context
     ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
     segmentation_profile = load_segmentation_profile(getattr(args, "segmentation_profile", None))
     active_segmentation_profile = segmentation_profile_for_mode(segmentation_profile, subtitle_mode)
@@ -4476,6 +4619,11 @@ def run_generate_subtitles_batch_plan_v3(
         "live_engine": str(os.getenv("SUBFIX_LIVE_ENGINE") or "islands_v2"),
         "qwen_batch_used": False,
         "qwen_batch_size": 0,
+        "hotword_enabled": bool(getattr(args, "hotwords_json", None)),
+        "hotword_entry_count": len(configured_hotword_entries),
+        "hotword_injected_count": len(hotword_entries),
+        "hotword_replacement_count": 0,
+        "hotword_context_supported": True,
         "speaker_turn_count": 0,
         "speaker_switch_count": 0,
         "bleed_rejected_count": 0,
@@ -4606,10 +4754,13 @@ def run_generate_subtitles_batch_plan_v3(
                         qwen_batch_index=chunk_index,
                         qwen_batch_count=len(qwen_chunks),
                     )
-                    qwen_payloads = transcribe_qwen3_asr_batch(
-                        [item["cut_path"] for item in chunk_items if item.get("cut_path")],
-                        args.model,
-                        args.language,
+                    qwen_audio_paths = [item["cut_path"] for item in chunk_items if item.get("cut_path")]
+                    qwen_payloads = (
+                        transcribe_qwen3_asr_batch(
+                            qwen_audio_paths, args.model, args.language, context=hotword_context
+                        )
+                        if hotword_context
+                        else transcribe_qwen3_asr_batch(qwen_audio_paths, args.model, args.language)
                     )
                     if len(qwen_payloads) != len(chunk_items):
                         raise RuntimeError(f"Qwen batch payload mismatch: {len(qwen_payloads)} != {len(chunk_items)}")
@@ -4643,7 +4794,13 @@ def run_generate_subtitles_batch_plan_v3(
                         progress_total=progress_total,
                         batch_id=batch_id,
                     )
-                    raw_payload = transcribe_with_backend(item["cut_path"], args.model, args.language, args.backend)
+                    raw_payload = (
+                        transcribe_with_backend(
+                            item["cut_path"], args.model, args.language, args.backend, context=hotword_context
+                        )
+                        if hotword_context
+                        else transcribe_with_backend(item["cut_path"], args.model, args.language, args.backend)
+                    )
 
                 segments = normalize_segments(raw_payload)
                 live_fallback = False
@@ -4672,6 +4829,11 @@ def run_generate_subtitles_batch_plan_v3(
                     speech_regions=item.get("speech_regions") or [],
                     subtitle_mode=subtitle_mode,
                 )
+                diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
+                    rows, hotword_entries
+                )
+                if str((raw_payload.get("diagnostic") or {}).get("hotword_context_status") or "") == "unsupported":
+                    diagnostic["hotword_context_supported"] = False
                 for row in rows:
                     row["batch_id"] = batch_id
                     row["track_order"] = int(batch.get("track_order") or 0)
@@ -4842,6 +5004,10 @@ def run_generate_subtitles_batch_plan_v4(
     subtitle_mode = str(getattr(args, "subtitle_mode", "narration") or "narration")
     if subtitle_mode not in {"narration", "live"}:
         subtitle_mode = "narration"
+    configured_hotword_entries = load_hotword_entries(getattr(args, "hotwords_json", None))
+    hotword_entries = configured_hotword_entries[:HOTWORD_MAX_ENTRIES]
+    hotword_context = build_hotword_context(hotword_entries)
+    args.hotword_context = hotword_context
     ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
     diagnostic: dict[str, Any] = {
         "mode": "generate_subtitles_batch",
@@ -4882,6 +5048,11 @@ def run_generate_subtitles_batch_plan_v4(
         "doubao_fallback_count": 0,
         "doubao_native_timestamp_window_count": 0,
         "doubao_native_timestamp_fallback_count": 0,
+        "hotword_enabled": bool(getattr(args, "hotwords_json", None)),
+        "hotword_entry_count": len(configured_hotword_entries),
+        "hotword_injected_count": len(hotword_entries),
+        "hotword_replacement_count": 0,
+        "hotword_context_supported": True,
     }
     profile: dict[str, Any] | None = None
     active_mode_profile: dict[str, Any] | None = None
@@ -5035,6 +5206,19 @@ def run_generate_subtitles_batch_plan_v4(
                     retry_dir=tmp_path / "asr_recovery",
                     model=args.model,
                     language=args.language,
+                    transcribe_fn=(
+                        (
+                            lambda audio_path, model_name, language_name: transcribe_qwen3_asr(
+                                audio_path, model_name, language_name, context=hotword_context
+                            )
+                        )
+                        if hotword_context
+                        else (
+                            lambda audio_path, model_name, language_name: transcribe_qwen3_asr(
+                                audio_path, model_name, language_name
+                            )
+                        )
+                    ),
                 )
             except generate_v4.V4AlignmentError:
                 diagnostic["asr_unrecovered_window_count"] += 1
@@ -5085,7 +5269,9 @@ def run_generate_subtitles_batch_plan_v4(
                     int(region["end_frame"]),
                     float(track["fps"]),
                 )
-                retry_payload = transcribe_qwen3_asr(retry_path, args.model, args.language)
+                retry_payload = transcribe_qwen3_asr(
+                    retry_path, args.model, args.language, context=hotword_context
+                )
                 diagnostic["local_retry_elapsed_seconds"] += time.monotonic() - local_retry_started_at
                 write_progress(
                     progress_path,
@@ -5120,6 +5306,12 @@ def run_generate_subtitles_batch_plan_v4(
                         "speech_seconds": audio_duration_seconds(retry_path),
                     }
                 )
+        if hotword_context:
+            diagnostic["hotword_context_supported"] = not any(
+                str((payload.get("diagnostic") or {}).get("hotword_context_status") or "")
+                == "unsupported"
+                for payload in raw_payloads
+            )
         diagnostic["stages"] = {
             "window_asr": [
                 {
@@ -5312,6 +5504,9 @@ def run_generate_subtitles_batch_plan_v4(
                         "reason": "alignment_quality",
                     }
                 )
+            diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
+                aligned_units, hotword_entries
+            )
             units_by_track.setdefault(track_index, []).extend(aligned_units)
             successful_alignment_windows.append(
                 {
@@ -5364,7 +5559,9 @@ def run_generate_subtitles_batch_plan_v4(
                     float(track["fps"]),
                 )
                 try:
-                    retry_payload = transcribe_qwen3_asr(retry_path, args.model, args.language)
+                    retry_payload = transcribe_qwen3_asr(
+                        retry_path, args.model, args.language, context=hotword_context
+                    )
                     retry_units, retry_align_diagnostic = generate_v4.require_aligned_units(
                         retry_path,
                         retry_payload,
@@ -5399,6 +5596,9 @@ def run_generate_subtitles_batch_plan_v4(
                     unit["raw_alignment_coverage"] = float(retry_align_diagnostic.get("raw_alignment_coverage") or 0.0)
                     unit["alignment_repaired_unit_count"] = int(retry_align_diagnostic.get("alignment_repaired_unit_count") or 0)
                     unit["unit_count"] = len(retry_units)
+                diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
+                    retry_units, hotword_entries
+                )
                 units_by_track.setdefault(track_index, []).extend(retry_units)
                 retry_regions.append(
                     {
@@ -5634,6 +5834,11 @@ def run_generate_subtitles_batch_plan_v4(
                 key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)),
             )
             diagnostic.update(refinement_diagnostic)
+        # Forced alignment may split a hotword across individual character units.
+        # Apply once more after segmentation, without changing any frame boundaries.
+        diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
+            subtitle_rows, hotword_entries
+        )
         for index, row in enumerate(subtitle_rows, start=1):
             row["index"] = index
         diagnostic.update(segmentation_diagnostic)
@@ -6460,6 +6665,7 @@ def main(argv: list[str] | None = None) -> int:
         default=str(os.getenv("SUBFIX_GENERATE_ENGINE") or "v5").lower(),
     )
     parser.add_argument("--segmentation-profile")
+    parser.add_argument("--hotwords-json")
     parser.add_argument("--calibration-json", action="append", default=[])
     parser.add_argument(
         "--backend",

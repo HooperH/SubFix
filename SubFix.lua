@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.1.6"
+SUBFIX_VERSION = "3.1.7"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -6406,11 +6406,22 @@ function run_subfix_background_command(cmd, options)
         end
         last_progress_signature = signature
         update_background_status(payload)
+        local current_batch = tonumber(payload.batch_index) or (NormalizeProgress and NormalizeProgress.current_batch) or 0
+        local total_batches = tonumber(payload.total_batches) or (NormalizeProgress and NormalizeProgress.total_batches) or 0
+        local progress_range_start = tonumber(options.progress_range_start)
+        local progress_range_end = tonumber(options.progress_range_end)
+        local overall_progress_index = nil
+        if progress_range_start and progress_range_end and total_batches > 0 then
+            local batch_fraction = math.max(0, math.min(1, current_batch / total_batches))
+            overall_progress_index = progress_range_start + (progress_range_end - progress_range_start) * batch_fraction
+        end
         update_normalize_progress({
-            stage = tostring(payload.stage or "后台处理"),
+            stage = tostring(options.progress_stage or payload.stage or "后台处理"),
             message = tostring(payload.message or ""),
-            current_batch = tonumber(payload.batch_index) or (NormalizeProgress and NormalizeProgress.current_batch) or 0,
-            total_batches = tonumber(payload.total_batches) or (NormalizeProgress and NormalizeProgress.total_batches) or 0,
+            current_batch = current_batch,
+            total_batches = total_batches,
+            progress_index = overall_progress_index,
+            progress_total = overall_progress_index and 100 or nil,
             log = tostring(payload.message or payload.stage or "后台处理")
         })
     end
@@ -8986,6 +8997,7 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     local helper = helper_dir .. "/subfix_asr_transcribe.py"
     local setup = helper_dir .. "/setup_asr_env.sh"
     local python = helper_dir .. "/.subfix_asr_env/bin/python"
+    local runtime_python = helper_dir .. "/runtime/python/bin/python3"
     local visible_helper_dir = script_dir .. "/SubFix"
     local visible_helper = visible_helper_dir .. "/subfix_asr_transcribe.py"
     local visible_setup = visible_helper_dir .. "/setup_asr_env.sh"
@@ -9010,6 +9022,9 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     end
     if not SUBFIX_AUDIO_ALIGN.file_exists(python) and SUBFIX_AUDIO_ALIGN.file_exists(user_python) then
         python = user_python
+    end
+    if not SUBFIX_AUDIO_ALIGN.file_exists(python) and SUBFIX_AUDIO_ALIGN.file_exists(runtime_python) then
+        python = runtime_python
     end
 
     return {
@@ -10800,7 +10815,7 @@ function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, b
     end
     local helper_mode = "qwen_forced_align_text_batches"
     local helper_label = "批量 Qwen3 forced alignment"
-    local progress_stage = "Qwen3 对齐"
+    local progress_stage = tostring(options.progress_stage or "Qwen3 对齐")
     local source_label = "主讲轨批量 Qwen3"
     local mapping_mode = "qwen3_forced_align_text_batches"
 
@@ -10827,7 +10842,10 @@ function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, b
     local ok, output, status = run_subfix_background_command(table.concat(cmd_parts, " "), {
         progress = progress,
         progress_path = progress_path,
-        label = helper_label
+        label = helper_label,
+        progress_stage = progress_stage,
+        progress_range_start = options.progress_range_start,
+        progress_range_end = options.progress_range_end
     })
     if status == "cancelled" then
         return nil, { cancelled = true, diagnostic = "已取消" }
@@ -11951,7 +11969,9 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
     local results, reference_info = SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, 0, {
         max_stable_ts_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames,
         allow_non_monotonic_candidates = true,
-        progress = normalize_progress
+        progress = normalize_progress,
+        progress_range_start = 0,
+        progress_range_end = 70
     })
     if reference_info and reference_info.cancelled then
         return nil, false, "已取消", {cancelled = true}
@@ -11984,7 +12004,10 @@ function SUBFIX_AUDIO_ALIGN.apply_protected_audio_alignment_for_gap_fill(rows, f
         local review_results, review_info = SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(review_plan, fps, 0, {
             max_stable_ts_move_frames = SUBFIX_AUDIO_ALIGN.normalize_length_max_ctc_move_frames,
             allow_non_monotonic_candidates = true,
-            progress = normalize_progress
+            progress = normalize_progress,
+            progress_stage = "Qwen3 复核",
+            progress_range_start = 70,
+            progress_range_end = 95
         })
         if review_info and review_info.cancelled then
             return nil, false, "已取消", {cancelled = true}

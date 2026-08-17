@@ -21,8 +21,8 @@ SUPPORT_PAYLOAD="$PAYLOAD_DIR/$INSTALL_PATH/.subfix_support"
 
 PYTHON_RUNTIME_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260718/cpython-3.12.13%2B20260718-aarch64-apple-darwin-install_only.tar.gz"
 PYTHON_RUNTIME_SHA256="62aeee6161d57303a71a138b75fd5cc6fb8c89c4b1d9c7f0a052d89fa0b6652b"
-ALIGNER_MODEL="$SCRIPT_DIR/.subfix_support/models/qwen3-forced-aligner-0.6b-f16.gguf"
-QWEN_BUILD="$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp/build"
+ALIGNER_MODEL="${ALIGNER_MODEL:-$SCRIPT_DIR/.subfix_support/models/qwen3-forced-aligner-0.6b-f16.gguf}"
+QWEN_BUILD="${QWEN_BUILD:-$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp/build}"
 USER_INSTALL_SCRIPT="$SCRIPT_DIR/scripts/install_subfix_for_user.sh"
 FFMPEG_BUILD_SCRIPT="$SCRIPT_DIR/scripts/build_bundled_ffmpeg.sh"
 

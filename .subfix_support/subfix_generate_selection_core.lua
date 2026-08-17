@@ -329,7 +329,8 @@ local function resolve_asr_paths()
         setup = helper_dir .. "/setup_asr_env.sh",
         python = helper_dir .. "/.subfix_asr_env/bin/python",
         runtime_python = helper_dir .. "/runtime/python/bin/python3",
-        diagnostic = user_support_dir .. "/last_generate_diagnostic.json"
+        diagnostic = user_support_dir .. "/last_generate_diagnostic.json",
+        hotwords = user_support_dir .. "/hotwords.json"
     }
     if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
         paths.helper = root .. "/subfix_asr_transcribe.py"
@@ -452,6 +453,51 @@ end
 local function save_last_engine_backend(backend)
     local content = string.format('{\n  "last_engine_backend": "%s"\n}\n', json_escape(backend))
     write_text_file(generate_prefs_file_path(), content)
+end
+
+local function load_generate_hotword_entries()
+    local text = read_text_file(resolve_asr_paths().hotwords)
+    local payload = text and decode_json_text(text) or nil
+    local raw_entries = type(payload) == "table" and payload.entries or {}
+    if type(raw_entries) ~= "table" then return {} end
+    local entries, seen_terms = {}, {}
+    for _, raw_entry in ipairs(raw_entries) do
+        if type(raw_entry) == "table" then
+            local term = trim_text(tostring(raw_entry.term or ""))
+            if term ~= "" and not seen_terms[term] then
+                local aliases, seen_aliases = {}, {}
+                if type(raw_entry.aliases) == "table" then
+                    for _, raw_alias in ipairs(raw_entry.aliases) do
+                        local alias = trim_text(tostring(raw_alias or ""))
+                        if alias ~= "" and alias ~= term and not seen_aliases[alias] then
+                            aliases[#aliases + 1] = alias
+                            seen_aliases[alias] = true
+                        end
+                    end
+                end
+                entries[#entries + 1] = {term = term, aliases = aliases}
+                seen_terms[term] = true
+            end
+        end
+    end
+    return entries
+end
+
+local function save_generate_hotword_entries(entries)
+    local path = resolve_asr_paths().hotwords
+    local parts = {}
+    for _, entry in ipairs(entries or {}) do
+        local aliases = {}
+        for _, alias in ipairs(entry.aliases or {}) do
+            aliases[#aliases + 1] = '"' .. json_escape(alias) .. '"'
+        end
+        parts[#parts + 1] = string.format(
+            '{"term":"%s","aliases":[%s]}',
+            json_escape(entry.term),
+            table.concat(aliases, ",")
+        )
+    end
+    return write_text_file(path, '{"version":1,"entries":[' .. table.concat(parts, ",") .. "]}\n")
 end
 
 local function temp_dir()
@@ -1736,10 +1782,10 @@ end
 
 local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     if not dispatcher or not ui then
-        return nil, nil, nil, nil, "无法初始化 Resolve UI"
+        return nil, nil, nil, nil, nil, "无法初始化 Resolve UI"
     end
     if type(audio_sources) ~= "table" or #audio_sources == 0 then
-        return nil, nil, nil, nil, "未找到与选区重叠的本地音频片段"
+        return nil, nil, nil, nil, nil, "未找到与选区重叠的本地音频片段"
     end
 
     local selected_audio_sources = nil
@@ -1779,13 +1825,16 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         end
     end
     local selected_backend = SUBTITLE_ENGINE_OPTIONS[selected_engine_index].backend
+    local hotword_entries = load_generate_hotword_entries()
+    local hotwords_enabled = #hotword_entries > 0
+    local selected_hotwords_json = nil
     local dialog_cancelled = false
     local qwen_install_requested = false
     local track_rows = {}
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 420, 284}),
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 420, 316}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -1811,6 +1860,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             ui:Label{Text = "识别模型：", Weight = 0},
             ui:Button{ID = "GenerateSubtitleEngineQwenBtn", Text = "Qwen（本地）", Weight = 0, MinimumSize = {0, 20}},
             ui:Button{ID = "GenerateSubtitleEngineDoubaoBtn", Text = "豆包（云端）", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
+        },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            ui:Label{Text = "热词库：", Weight = 0},
+            ui:Button{ID = "GenerateHotwordToggleBtn", Text = "", Weight = 0, MinimumSize = {0, 20}},
+            ui:Button{ID = "GenerateHotwordManageBtn", Text = "管理…", Weight = 0, MinimumSize = {0, 20}},
             ui:HGap(0, 1)
         },
         ui:Label{
@@ -1872,6 +1929,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local engine_qwen_btn = items and items.GenerateSubtitleEngineQwenBtn or nil
     local engine_doubao_btn = items and items.GenerateSubtitleEngineDoubaoBtn or nil
+    local hotword_toggle_btn = items and items.GenerateHotwordToggleBtn or nil
 
     local function refresh_subtitle_engine_buttons()
         if engine_qwen_btn then
@@ -1895,6 +1953,207 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         local option = SUBTITLE_ENGINE_OPTIONS[selected_engine_index]
         return option and option.backend or SUBTITLE_ENGINE_OPTIONS[1].backend
     end
+
+    local hotword_library_window = nil
+    local hotword_clear_confirm_window = nil
+    local hotword_library_closing = false
+    local function refresh_hotword_toggle()
+        if not hotword_toggle_btn then return end
+        local prefix = hotwords_enabled and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK
+        local count_text = tostring(#hotword_entries) .. " 条"
+        if #hotword_entries > 200 then count_text = count_text .. "（本次前200条）" end
+        pcall(function() hotword_toggle_btn.Text = prefix .. " " .. count_text end)
+    end
+
+    local function show_hotword_library_dialog()
+        if hotword_library_window then
+            hotword_library_closing = false
+            pcall(function() hotword_library_window:Show() end)
+            return
+        end
+        hotword_library_window = dispatcher:AddWindow({
+            ID = "GenerateHotwordLibraryWindow",
+            WindowTitle = "SubFix · 热词库",
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({620, 330, 520, 290}),
+        },
+        ui:VGroup{
+            Spacing = 6,
+            ContentsMargins = 10,
+            ui:Tree{ID = "GenerateHotwordTree", Weight = 1, MinimumSize = {0, 90}, Events = {ItemClicked = true}},
+            ui:HGroup{
+                Weight = 0, Spacing = 8,
+                ui:Label{Text = "标准词：", Weight = 0},
+                ui:LineEdit{ID = "GenerateHotwordTermInput", PlaceholderText = "例如 DaVinci Resolve", Weight = 1}
+            },
+            ui:HGroup{
+                Weight = 0, Spacing = 8,
+                MinimumSize = {0, 34},
+                ui:Button{ID = "GenerateHotwordAddBtn", Text = "新增", Weight = 1, MinimumSize = {0, 28}},
+                ui:Button{ID = "GenerateHotwordDeleteBtn", Text = "删除", Weight = 1, MinimumSize = {0, 28}},
+                ui:Button{ID = "GenerateHotwordClearBtn", Text = "清空", Weight = 1, MinimumSize = {0, 28}}
+            },
+            ui:VGap(10),
+            ui:HGroup{
+                Weight = 0, Spacing = 8,
+                MinimumSize = {0, 34},
+                ui:Button{ID = "GenerateHotwordCloseBtn", Text = "完成", Weight = 1, MinimumSize = {0, 28}}
+            },
+            ui:Label{ID = "GenerateHotwordStatusLabel", Text = "", Weight = 0}
+        })
+        local library_items = hotword_library_window:GetItems()
+        local hotword_tree = library_items and library_items.GenerateHotwordTree or nil
+        local term_input = library_items and library_items.GenerateHotwordTermInput or nil
+        local status_label = library_items and library_items.GenerateHotwordStatusLabel or nil
+        local item_map, selected_hotword_index = {}, nil
+        local hotword_library_dirty = false
+        if hotword_tree then
+            pcall(function() hotword_tree.ColumnCount = 1 end)
+            pcall(function() hotword_tree.HeaderHidden = true end)
+        end
+
+        local function set_hotword_status(text)
+            if status_label then pcall(function() status_label.Text = tostring(text or "") end) end
+        end
+        local function refresh_hotword_tree()
+            item_map = {}
+            if hotword_tree then pcall(function() hotword_tree:Clear() end) end
+            for index, entry in ipairs(hotword_entries) do
+                local ok_item, item = pcall(function() return hotword_tree:NewItem() end)
+                if ok_item and item then
+                    set_tree_item_text(item, 0, tostring(entry.term))
+                    pcall(function() hotword_tree:AddTopLevelItem(item) end)
+                    item_map[item] = index
+                end
+            end
+            safe_refresh_tree_widget(hotword_tree)
+            refresh_hotword_toggle()
+        end
+        local function append_hotword_tree_entry(index, entry)
+            if not hotword_tree or not entry then return end
+            local ok_item, item = pcall(function() return hotword_tree:NewItem() end)
+            if not ok_item or not item then return end
+            set_tree_item_text(item, 0, tostring(entry.term))
+            pcall(function() hotword_tree:AddTopLevelItem(item) end)
+            item_map[item] = index
+            safe_refresh_tree_widget(hotword_tree)
+        end
+        local function save_hotword_library()
+            if not hotword_library_dirty then return true end
+            if not save_generate_hotword_entries(hotword_entries) then
+                set_hotword_status("保存失败，请检查本机插件支持目录权限")
+                return false
+            end
+            hotword_library_dirty = false
+            return true
+        end
+        function hotword_library_window.On.GenerateHotwordTree.ItemClicked(ev)
+            local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem"}) or get_selected_tree_node(hotword_tree)
+            selected_hotword_index = item and item_map[item] or nil
+        end
+        function hotword_library_window.On.GenerateHotwordAddBtn.Clicked(ev)
+            local term = trim_text(term_input and term_input.Text or "")
+            if term == "" then set_hotword_status("请填写标准词") return end
+            hotword_entries[#hotword_entries + 1] = {term = term, aliases = {}}
+            selected_hotword_index = #hotword_entries
+            hotword_library_dirty = true
+            hotwords_enabled = #hotword_entries > 0
+            append_hotword_tree_entry(selected_hotword_index, hotword_entries[selected_hotword_index])
+            if term_input then pcall(function() term_input.Text = "" end) end
+            refresh_hotword_toggle()
+            set_hotword_status("已添加，点击完成保存")
+        end
+        function hotword_library_window.On.GenerateHotwordDeleteBtn.Clicked(ev)
+            if not selected_hotword_index then set_hotword_status("请先选择要删除的词条") return end
+            table.remove(hotword_entries, selected_hotword_index)
+            selected_hotword_index = nil
+            if term_input then pcall(function() term_input.Text = "" end) end
+            hotword_library_dirty = true
+            hotwords_enabled = #hotword_entries > 0
+            refresh_hotword_tree()
+            set_hotword_status("已删除，点击完成保存")
+        end
+        local function hide_hotword_clear_confirmation()
+            if hotword_clear_confirm_window then
+                pcall(function() hotword_clear_confirm_window:Hide() end)
+            end
+        end
+        local function show_hotword_clear_confirmation()
+            if #hotword_entries == 0 then
+                set_hotword_status("当前没有热词可清空")
+                return
+            end
+            if not hotword_clear_confirm_window then
+                hotword_clear_confirm_window = dispatcher:AddWindow({
+                    ID = "GenerateHotwordClearConfirmWindow",
+                    WindowTitle = "SubFix · 清空热词库",
+                    Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({720, 390, 360, 80}),
+                },
+                ui:VGroup{
+                    Spacing = 10,
+                    ContentsMargins = 14,
+                    ui:Label{Text = "确定清空全部热词吗？此操作无法撤销。", WordWrap = true, Weight = 0},
+                    ui:HGroup{
+                        Weight = 0, Spacing = 8,
+                        MinimumSize = {0, 34},
+                        ui:Button{ID = "GenerateHotwordClearCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}},
+                        ui:Button{ID = "GenerateHotwordClearConfirmBtn", Text = "清空全部", Weight = 1, MinimumSize = {0, 28}}
+                    },
+                    ui:VGap(8, 0)
+                })
+                function hotword_clear_confirm_window.On.GenerateHotwordClearCancelBtn.Clicked(ev)
+                    hide_hotword_clear_confirmation()
+                end
+                function hotword_clear_confirm_window.On.GenerateHotwordClearConfirmBtn.Clicked(ev)
+                    hotword_entries = {}
+                    selected_hotword_index = nil
+                    if term_input then pcall(function() term_input.Text = "" end) end
+                    hotword_library_dirty = true
+                    hotwords_enabled = false
+                    refresh_hotword_tree()
+                    set_hotword_status("已清空，点击完成保存")
+                    hide_hotword_clear_confirmation()
+                end
+                function hotword_clear_confirm_window.On.GenerateHotwordClearConfirmWindow.Close(ev)
+                    hide_hotword_clear_confirmation()
+                end
+            end
+            pcall(function() hotword_clear_confirm_window:Show() end)
+        end
+        function hotword_library_window.On.GenerateHotwordClearBtn.Clicked(ev)
+            show_hotword_clear_confirmation()
+        end
+        local function close_hotword_library()
+            if hotword_library_closing then return end
+            hotword_library_closing = true
+            hide_hotword_clear_confirmation()
+            if not save_hotword_library() then
+                hotword_library_closing = false
+                return
+            end
+            pcall(function() hotword_library_window:Hide() end)
+        end
+        function hotword_library_window.On.GenerateHotwordCloseBtn.Clicked(ev)
+            close_hotword_library()
+        end
+        function hotword_library_window.On.GenerateHotwordLibraryWindow.Close(ev)
+            close_hotword_library()
+        end
+        refresh_hotword_tree()
+        pcall(function() hotword_library_window:Show() end)
+    end
+
+    function selection_window.On.GenerateHotwordToggleBtn.Clicked(ev)
+        if #hotword_entries == 0 then
+            show_hotword_library_dialog()
+            return
+        end
+        hotwords_enabled = not hotwords_enabled
+        refresh_hotword_toggle()
+    end
+    function selection_window.On.GenerateHotwordManageBtn.Clicked(ev)
+        show_hotword_library_dialog()
+    end
+    refresh_hotword_toggle()
 
     -- 豆包密钥配置子窗口：点"豆包（云端）"且未配置密钥时按需弹出。复用父对话框
     -- 已在跑的 dispatcher:RunLoop() 作非模态覆盖，子窗口自身不 RunLoop/ExitLoop，
@@ -2243,6 +2502,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         end
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
+        selected_hotwords_json = hotwords_enabled and resolve_asr_paths().hotwords or nil
         if selected_backend == "auto" then
             local qwen_status = inspect_local_qwen(resolve_asr_paths())
             if not qwen_status.ready then
@@ -2276,9 +2536,11 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     pcall(function() doubao_key_window:Hide() end)
     pcall(function() doubao_reminder_window:Hide() end)
     pcall(function() qwen_download_window:Hide() end)
+    pcall(function() if hotword_library_window then hotword_library_window:Hide() end end)
+    pcall(function() if hotword_clear_confirm_window then hotword_clear_confirm_window:Hide() end end)
 
     if qwen_install_requested then
-        return nil, nil, nil, nil, "__subfix_install_qwen__"
+        return nil, nil, nil, nil, nil, "__subfix_install_qwen__"
     end
 
     if not selected_audio_sources and not dialog_cancelled then
@@ -2289,12 +2551,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     if not selected_audio_sources then
-        return nil, nil, nil, nil, "已取消"
+        return nil, nil, nil, nil, nil, "已取消"
     end
     if #selected_audio_sources == 0 then
-        return nil, nil, nil, nil, "请至少选择一个音频轨道"
+        return nil, nil, nil, nil, nil, "请至少选择一个音频轨道"
     end
-    return selected_audio_sources, subtitle_mode, selected_max_chars, selected_backend, nil
+    return selected_audio_sources, subtitle_mode, selected_max_chars, selected_backend, selected_hotwords_json, nil
 end
 
 local function progress_elapsed_text(started_at)
@@ -2625,7 +2887,7 @@ local function build_asr_helper_command(audio_source, srt_path, json_path, timel
     return table.concat(cmd_parts, " "), nil
 end
 
-local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend)
+local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
     local paths = resolve_asr_paths()
     if not file_exists(paths.helper) then
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
@@ -2633,12 +2895,17 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     subtitle_mode = subtitle_mode == "live" and "live" or "narration"
     -- backend 由生成对话框的"识别模型"选择决定；缺省回退到 DEFAULT_ASR_BACKEND(auto/Qwen 本地)。
     local asr_backend = (type(backend) == "string" and backend ~= "") and backend or DEFAULT_ASR_BACKEND
-    local qwen_status = asr_backend == "auto" and inspect_local_qwen(paths) or nil
+    local qwen_status = inspect_local_qwen(paths)
     local python = paths.python
     if asr_backend == "doubao_asr" then
-        python = paths.runtime_python
-        if not file_exists(python) then
-            return nil, "SubFix 内置 Python 缺失，请重新安装完整 SubFix 测试版"
+        -- 豆包负责转写，但 v4/v5 仍依赖 Qwen 做强制时间对齐。
+        if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
+            python = qwen_status.python
+        else
+            python = paths.runtime_python
+            if not file_exists(python) then
+                return nil, "SubFix 内置 Python 缺失，请重新安装完整 SubFix 测试版"
+            end
         end
     elseif not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
         return nil, "本地 Qwen 尚未安装，请先双击“Qwen（本地）”完成下载安装"
@@ -2650,7 +2917,11 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     if asr_backend == "auto" then
         cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
     end
-    local command_args = {
+    local command_args = {}
+    if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
+        command_args = {"env", "-u", "PYTHONHOME", "-u", "PYTHONPATH"}
+    end
+    local helper_args = {
         shell_quote(python),
         shell_quote(paths.helper),
         "--mode", "generate_subtitles_batch",
@@ -2668,6 +2939,7 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         "--diagnostic-output", shell_quote(paths.diagnostic),
         "--progress-json", shell_quote(progress_path)
     }
+    for _, value in ipairs(helper_args) do command_args[#command_args + 1] = value end
     for _, value in ipairs(command_args) do cmd_parts[#cmd_parts + 1] = value end
     max_chars = tonumber(max_chars) or 25
     cmd_parts[#cmd_parts + 1] = "--max-chars"
@@ -2676,6 +2948,10 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     if profile_path then
         cmd_parts[#cmd_parts + 1] = "--segmentation-profile"
         cmd_parts[#cmd_parts + 1] = shell_quote(profile_path)
+    end
+    if hotwords_json and file_exists(hotwords_json) then
+        cmd_parts[#cmd_parts + 1] = "--hotwords-json"
+        cmd_parts[#cmd_parts + 1] = shell_quote(hotwords_json)
     end
     return table.concat(cmd_parts, " "), nil
 end
@@ -2785,9 +3061,9 @@ local function run_asr_helper_with_progress(audio_source, srt_path, json_path, t
     return true
 end
 
-local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend)
+local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend, hotwords_json)
     local progress_path = json_path .. ".progress.json"
-    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend)
+    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
     if not cmd then return false, cmd_err end
     update_generate_progress_window(
         progress_state,
@@ -3201,11 +3477,12 @@ local function generate_selection_subtitles()
     -- 字幕长度默认标准（≤25字）；识别模型 backend 默认 Qwen 本地（DEFAULT_ASR_BACKEND=="auto"）。
     local max_chars = 25
     local backend = DEFAULT_ASR_BACKEND
+    local hotwords_json = nil
     local selection_err = nil
     -- 始终弹出对话框（含只有 1 个音频候选的情形）：即便只有一条音频轨，用户也需要能
     -- 选择识别模型（Qwen/豆包）与字幕长度，故不再对单候选自动跳过弹窗、直接生成。
     while true do
-        selected_audio_sources, subtitle_mode, max_chars, backend, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
+        selected_audio_sources, subtitle_mode, max_chars, backend, hotwords_json, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
         if selection_err ~= "__subfix_install_qwen__" then break end
         local install_ok, install_err = false, nil
         repeat
@@ -3274,7 +3551,8 @@ local function generate_selection_subtitles()
         #selected_track_sources,
         subtitle_mode,
         max_chars,
-        backend
+        backend,
+        hotwords_json
     )
     while not helper_ok and helper_status ~= "cancelled" and backend == "doubao_asr" and is_doubao_asr_failure(helper_err) do
         -- 进度窗口中的错误文本通常包含 Python 完整日志；隐藏它，改由明确操作的短弹窗呈现。
@@ -3306,7 +3584,8 @@ local function generate_selection_subtitles()
             #selected_track_sources,
             subtitle_mode,
             max_chars,
-            backend
+            backend,
+            hotwords_json
         )
     end
     if not helper_ok then
