@@ -184,9 +184,12 @@ def cleanup_legacy_system_menu(target_root: Path) -> None:
         SYSTEM_UTILITY_ROOT / "SubFix_GenerateSelectionSubtitles.lua",
     )
     try:
-        for legacy_path in legacy_paths:
-            if legacy_path.is_file() or legacy_path.is_symlink():
-                legacy_path.unlink()
+        if menu_directory.is_symlink():
+            menu_directory.unlink()
+        else:
+            for legacy_path in legacy_paths:
+                if legacy_path.is_file() or legacy_path.is_symlink():
+                    legacy_path.unlink()
         if menu_directory.is_dir() and not menu_directory.is_symlink():
             menu_directory.rmdir()
     except OSError:

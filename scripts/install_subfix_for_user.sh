@@ -12,15 +12,22 @@ cleanup_system_subfix_menu() {
   local legacy_path
   # The package payload is staged system-wide so postinstall can run as root,
   # but Resolve scans both system and user script roots. Keep only the user copy.
+  if [[ -L "$SYSTEM_UTILITY/SubFix" ]]; then
+    rm -f -- "$SYSTEM_UTILITY/SubFix"
+  else
+    for legacy_path in \
+      "$SYSTEM_UTILITY/SubFix/SubFix.lua" \
+      "$SYSTEM_UTILITY/SubFix/生成选区字幕.lua" \
+      "$SYSTEM_UTILITY/SubFix/SubFix_GenerateSelectionSubtitles.lua"; do
+      [[ -f "$legacy_path" || -L "$legacy_path" ]] && rm -f -- "$legacy_path"
+    done
+    rmdir "$SYSTEM_UTILITY/SubFix" 2>/dev/null || true
+  fi
   for legacy_path in \
-    "$SYSTEM_UTILITY/SubFix/SubFix.lua" \
-    "$SYSTEM_UTILITY/SubFix/生成选区字幕.lua" \
-    "$SYSTEM_UTILITY/SubFix_GenerateSelectionSubtitles.lua" \
     "$SYSTEM_UTILITY/SubFix.lua" \
     "$SYSTEM_UTILITY/SubFix_GenerateSelectionSubtitles.lua"; do
     [[ -f "$legacy_path" || -L "$legacy_path" ]] && rm -f -- "$legacy_path"
   done
-  rmdir "$SYSTEM_UTILITY/SubFix" 2>/dev/null || true
 }
 
 if [[ ! -x "$RUNTIME_PYTHON" || ! -x "$BUNDLED_FFMPEG" || ! -d "$SYSTEM_UTILITY/SubFix" ]]; then
