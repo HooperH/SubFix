@@ -19,6 +19,7 @@ import zipfile
 REPOSITORY = "HooperH/SubFix"
 RELEASE_API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 USER_UTILITY_ROOT = Path.home() / "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
+SYSTEM_UTILITY_ROOT = Path("/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility")
 MANIFEST_NAME = "subfix-update-manifest.json"
 UPDATE_FILE_PATHS = frozenset(
     {
@@ -171,6 +172,29 @@ def _safe_destination(target_root: Path, relative_path: str) -> Path:
     return parent / PurePosixPath(relative_path).name
 
 
+def cleanup_legacy_system_menu(target_root: Path) -> None:
+    """Remove the previous system-level menu only after a user-level update succeeds."""
+    if target_root != USER_UTILITY_ROOT:
+        return
+    menu_directory = SYSTEM_UTILITY_ROOT / "SubFix"
+    legacy_paths = (
+        menu_directory / "SubFix.lua",
+        menu_directory / "生成选区字幕.lua",
+        SYSTEM_UTILITY_ROOT / "SubFix.lua",
+        SYSTEM_UTILITY_ROOT / "SubFix_GenerateSelectionSubtitles.lua",
+    )
+    try:
+        for legacy_path in legacy_paths:
+            if legacy_path.is_file() or legacy_path.is_symlink():
+                legacy_path.unlink()
+        if menu_directory.is_dir() and not menu_directory.is_symlink():
+            menu_directory.rmdir()
+    except OSError:
+        # A legacy root-owned install may require the corrected .pkg once;
+        # never fail a verified user-level update solely because of that stale copy.
+        return
+
+
 def install_archive(archive_path: Path, expected_sha256: str, version: str, target_root: Path = USER_UTILITY_ROOT) -> None:
     actual_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
     if actual_sha256.lower() != str(expected_sha256).lower():
@@ -199,6 +223,7 @@ def install_archive(archive_path: Path, expected_sha256: str, version: str, targ
                     if relative_path == ".subfix_support/bin/ffmpeg":
                         destination.chmod(0o755)
                     replaced.append(destination)
+                cleanup_legacy_system_menu(target_root)
             except Exception as exc:
                 for destination in reversed(replaced):
                     original = backups[destination]

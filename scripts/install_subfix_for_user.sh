@@ -8,6 +8,21 @@ SYSTEM_SUPPORT="$SYSTEM_UTILITY/.subfix_support"
 RUNTIME_PYTHON="$SYSTEM_SUPPORT/runtime/python/bin/python3"
 BUNDLED_FFMPEG="$SYSTEM_SUPPORT/bin/ffmpeg"
 
+cleanup_system_subfix_menu() {
+  local legacy_path
+  # The package payload is staged system-wide so postinstall can run as root,
+  # but Resolve scans both system and user script roots. Keep only the user copy.
+  for legacy_path in \
+    "$SYSTEM_UTILITY/SubFix/SubFix.lua" \
+    "$SYSTEM_UTILITY/SubFix/生成选区字幕.lua" \
+    "$SYSTEM_UTILITY/SubFix_GenerateSelectionSubtitles.lua" \
+    "$SYSTEM_UTILITY/SubFix.lua" \
+    "$SYSTEM_UTILITY/SubFix_GenerateSelectionSubtitles.lua"; do
+    [[ -f "$legacy_path" || -L "$legacy_path" ]] && rm -f -- "$legacy_path"
+  done
+  rmdir "$SYSTEM_UTILITY/SubFix" 2>/dev/null || true
+}
+
 if [[ ! -x "$RUNTIME_PYTHON" || ! -x "$BUNDLED_FFMPEG" || ! -d "$SYSTEM_UTILITY/SubFix" ]]; then
   echo "SubFix 安装不完整：未找到内置运行时、ffmpeg 或主脚本目录。" >&2
   exit 1
@@ -60,5 +75,7 @@ for support_file in \
   models/qwen3-forced-aligner-0.6b-f16.gguf; do
   [[ -e "$USER_SUPPORT/$support_file" ]] && chown "$CONSOLE_USER":staff "$USER_SUPPORT/$support_file"
 done
+
+cleanup_system_subfix_menu
 
 echo "已部署完整 SubFix 运行时到 $USER_UTILITY（用户：$CONSOLE_USER）。"
