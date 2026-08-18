@@ -28,6 +28,7 @@ cleanup_system_subfix_menu() {
     "$SYSTEM_UTILITY/SubFix_GenerateSelectionSubtitles.lua"; do
     [[ -f "$legacy_path" || -L "$legacy_path" ]] && rm -f -- "$legacy_path"
   done
+  return 0
 }
 
 if [[ ! -x "$RUNTIME_PYTHON" || ! -x "$BUNDLED_FFMPEG" || ! -d "$SYSTEM_UTILITY/SubFix" ]]; then
