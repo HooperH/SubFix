@@ -4119,15 +4119,14 @@ def _doubao_asr_timestamp_payload(result: Any) -> tuple[list[dict[str, Any]], li
                 word = {"word": text, "start": word_start, "end": word_end}
                 segment_words.append(word)
                 words.append(word)
-        if segment_words:
-            segments.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "text": str(utterance.get("text") or "").strip(),
-                    "words": segment_words,
-                }
-            )
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "text": str(utterance.get("text") or "").strip(),
+                "words": segment_words,
+            }
+        )
     return segments, words
 
 
@@ -4135,8 +4134,9 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     """Transcribe via Volcano Engine (豆包) 录音文件极速版识别 HTTP API.
 
     Word timestamps are normalized from the API's milliseconds to seconds.
-    The v4/v5 pipeline validates them before use and falls back to Qwen forced
-    alignment only when they are missing or unreliable.
+    The v4/v5 pipeline validates them before use and uses a deterministic local
+    time mapping when they are missing or unreliable. Selecting 豆包 never
+    requires the Qwen runtime.
 
     Configuration uses one API Key only. Legacy App ID / Access Token files
     are intentionally ignored so an empty API Key can never spend cloud quota.
@@ -4170,7 +4170,7 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     body = {
         "user": {"uid": api_key},
         "audio": {"data": base64.b64encode(audio_bytes).decode("ascii")},
-        "request": {"model_name": "bigmodel"},
+        "request": {"model_name": "bigmodel", "show_utterances": True},
     }
     headers = {
         "Content-Type": "application/json",
@@ -4561,6 +4561,51 @@ def transcribe_with_backend(
         return payload
 
     raise RuntimeError("ASR backend 全部不可用: " + "；".join(fallback_errors))
+
+
+DOUBAO_ASR_BACKENDS = frozenset({"doubao_asr", "doubao_asr_v2"})
+
+
+def transcribe_v4_retry_audio(
+    audio_path: Path,
+    model: str,
+    language: str | None,
+    *,
+    backend: str,
+    hotword_context: str = "",
+) -> dict[str, Any]:
+    """Retry a v4/v5 window with the backend explicitly selected by the user."""
+    if backend == "doubao_asr":
+        return transcribe_doubao_asr(audio_path, model, language)
+    if backend == "doubao_asr_v2":
+        return transcribe_doubao_asr_v2(audio_path, model, language)
+    return (
+        transcribe_qwen3_asr(audio_path, model, language, context=hotword_context)
+        if hotword_context
+        else transcribe_qwen3_asr(audio_path, model, language)
+    )
+
+
+def align_v4_retry_audio(
+    audio_path: Path,
+    text: str,
+    language: str,
+    *,
+    backend: str,
+) -> list[dict[str, Any]]:
+    """Provide fallback timestamps without crossing ASR backend boundaries."""
+    if backend not in DOUBAO_ASR_BACKENDS:
+        return qwen3_force_align_items(audio_path, text, language)
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return []
+    return [
+        {
+            "text": clean_text,
+            "start": 0.0,
+            "end": max(0.001, audio_duration_seconds(audio_path)),
+        }
+    ]
 
 
 def should_try_qwen_batch_backend(backend: str) -> bool:
@@ -5260,8 +5305,8 @@ def run_generate_subtitles_batch_plan_v4(
     # Progress label for the per-window transcription step. It reflects the
     # requested ASR backend (识别模型) so the progress window doesn't always
     # read "Qwen" even when the user picked 豆包. Actual dispatch happens in
-    # transcribe_v4_window_batch; forced alignment further downstream is still
-    # Qwen is used only when the selected ASR has no reliable timestamps.
+    # transcribe_v4_window_batch; recovery and alignment keep using the same
+    # explicitly selected backend.
     backend_label = str(getattr(args, "backend", "auto") or "auto")
     asr_label = (
         "豆包 2.0" if backend_label == "doubao_asr_v2"
@@ -5279,6 +5324,20 @@ def run_generate_subtitles_batch_plan_v4(
     hotword_entries = configured_hotword_entries[:HOTWORD_MAX_ENTRIES]
     hotword_context = build_hotword_context(hotword_entries)
     args.hotword_context = hotword_context
+    uses_doubao_backend = backend_label in DOUBAO_ASR_BACKENDS
+    retry_transcribe_fn = lambda audio_path, model_name, language_name: transcribe_v4_retry_audio(
+        audio_path,
+        model_name,
+        language_name,
+        backend=backend_label,
+        hotword_context=hotword_context,
+    )
+    retry_align_fn = lambda audio_path, text, language: align_v4_retry_audio(
+        audio_path,
+        text,
+        language,
+        backend=backend_label,
+    )
     ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
     diagnostic: dict[str, Any] = {
         "mode": "generate_subtitles_batch",
@@ -5483,19 +5542,7 @@ def run_generate_subtitles_batch_plan_v4(
                     retry_dir=tmp_path / "asr_recovery",
                     model=args.model,
                     language=args.language,
-                    transcribe_fn=(
-                        (
-                            lambda audio_path, model_name, language_name: transcribe_qwen3_asr(
-                                audio_path, model_name, language_name, context=hotword_context
-                            )
-                        )
-                        if hotword_context
-                        else (
-                            lambda audio_path, model_name, language_name: transcribe_qwen3_asr(
-                                audio_path, model_name, language_name
-                            )
-                        )
-                    ),
+                    transcribe_fn=retry_transcribe_fn,
                 )
             except generate_v4.V4AlignmentError:
                 diagnostic["asr_unrecovered_window_count"] += 1
@@ -5546,9 +5593,7 @@ def run_generate_subtitles_batch_plan_v4(
                     int(region["end_frame"]),
                     float(track["fps"]),
                 )
-                retry_payload = transcribe_qwen3_asr(
-                    retry_path, args.model, args.language, context=hotword_context
-                )
+                retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
                 diagnostic["local_retry_elapsed_seconds"] += time.monotonic() - local_retry_started_at
                 write_progress(
                     progress_path,
@@ -5626,13 +5671,13 @@ def run_generate_subtitles_batch_plan_v4(
         alignment_retry_regions: list[dict[str, Any]] = []
         for align_index, (window, raw_payload) in enumerate(zip(windows, raw_payloads), start=1):
             has_doubao_words = (
-                str(raw_payload.get("backend") or "") == "doubao_asr"
+                str(raw_payload.get("backend") or "") in DOUBAO_ASR_BACKENDS
                 and any(bool(segment.get("words")) for segment in raw_payload.get("segments") or [] if isinstance(segment, dict))
             )
             write_progress(
                 progress_path,
                 "align_subtitle_batch",
-                f"{engine_label} {'豆包时间戳校验' if has_doubao_words else 'Forced Alignment'} {align_index}/{len(windows)}",
+                f"{engine_label} {'豆包时间轴整理' if uses_doubao_backend else 'Forced Alignment'} {align_index}/{len(windows)}",
                 batch_index=align_index,
                 total_batches=len(windows),
                 progress_index=v4_progress_point(65, 85, align_index - 1, len(windows)),
@@ -5678,7 +5723,7 @@ def run_generate_subtitles_batch_plan_v4(
                     adjacent_window=adjacent_window,
                     adjacent_payload=adjacent_payload,
                     merged_audio_path=merged_audio_path,
-                    align_fn=qwen3_force_align_items,
+                    align_fn=retry_align_fn,
                     language=align_language,
                     fps=float(window["fps"]),
                 )
@@ -5836,13 +5881,11 @@ def run_generate_subtitles_batch_plan_v4(
                     float(track["fps"]),
                 )
                 try:
-                    retry_payload = transcribe_qwen3_asr(
-                        retry_path, args.model, args.language, context=hotword_context
-                    )
+                    retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
                     retry_units, retry_align_diagnostic = generate_v4.require_aligned_units(
                         retry_path,
                         retry_payload,
-                        qwen3_force_align_items,
+                        retry_align_fn,
                         align_language,
                         float(track["fps"]),
                         int(region["start_frame"]),

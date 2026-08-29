@@ -685,11 +685,22 @@ def stitch_track_window_units(
 
 def _timestamp_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
+    is_doubao = str(payload.get("backend") or "") in {"doubao_asr", "doubao_asr_v2"}
     for segment in payload.get("segments") or []:
+        segment_items: list[dict[str, Any]] = []
         for word in segment.get("words") or []:
             text = str(word.get("word") or word.get("text") or "")
             if text and word.get("start") is not None and word.get("end") is not None:
-                items.append({"text": text, "start": float(word["start"]), "end": float(word["end"])})
+                segment_items.append(
+                    {"text": text, "start": float(word["start"]), "end": float(word["end"])}
+                )
+        items.extend(segment_items)
+        if is_doubao and not segment_items:
+            text = str(segment.get("text") or "")
+            if text and segment.get("start") is not None and segment.get("end") is not None:
+                items.append(
+                    {"text": text, "start": float(segment["start"]), "end": float(segment["end"])}
+                )
     return items
 
 
