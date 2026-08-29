@@ -12,7 +12,7 @@ import re
 import statistics
 import wave
 from array import array
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -182,6 +182,85 @@ def normalize_text(text: Any) -> str:
     return re.sub(r"[\s\-_—–，。！？、；：,.!?;:\"'“”‘’（）()《》【】\[\]{}<>…·/\\|]+", "", str(text or "").lower())
 
 
+def _is_ascii_word_char(value: str) -> bool:
+    return len(value) == 1 and value.isascii() and value.isalnum()
+
+
+def annotate_original_word_boundaries(
+    units: list[dict[str, Any]],
+    raw_text: str,
+) -> list[dict[str, Any]]:
+    output = [dict(unit) for unit in units or []]
+    for unit in output:
+        unit.pop("space_before", None)
+    expected = normalize_text(raw_text)
+    actual = "".join(normalize_text(unit.get("text")) for unit in output)
+    if not expected or actual != expected or len(output) != len(expected):
+        return output
+
+    boundaries: set[int] = set()
+    normalized_index = 0
+    previous_char = ""
+    whitespace_pending = False
+    for raw_char in str(raw_text or ""):
+        normalized_piece = normalize_text(raw_char)
+        if not normalized_piece:
+            if raw_char.isspace():
+                whitespace_pending = True
+            continue
+        for normalized_char in normalized_piece:
+            if (
+                whitespace_pending
+                and _is_ascii_word_char(previous_char)
+                and _is_ascii_word_char(normalized_char)
+            ):
+                boundaries.add(normalized_index)
+            previous_char = normalized_char
+            normalized_index += 1
+            whitespace_pending = False
+
+    for boundary in boundaries:
+        output[boundary]["space_before"] = True
+    return output
+
+
+def propagate_original_word_boundaries(
+    candidates: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    output = [dict(unit) for unit in selected or []]
+    boundary_events: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for unit in candidates or []:
+        if unit.get("space_before") is not True:
+            continue
+        boundary_events[int(unit.get("track_index") or 0)].append(
+            (int(unit.get("start_frame") or 0), int(unit.get("end_frame") or 0))
+        )
+    for track_index, events in boundary_events.items():
+        boundary_events[track_index] = sorted(set(events))
+
+    previous_end_by_track: dict[int, int] = {}
+    event_cursor_by_track: dict[int, int] = defaultdict(int)
+    for unit in output:
+        track_index = int(unit.get("track_index") or 0)
+        current_start = int(unit.get("start_frame") or 0)
+        lower_bound = previous_end_by_track.get(track_index, current_start)
+        events = boundary_events.get(track_index, [])
+        event_cursor = event_cursor_by_track[track_index]
+        while event_cursor < len(events) and events[event_cursor][1] < lower_bound:
+            event_cursor += 1
+        crossed_boundary = False
+        while event_cursor < len(events) and events[event_cursor][1] <= current_start:
+            if events[event_cursor][0] >= lower_bound:
+                crossed_boundary = True
+            event_cursor += 1
+        event_cursor_by_track[track_index] = event_cursor
+        if crossed_boundary:
+            unit["space_before"] = True
+        previous_end_by_track[track_index] = int(unit.get("end_frame") or current_start)
+    return output
+
+
 def _read_mono_pcm16(path: Path) -> tuple[int, array]:
     with wave.open(str(path), "rb") as handle:
         if handle.getnchannels() != 1 or handle.getsampwidth() != 2:
@@ -237,19 +316,14 @@ def compose_track_audio(
         expected_frames = int(item["timeline_end_frame"]) - int(item.get("timeline_start_frame") or 0)
         actual_frames = int(round(sample_count / sample_rate * fps))
         tolerance = max(2, int(math.ceil(max(1, expected_frames) * 0.01)))
-        tail_silence_seconds = float(item.get("source_audio_tail_silence_seconds") or 0.0)
-        truncated_source_tail = (
-            item.get("source_audio_tail_truncated") is True
-            and tail_silence_seconds > 0
-            and actual_frames < expected_frames
-        )
-        if expected_frames <= 0 or (
-            abs(actual_frames - expected_frames) > tolerance and not truncated_source_tail
-        ):
-            raise ValueError(f"v4 音频时长与时间线跨度不一致，暂不支持重定时片段: {path.name}")
-        if truncated_source_tail:
+        if expected_frames <= 0:
+            raise ValueError(f"v4 时间线音频片段跨度无效: {path.name}")
+        if actual_frames - expected_frames > tolerance:
+            raise ValueError(f"v4 音频时长超过时间线跨度，暂不支持重定时片段: {path.name}")
+        if expected_frames - actual_frames > tolerance:
+            # Resolve can keep the timeline span after ffmpeg reaches source EOF; preserve that span with silence.
             source_audio_tail_truncated_count += 1
-            source_audio_tail_silence_seconds += tail_silence_seconds
+            source_audio_tail_silence_seconds += (expected_frames - actual_frames) / fps
     timeline_end = max(
         int(item["timeline_end_frame"])
         if item.get("timeline_end_frame") is not None
@@ -838,6 +912,7 @@ def require_aligned_units(
             f"字符={len(units)}, 跨度={aligned_span}帧, 同帧最多={maximum_observed_same_start}"
         )
     units = annotate_asr_punctuation(units, str(payload.get("text") or ""))
+    units = annotate_original_word_boundaries(units, str(payload.get("text") or ""))
     return units, {
         "forced_align_retry_count": retry_count,
         "aligned_unit_count": len(units),
@@ -2506,7 +2581,8 @@ def protect_word_boundaries(
         )
 
     full_text = "".join(entry["text"] for entry in entries)
-    word_bounds = _word_boundary_positions(full_text, tokenizer)
+    entry_units = [unit for entry in entries for unit in entry["units"]]
+    word_bounds = _unit_word_boundary_positions(entry_units, tokenizer)
 
     protected_count = 0
     running = 0
@@ -2571,15 +2647,18 @@ def _hard_cut_boundaries(
     max_chars: int,
     tokenizer: Callable[[str], list[str]] | None = None,
 ) -> list[int]:
-    """Choose unit-index boundaries splitting ``row_units`` into runs of at
-    most ``max_chars`` characters each.
+    """Choose unit-index boundaries splitting ``row_units`` near ``max_chars``.
+
+    A single word may exceed the limit because preserving a whole English
+    word takes precedence over the cap.
 
     Returns a sorted list of indices into ``row_units`` (each in
     ``1..len(row_units) - 1``); ``row_units[:boundary]`` /
     ``row_units[boundary:]`` marks a cut. Within the character window that
     must be cut to respect ``max_chars``, a boundary right after an ASR
     punctuation mark or the widest inter-unit time gap is preferred (the
-    least jarring place to break); failing that, a word boundary (per
+    least jarring place to break), but only when it is also a word boundary.
+    Failing that, a word boundary (per
     ``tokenizer`` / WORD_DICTIONARY -- see protect_word_boundaries) closest
     to the limit is preferred over cutting through a word; when neither
     exists in that window the cut lands exactly at the ``max_chars``
@@ -2592,8 +2671,7 @@ def _hard_cut_boundaries(
     for length in lengths:
         prefix.append(prefix[-1] + length)
     total = prefix[-1]
-    row_text = "".join(str(unit.get("text") or "") for unit in row_units)
-    word_bounds = _word_boundary_positions(row_text, tokenizer)
+    word_bounds = _unit_word_boundary_positions(row_units, tokenizer)
     boundaries: list[int] = []
     start_prefix = 0
     unit_count = len(row_units)
@@ -2606,6 +2684,8 @@ def _hard_cut_boundaries(
                 continue
             if prefix[index] > forced_limit:
                 break
+            if prefix[index] not in word_bounds:
+                continue
             left_unit = row_units[index - 1]
             right_unit = row_units[index]
             punctuation = 1 if (
@@ -2628,12 +2708,20 @@ def _hard_cut_boundaries(
             if word_safe_candidates:
                 chosen = max(word_safe_candidates)
             else:
-                chosen = None
-                for index in range(1, unit_count):
-                    if prefix[index] <= forced_limit:
-                        chosen = index
-                    else:
-                        break
+                next_word_safe_candidates = [
+                    index
+                    for index in range(1, unit_count)
+                    if prefix[index] > forced_limit
+                    and prefix[index] > start_prefix
+                    and prefix[index] in word_bounds
+                ]
+                chosen = min(next_word_safe_candidates) if next_word_safe_candidates else None
+                if chosen is None:
+                    for index in range(1, unit_count):
+                        if prefix[index] <= forced_limit:
+                            chosen = index
+                        else:
+                            break
                 if chosen is None:
                     # A single canonical unit's own text already exceeds
                     # max_chars: there is no finer per-character time to
@@ -2655,15 +2743,16 @@ def enforce_hard_char_limit(
     max_chars: int | None,
     tokenizer: Callable[[str], list[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Hard-cap every row's character count at ``max_chars`` (post-processing).
+    """Cap rows near ``max_chars`` without cutting through English words.
 
     功能: 短视频档硬性字数上限强制切. ``segment_canonical_units``'s DP
     boundary scoring treats ``max_chars`` as a *soft* target: a long,
     pause-free clause can still score higher unsplit than split (the split
     penalty outweighs the length preference), so a handful of rows can land
     above the requested cap. This pass is a deterministic backstop that
-    forces every row down to ``max_chars`` characters, no matter what the DP
-    decided.
+    forces long rows toward ``max_chars`` characters. A single English word
+    may exceed the limit because word integrity takes precedence over a
+    strict character cap.
 
     Only takes effect when ``max_chars`` is not ``None`` — with no cap
     requested (the pre-existing default), this returns ``rows`` unchanged
@@ -2742,6 +2831,69 @@ def enforce_hard_char_limit(
     for index, row in enumerate(output, start=1):
         row["index"] = index
     return output, split_count
+
+
+def _unit_word_boundary_positions(
+    units: list[dict[str, Any]],
+    tokenizer: Callable[[str], list[str]] | None = None,
+) -> frozenset[int]:
+    ordered = [dict(unit) for unit in units or []]
+    text = "".join(str(unit.get("text") or "") for unit in ordered)
+    positions = set(_word_boundary_positions(text, tokenizer))
+    cursor = 0
+    for index in range(1, len(ordered)):
+        left_text = str(ordered[index - 1].get("text") or "")
+        right_text = str(ordered[index].get("text") or "")
+        cursor += len(left_text)
+        left_char = left_text[-1:] if left_text else ""
+        right_char = right_text[:1] if right_text else ""
+        if not (_is_ascii_word_char(left_char) and _is_ascii_word_char(right_char)):
+            continue
+        if ordered[index].get("space_before") is True:
+            positions.add(cursor)
+        else:
+            positions.discard(cursor)
+    return frozenset(positions)
+
+
+def restore_display_spacing(
+    rows: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ordered_units = sorted(
+        [dict(unit) for unit in units or []],
+        key=lambda unit: (int(unit.get("start_frame") or 0), int(unit.get("end_frame") or 0)),
+    )
+    output: list[dict[str, Any]] = []
+    cursor = 0
+    for raw_row in rows or []:
+        row = dict(raw_row)
+        target_length = len(normalize_text(row.get("text")))
+        row_units: list[dict[str, Any]] = []
+        consumed = 0
+        while consumed < target_length and cursor < len(ordered_units):
+            candidate = ordered_units[cursor]
+            row_units.append(candidate)
+            consumed += len(normalize_text(candidate.get("text"))) or 1
+            cursor += 1
+        pieces: list[str] = []
+        previous_char = ""
+        for unit in row_units:
+            unit_text = str(unit.get("text") or "")
+            current_char = unit_text[:1]
+            if (
+                pieces
+                and unit.get("space_before") is True
+                and _is_ascii_word_char(previous_char)
+                and _is_ascii_word_char(current_char)
+            ):
+                pieces.append(" ")
+            pieces.append(unit_text)
+            previous_char = unit_text[-1:] if unit_text else previous_char
+        if row_units:
+            row["text"] = "".join(pieces)
+        output.append(row)
+    return output
 
 
 def extend_subtitle_row_tails(

@@ -25,10 +25,41 @@ DYLIBS=("$SOURCE_BUILD"/*.dylib)
 cp "${DYLIBS[@]}" "$STAGING/"
 chmod 755 "$STAGING/qwen3-asr-cli"
 
+list_rpaths() {
+  otool -l "$1" | awk '
+    $1 == "cmd" && $2 == "LC_RPATH" { need_path = 1; next }
+    need_path && $1 == "path" {
+      line = $0
+      sub(/^[[:space:]]*path[[:space:]]+/, "", line)
+      sub(/[[:space:]]+\(offset[[:space:]][0-9]+\)$/, "", line)
+      print line
+      need_path = 0
+    }
+  '
+}
+
+for binary in "$STAGING/qwen3-asr-cli" "$STAGING"/*.dylib; do
+  [[ -L "$binary" ]] && continue
+  while IFS= read -r rpath; do
+    case "$rpath" in
+      /*) install_name_tool -delete_rpath "$rpath" "$binary" ;;
+    esac
+  done < <(list_rpaths "$binary")
+done
+
+if ! list_rpaths "$STAGING/qwen3-asr-cli" | grep -Fxq '@executable_path'; then
+  install_name_tool -add_rpath '@executable_path' "$STAGING/qwen3-asr-cli"
+fi
+
 for binary in "$STAGING/qwen3-asr-cli" "$STAGING"/*.dylib; do
   file "$binary" | grep -q arm64 || { echo "non-arm64 binary: $binary" >&2; exit 1; }
   otool -L "$binary" | tail -n +2 | grep -q '/Users/' && { echo "developer-local dylib path: $binary" >&2; exit 1; }
+  list_rpaths "$binary" | grep -q '^/' && { echo "absolute rpath: $binary" >&2; exit 1; }
 done
+list_rpaths "$STAGING/qwen3-asr-cli" | grep -Fxq '@executable_path' \
+  || { echo "missing @executable_path rpath" >&2; exit 1; }
+"$STAGING/qwen3-asr-cli" --help >/dev/null 2>&1 \
+  || { echo "qwen3-asr-cli failed to launch from staged runtime" >&2; exit 1; }
 
 rm -rf "$DEST_BIN"
 mv "$STAGING" "$DEST_BIN"

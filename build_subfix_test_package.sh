@@ -37,6 +37,7 @@ for required in \
   "$SCRIPT_DIR/.subfix_support/subfix_generate_selection_core.lua" \
   "$SCRIPT_DIR/.subfix_support/subfix_update.py" \
   "$SCRIPT_DIR/.subfix_support/subfix_qwen_local_manager.py" \
+  "$SCRIPT_DIR/.subfix_support/subfix_process_group.py" \
   "$SCRIPT_DIR/subfix_asr_transcribe.py" \
   "$SCRIPT_DIR/subfix_generate_v4.py" \
   "$SCRIPT_DIR/subfix_generate_v5.py" \
@@ -69,7 +70,7 @@ mkdir -p "$SUPPORT_PAYLOAD" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix" "$PKG_SCRIPTS_DI
 
 cp "$SCRIPT_DIR/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua"
 cp "$SCRIPT_DIR/生成选区字幕.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua"
-for helper in subfix_generate_selection_core.lua subfix_update.py subfix_qwen_local_manager.py segmentation_profile.json segmentation_profile_v3.json segmentation_profile_v4.json; do
+for helper in subfix_generate_selection_core.lua subfix_update.py subfix_qwen_local_manager.py subfix_process_group.py segmentation_profile.json segmentation_profile_v3.json segmentation_profile_v4.json; do
   cp "$SCRIPT_DIR/.subfix_support/$helper" "$SUPPORT_PAYLOAD/$helper"
 done
 for helper in subfix_asr_transcribe.py subfix_generate_v4.py subfix_generate_v5.py subfix_generate_textnorm.py setup_asr_env.sh; do
@@ -87,7 +88,7 @@ cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$RELEASE_DIR/第三方许可/FFmpeg-
 cp "$FFMPEG_STAGE_DIR/FFmpeg-BUILD-INFO.txt" "$RELEASE_DIR/第三方许可/FFmpeg-BUILD-INFO.txt"
 cp "$FFMPEG_STAGE_DIR/ffmpeg-9.0.tar.xz" "$RELEASE_DIR/第三方许可/ffmpeg-9.0.tar.xz"
 chmod 755 "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua" \
-  "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli" "$SUPPORT_PAYLOAD/bin/ffmpeg"
+  "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/subfix_process_group.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli" "$SUPPORT_PAYLOAD/bin/ffmpeg"
 
 cat > "$PKG_SCRIPTS_DIR/preinstall" <<'EOF'
 #!/bin/bash

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -24,8 +26,10 @@ QWEN_ASR_REQUIRED_MODEL_FILES = (
 )
 MODEL_DOWNLOAD_ETA_MIN_ELAPSED_SECONDS = 10
 MODEL_DOWNLOAD_ETA_MIN_DOWNLOADED_BYTES = 8 * 1024 * 1024
+MODEL_DOWNLOAD_MIN_VISIBLE_FRACTION = 0.005
 COMMAND_HEARTBEAT_INTERVAL_SECONDS = 1
 COMMAND_ERROR_TAIL_MAX_CHARS = 1200
+INSTALL_IN_PROGRESS_MESSAGE = "本地 Qwen 正在安装或下载模型，请勿重复启动"
 ProgressReporter = Callable[..., None]
 
 
@@ -66,6 +70,28 @@ class SubFixQwenPaths:
     @property
     def install_log(self) -> Path:
         return self.data_root / "logs" / "qwen-local-install.log"
+
+    @property
+    def install_lock(self) -> Path:
+        return self.data_root / "locks" / "qwen-local-install.lock"
+
+
+@contextmanager
+def exclusive_install_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(INSTALL_IN_PROGRESS_MESSAGE) from exc
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def python_can_import_qwen_asr(python: Path) -> bool:
@@ -336,7 +362,9 @@ def report_model_download_progress(
         current_at = time.monotonic()
         current_bytes = directory_size_bytes(model_dir)
         details: dict[str, object] = {}
-        if total_bytes is not None:
+        # Resolve rounds the displayed percentage, so wait until this can render
+        # as at least 1% instead of switching from the marquee to a visible 0%.
+        if total_bytes is not None and current_bytes / total_bytes >= MODEL_DOWNLOAD_MIN_VISIBLE_FRACTION:
             details["progress_index"] = min(current_bytes, total_bytes)
             details["progress_total"] = total_bytes
             eta_seconds = model_download_eta_seconds(
@@ -348,7 +376,10 @@ def report_model_download_progress(
             )
             if eta_seconds is not None:
                 details["eta_seconds"] = eta_seconds
-        report("下载模型", "正在下载 Qwen3-ASR-1.7B", **details)
+        if details:
+            report("下载模型", "正在下载 Qwen3-ASR-1.7B", **details)
+        else:
+            report("连接模型仓库", "正在连接 Qwen3-ASR-1.7B")
         stop_event.wait(1)
 
 
@@ -454,7 +485,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         if args.action == "install":
-            payload = install(paths, make_progress_reporter(args.progress_json))
+            with exclusive_install_lock(paths.install_lock):
+                payload = install(paths, make_progress_reporter(args.progress_json))
         else:
             payload = inspect_install(paths)
     except Exception as exc:

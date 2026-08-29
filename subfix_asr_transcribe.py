@@ -106,13 +106,19 @@ generate_textnorm = _LazyGenerateTextnorm()
 DEFAULT_MODEL = "small"
 DEFAULT_CTC_MODEL = "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn"
 HELPER_VERSION = "subfix-2026-07-13-candidate-arbitration-v5"
-TRANSCRIBE_BACKENDS = ("mimo_asr", "qwen3_asr", "mlx_whisper", "openai_whisper", "doubao_asr")
-# doubao_asr is a paid, credential-gated backend (Volcano Engine). It must
-# never be silently invoked by the "auto" fallback chain -- default behavior
-# stays exactly as before (auto -> qwen3 first). Only an explicit
-# `--backend doubao_asr` CLI flag enables it (Lua UI still always passes
-# "auto" this round; see transcribe_with_backend below).
-AUTO_TRANSCRIBE_BACKENDS = tuple(name for name in TRANSCRIBE_BACKENDS if name != "doubao_asr")
+TRANSCRIBE_BACKENDS = (
+    "mimo_asr",
+    "qwen3_asr",
+    "mlx_whisper",
+    "openai_whisper",
+    "doubao_asr",
+    "doubao_asr_v2",
+)
+# 豆包后端均为付费、凭据门控路径，绝不进入 "auto" 回退链；默认行为仍是
+# auto -> qwen3。只有显式 CLI/UI 选择才会调用任一豆包规格。
+AUTO_TRANSCRIBE_BACKENDS = tuple(
+    name for name in TRANSCRIBE_BACKENDS if name not in {"doubao_asr", "doubao_asr_v2"}
+)
 # NOTE: GENERATED_SUBTITLE_MAX_CHARS and friends below drive the legacy v3
 # rule-based splitter (split_generated_subtitle_text/_clause,
 # generate_subtitle_rows_from_segments). The user-facing "字幕长度"
@@ -197,6 +203,18 @@ DOUBAO_ASR_RETRY_BACKOFF_SECONDS = 0.5
 # code/message 字段（区别于旧版录音文件标准版接口）。
 DOUBAO_ASR_SUCCESS_STATUS_CODE = "20000000"
 DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE = "20000003"
+# 豆包录音文件识别模型 2.0 标准版使用异步 submit/query 协议。它与上方极速版
+# 共用单 API Key，但不能复用同步 endpoint 或 resource id。
+DOUBAO_ASR_V2_SUBMIT_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
+DOUBAO_ASR_V2_QUERY_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+DOUBAO_ASR_V2_RESOURCE_ID = "volc.seedasr.auc"
+# 20000001/2 表示处理中/排队中，20000003 表示已完成但未检测到人声。
+DOUBAO_ASR_V2_NON_ERROR_STATUS_CODES = frozenset(
+    {DOUBAO_ASR_SUCCESS_STATUS_CODE, "20000001", "20000002", DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE}
+)
+DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS = 60
+DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS = 0.5
+DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS = 2.0
 QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 QWEN3_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN3_CPP_BIN_ENV = "SUBFIX_QWEN3_ASR_CPP_BIN"
@@ -333,12 +351,23 @@ def write_payload(path: Path, payload: dict[str, Any]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def build_generate_writeback_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("ok") is False:
+        return {"ok": False, "error": str(payload.get("error") or "ASR helper 执行失败")}
+    return {
+        "ok": True,
+        "subtitle_rows": list(payload.get("subtitle_rows") or []),
+    }
+
+
 def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, Any]:
     diagnostic_keys = {
+        "requested_mode",
         "subtitle_mode",
         "live_engine",
         "source_batch_count",
         "batch_count",
+        "batch_max_seconds",
         "successful_batch_count",
         "failed_batch_count",
         "generated_subtitle_count",
@@ -435,6 +464,10 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "doubao_fallback_count",
         "doubao_native_timestamp_window_count",
         "doubao_native_timestamp_fallback_count",
+        "adaptive_fast_unit_count",
+        "adaptive_full_unit_count",
+        "adaptive_full_region_count",
+        "adaptive_selection_elapsed_seconds",
         "doubao_fallback_errors",
         "doubao_log_ids",
         "doubao_resource_ids",
@@ -4196,6 +4229,178 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
     raise RuntimeError(str(last_error) if last_error else "豆包 ASR 请求失败: 未知错误")
 
 
+def _doubao_asr_api_key() -> str:
+    api_key = str(os.getenv(DOUBAO_ASR_API_KEY_ENV) or "").strip()
+    if not api_key:
+        api_key = str(_load_doubao_credentials_file().get("api_key") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "豆包 ASR 未配置密钥：请设置环境变量 "
+            f"{DOUBAO_ASR_API_KEY_ENV}，"
+            f"或在 {_doubao_credentials_path()} 写入 "
+            '{"api_key": "..."} 后重试'
+        )
+    return api_key
+
+
+def _doubao_asr_v2_response_fields(response_payload: dict[str, Any], status_code: str) -> tuple[str, dict[str, Any]]:
+    """Accept both the raw HTTP body and the documentation's body envelope."""
+    body = response_payload.get("body")
+    if not isinstance(body, dict):
+        body = response_payload
+    headers = response_payload.get("headers")
+    if isinstance(headers, dict):
+        status_code = status_code or str(headers.get("X-Api-Status-Code") or "")
+    status_code = status_code or str(body.get("X-Api-Status-Code") or "")
+    return status_code, body
+
+
+def _doubao_asr_v2_post(
+    endpoint: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    stage: str,
+) -> tuple[str, dict[str, Any], str]:
+    try:
+        status_code, response_text, log_id = _doubao_asr_request_once(
+            endpoint,
+            headers,
+            json.dumps(body).encode("utf-8"),
+            DOUBAO_ASR_TIMEOUT_SECONDS,
+        )
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        try:
+            error_payload = json.loads(error_body) if error_body else {}
+        except json.JSONDecodeError:
+            error_payload = {}
+        error_header = error_payload.get("header") if isinstance(error_payload, dict) else None
+        if not isinstance(error_header, dict):
+            error_header = {}
+        if exc.code == 403 and str(error_header.get("code") or "") == "45000030":
+            request_id = str(error_header.get("reqid") or "").strip()
+            request_hint = f"；请求 ID：{request_id}" if request_id else ""
+            raise RuntimeError(
+                f"豆包标准版{stage}未获授权：当前 API Key 所属项目未开通"
+                f"录音文件识别模型 2.0（{DOUBAO_ASR_V2_RESOURCE_ID}）。"
+                f"请在同一项目开通服务，并重新复制该项目的 API Key{request_hint}"
+            ) from exc
+        raise RuntimeError(f"豆包标准版{stage} HTTP {exc.code}: {exc.reason}; {error_body[:500]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"豆包标准版{stage}失败（网络/超时）: {exc}") from exc
+    try:
+        response_payload = json.loads(response_text) if response_text else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"豆包标准版{stage}响应不是合法 JSON: {exc}") from exc
+    if not isinstance(response_payload, dict):
+        raise RuntimeError(f"豆包标准版{stage}响应 JSON 必须是对象")
+    return (*_doubao_asr_v2_response_fields(response_payload, status_code), log_id)
+
+
+def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
+    """Transcribe through 豆包录音文件识别模型 2.0 标准版's async API."""
+    api_key = _doubao_asr_api_key()
+    audio_bytes = Path(audio_path).read_bytes()
+    if not audio_bytes:
+        raise RuntimeError(f"豆包 ASR 音频文件为空: {audio_path}")
+
+    submit_request_id = str(uuid.uuid4())
+    submit_headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": DOUBAO_ASR_V2_RESOURCE_ID,
+        "X-Api-Request-Id": submit_request_id,
+        "X-Api-Sequence": "-1",
+    }
+    submit_body = {
+        "audio": {
+            "data": base64.b64encode(audio_bytes).decode("ascii"),
+            "format": "wav",
+            "codec": "raw",
+            "rate": 16000,
+            "bits": 16,
+            "channel": 1,
+        },
+        "request": {
+            "model_name": "bigmodel",
+            "show_utterances": True,
+            "enable_punc": True,
+            "enable_itn": False,
+            "enable_ddc": False,
+            "enable_speaker_info": False,
+            "enable_channel_split": False,
+        },
+    }
+    submit_status, submit_payload, submit_log_id = _doubao_asr_v2_post(
+        DOUBAO_ASR_V2_SUBMIT_ENDPOINT,
+        submit_headers,
+        submit_body,
+        "任务提交",
+    )
+    if submit_status and submit_status != DOUBAO_ASR_SUCCESS_STATUS_CODE:
+        message = str(submit_payload.get("X-Api-Message") or submit_payload.get("message") or "")
+        raise RuntimeError(f"豆包标准版任务提交返回错误状态 {submit_status}: {message[:300]}")
+    task_id = str(submit_payload.get("task_id") or submit_request_id).strip()
+    if not task_id:
+        raise RuntimeError("豆包标准版任务提交未返回 task_id")
+
+    query_headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": DOUBAO_ASR_V2_RESOURCE_ID,
+        "X-Api-Request-Id": task_id,
+    }
+    query_log_ids: list[str] = []
+    query_status_codes: list[str] = []
+    for attempt in range(1, DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS + 1):
+        query_status, query_payload, query_log_id = _doubao_asr_v2_post(
+            DOUBAO_ASR_V2_QUERY_ENDPOINT,
+            query_headers,
+            {},
+            "结果查询",
+        )
+        if query_log_id:
+            query_log_ids.append(query_log_id)
+        if query_status:
+            query_status_codes.append(query_status)
+        if query_status and query_status not in DOUBAO_ASR_V2_NON_ERROR_STATUS_CODES:
+            message = str(query_payload.get("X-Api-Message") or query_payload.get("message") or "")
+            raise RuntimeError(f"豆包标准版结果查询返回错误状态 {query_status}: {message[:300]}")
+        result = query_payload.get("result")
+        if query_status == DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE and not isinstance(result, dict):
+            result = {}
+        if isinstance(result, dict):
+            segments, words = _doubao_asr_timestamp_payload(result)
+            return {
+                "backend": "doubao_asr_v2",
+                "model": model,
+                "language": language,
+                "segments": segments,
+                "words": words,
+                "text": str(result.get("text") or "").strip(),
+                "diagnostic": {
+                    "resource_id": DOUBAO_ASR_V2_RESOURCE_ID,
+                    "submit_endpoint": DOUBAO_ASR_V2_SUBMIT_ENDPOINT,
+                    "query_endpoint": DOUBAO_ASR_V2_QUERY_ENDPOINT,
+                    "task_id": task_id,
+                    "status_code": query_status or submit_status,
+                    "log_id": query_log_id or submit_log_id,
+                    "submit_log_id": submit_log_id,
+                    "query_log_ids": query_log_ids,
+                    "query_status_codes": query_status_codes,
+                    "attempt": attempt,
+                },
+            }
+        if attempt < DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS:
+            time.sleep(
+                min(
+                    DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS,
+                    DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS * attempt,
+                )
+            )
+    raise RuntimeError(f"豆包标准版等待结果超时（task_id={task_id}）")
+
+
 def transcribe_v4_window_batch(
     window_audio_paths: list[Path],
     args: argparse.Namespace,
@@ -4206,16 +4411,13 @@ def transcribe_v4_window_batch(
     run_generate_subtitles_batch_plan_v4's first-step transcription
     switchable by backend while leaving segmentation, profiles, and
     SUBFIX_V5_WRITEBACK untouched:
-      - default / any backend other than "doubao_asr": calls
+      - default / any backend other than the explicit 豆包 backends: calls
         transcribe_qwen3_asr_batch exactly as before (zero behavior change).
-      - backend == "doubao_asr": transcribes each window individually via
-        Volcano's flash-recognize HTTP API (one HTTP request per window --
-        there is no native batch endpoint documented, so mind QPS limits and
-        the ~0.8 CNY/hour billing when testing on long batches). A per-window
-        failure is surfaced to Resolve with the affected filename and original
-        cause; valid word timestamps are consumed by the existing alignment
-        validator, otherwise it falls back to Qwen. Resolve then lets the
-        user explicitly retry or switch to Qwen for request failures.
+      - `doubao_asr` / `doubao_asr_v2`: transcribe each window individually
+        via the explicitly selected Volcano tier. A per-window failure is
+        surfaced to Resolve with the affected filename and original cause;
+        valid word timestamps are consumed by the existing alignment validator,
+        otherwise it falls back to Qwen.
 
     Returns (payloads, diagnostic) where diagnostic carries
     asr_backend_used / doubao_fallback_count (+ error detail) for the
@@ -4223,7 +4425,7 @@ def transcribe_v4_window_batch(
     for the whitelist these keys must be added to).
     """
     backend = str(getattr(args, "backend", "auto") or "auto")
-    if backend != "doubao_asr":
+    if backend not in {"doubao_asr", "doubao_asr_v2"}:
         hotword_context = str(getattr(args, "hotword_context", "") or "")
         payloads = (
             transcribe_qwen3_asr_batch(
@@ -4232,15 +4434,17 @@ def transcribe_v4_window_batch(
             if hotword_context
             else transcribe_qwen3_asr_batch(window_audio_paths, args.model, args.language)
         )
-        context_statuses = {
-            str((payload.get("diagnostic") or {}).get("hotword_context_status") or "not_requested")
-            for payload in payloads
-        }
-        return payloads, {
+        diagnostic = {
             "asr_backend_used": "qwen3_asr",
             "doubao_fallback_count": 0,
-            "hotword_context_supported": "unsupported" not in context_statuses,
         }
+        if hotword_context:
+            context_statuses = {
+                str((payload.get("diagnostic") or {}).get("hotword_context_status") or "not_requested")
+                for payload in payloads
+            }
+            diagnostic["hotword_context_supported"] = "unsupported" not in context_statuses
+        return payloads, diagnostic
 
     payloads = []
     doubao_log_ids: list[str] = []
@@ -4248,7 +4452,8 @@ def transcribe_v4_window_batch(
     doubao_status_codes: list[str] = []
     for window_audio_path in window_audio_paths:
         try:
-            payload = transcribe_doubao_asr(window_audio_path, args.model, args.language)
+            transcribe = transcribe_doubao_asr_v2 if backend == "doubao_asr_v2" else transcribe_doubao_asr
+            payload = transcribe(window_audio_path, args.model, args.language)
             payloads.append(payload)
             # 收集火山返回的追踪/计费线索，便于在诊断里核对每次调用是否真计费。
             call_diag = payload.get("diagnostic") or {}
@@ -4263,7 +4468,7 @@ def transcribe_v4_window_batch(
                 f"豆包 ASR 失败（{Path(window_audio_path).name}）: {exc}"
             ) from exc
     diagnostic: dict[str, Any] = {
-        "asr_backend_used": "doubao_asr",
+        "asr_backend_used": backend,
         "doubao_fallback_count": 0,
     }
     if doubao_log_ids:
@@ -4319,7 +4524,7 @@ def transcribe_with_backend(
     context: str | None = None,
 ) -> dict[str, Any]:
     requested_backend = backend or "auto"
-    # "auto" never silently tries doubao_asr (paid/credential-gated); it must
+    # "auto" never silently tries either paid/credential-gated 豆包 backend; it must
     # be requested explicitly. See AUTO_TRANSCRIBE_BACKENDS definition.
     candidates = list(AUTO_TRANSCRIBE_BACKENDS) if requested_backend == "auto" else [requested_backend]
     fallback_errors: list[str] = []
@@ -4338,6 +4543,8 @@ def transcribe_with_backend(
                 )
             elif candidate == "doubao_asr":
                 payload = transcribe_doubao_asr(audio_path, model, language)
+            elif candidate == "doubao_asr_v2":
+                payload = transcribe_doubao_asr_v2(audio_path, model, language)
             elif candidate in EXTERNAL_TRANSCRIBE_COMMAND_ENV:
                 payload = transcribe_external_backend(audio_path, model, language, candidate)
             else:
@@ -4982,6 +5189,65 @@ def run_generate_subtitles_batch_plan_v3(
     }
 
 
+def select_adaptive_subtitle_candidates(
+    units: list[dict[str, Any]],
+    fps: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    started_at = time.monotonic()
+    safe_regions, risky_regions = generate_v5.partition_adaptive_regions(units, fps)
+
+    def overlapping(region: dict[str, Any]) -> list[dict[str, Any]]:
+        start = int(region["start_frame"])
+        end = int(region["end_frame"])
+        return [
+            dict(unit)
+            for unit in units
+            if int(unit.get("end_frame") or 0) > start and int(unit.get("start_frame") or 0) < end
+        ]
+
+    selected: list[dict[str, Any]] = []
+    stage_diagnostic: dict[str, int] = {}
+
+    def add_diagnostic(values: dict[str, Any]) -> None:
+        for key, value in values.items():
+            if isinstance(value, (int, float)):
+                stage_diagnostic[key] = stage_diagnostic.get(key, 0) + int(value)
+
+    for region in safe_regions:
+        safe_units, overlap_diagnostic = generate_v4.dedupe_overlap_units(overlapping(region))
+        selected.extend(safe_units)
+        add_diagnostic(overlap_diagnostic)
+
+    full_unit_count = 0
+    for region in risky_regions:
+        risky_units = overlapping(region)
+        full_unit_count += len(risky_units)
+        echo_filtered, echo_diagnostic = generate_v4.suppress_cross_mic_echo_regions(risky_units, fps)
+        exclusive_units, exclusive_diagnostic = generate_v4.build_exclusive_unit_stream(echo_filtered, fps)
+        filtered_units, near_duplicate_diagnostic = generate_v4.suppress_near_duplicate_units(exclusive_units, fps)
+        selected.extend(filtered_units)
+        add_diagnostic(echo_diagnostic)
+        add_diagnostic(exclusive_diagnostic)
+        add_diagnostic(near_duplicate_diagnostic)
+
+    selected, final_overlap_diagnostic = generate_v4.dedupe_overlap_units(selected)
+    add_diagnostic(final_overlap_diagnostic)
+    selected.sort(
+        key=lambda unit: (
+            int(unit.get("start_frame") or 0),
+            int(unit.get("end_frame") or 0),
+            int(unit.get("track_index") or 0),
+        )
+    )
+    return selected, {
+        **stage_diagnostic,
+        "adaptive_fast_unit_count": sum(len(overlapping(region)) for region in safe_regions),
+        "adaptive_full_unit_count": full_unit_count,
+        "adaptive_full_region_count": len(risky_regions),
+        "adaptive_selection_elapsed_seconds": round(time.monotonic() - started_at, 6),
+    }
+
+
 def run_generate_subtitles_batch_plan_v4(
     batches: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -4996,7 +5262,12 @@ def run_generate_subtitles_batch_plan_v4(
     # read "Qwen" even when the user picked 豆包. Actual dispatch happens in
     # transcribe_v4_window_batch; forced alignment further downstream is still
     # Qwen is used only when the selected ASR has no reliable timestamps.
-    asr_label = "豆包" if str(getattr(args, "backend", "auto") or "auto") == "doubao_asr" else "Qwen"
+    backend_label = str(getattr(args, "backend", "auto") or "auto")
+    asr_label = (
+        "豆包 2.0" if backend_label == "doubao_asr_v2"
+        else "豆包" if backend_label == "doubao_asr"
+        else "Qwen"
+    )
     if not batches:
         raise RuntimeError(f"缺少 generate_subtitles {engine_label} batch plan")
     if fixture_payload is not None:
@@ -5053,6 +5324,10 @@ def run_generate_subtitles_batch_plan_v4(
         "hotword_injected_count": len(hotword_entries),
         "hotword_replacement_count": 0,
         "hotword_context_supported": True,
+        "adaptive_fast_unit_count": 0,
+        "adaptive_full_unit_count": 0,
+        "adaptive_full_region_count": 0,
+        "adaptive_selection_elapsed_seconds": 0.0,
     }
     profile: dict[str, Any] | None = None
     active_mode_profile: dict[str, Any] | None = None
@@ -5163,6 +5438,8 @@ def run_generate_subtitles_batch_plan_v4(
             diagnostic["doubao_fallback_count"] += int(
                 chunk_asr_diagnostic.get("doubao_fallback_count") or 0
             )
+            if chunk_asr_diagnostic.get("hotword_context_supported") is False:
+                diagnostic["hotword_context_supported"] = False
             if chunk_asr_diagnostic.get("doubao_fallback_errors"):
                 diagnostic.setdefault("doubao_fallback_errors", []).extend(
                     chunk_asr_diagnostic["doubao_fallback_errors"]
@@ -5631,7 +5908,7 @@ def run_generate_subtitles_batch_plan_v4(
         write_progress(
             progress_path,
             "select_subtitle_sources",
-            f"{engine_label} 正在进行文本候选仲裁",
+            f"{engine_label} 正在进行{'自适应' if v5_mode else '文本'}候选仲裁",
             progress_index=85,
             progress_total=100,
         )
@@ -5721,21 +5998,33 @@ def run_generate_subtitles_batch_plan_v4(
             }
             for unit in candidates
         ]
-        echo_filtered_candidates, echo_diagnostic = generate_v4.suppress_cross_mic_echo_regions(
-            candidates,
-            float(args.fps or 30.0),
-        )
-        diagnostic.update(echo_diagnostic)
-        canonical_units, exclusive_diagnostic = generate_v4.build_exclusive_unit_stream(
-            echo_filtered_candidates,
-            float(args.fps or 30.0),
-        )
-        diagnostic.update(exclusive_diagnostic)
-        canonical_units, near_duplicate_diagnostic = generate_v4.suppress_near_duplicate_units(
-            canonical_units,
-            float(args.fps or 30.0),
-        )
-        diagnostic.update(near_duplicate_diagnostic)
+        if v5_mode:
+            canonical_units, adaptive_diagnostic = select_adaptive_subtitle_candidates(
+                candidates,
+                float(args.fps or 30.0),
+            )
+            for key, value in adaptive_diagnostic.items():
+                if key in diagnostic and isinstance(value, (int, float)):
+                    diagnostic[key] += value
+                else:
+                    diagnostic[key] = value
+        else:
+            echo_filtered_candidates, echo_diagnostic = generate_v4.suppress_cross_mic_echo_regions(
+                candidates,
+                float(args.fps or 30.0),
+            )
+            diagnostic.update(echo_diagnostic)
+            canonical_units, exclusive_diagnostic = generate_v4.build_exclusive_unit_stream(
+                echo_filtered_candidates,
+                float(args.fps or 30.0),
+            )
+            diagnostic.update(exclusive_diagnostic)
+            canonical_units, near_duplicate_diagnostic = generate_v4.suppress_near_duplicate_units(
+                canonical_units,
+                float(args.fps or 30.0),
+            )
+            diagnostic.update(near_duplicate_diagnostic)
+        canonical_units = generate_v4.propagate_original_word_boundaries(candidates, canonical_units)
         write_progress(
             progress_path,
             "segment_subtitles",
@@ -5793,6 +6082,7 @@ def run_generate_subtitles_batch_plan_v4(
             tail_extension_max_gap_frames,
         )
         diagnostic["tail_extended_row_count"] = tail_extended_row_count
+        subtitle_rows = generate_v4.restore_display_spacing(subtitle_rows, canonical_units)
         subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
         diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
         if v5_mode and v5_writeback == "live" and subtitle_rows:
@@ -5834,8 +6124,6 @@ def run_generate_subtitles_batch_plan_v4(
                 key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0)),
             )
             diagnostic.update(refinement_diagnostic)
-        # Forced alignment may split a hotword across individual character units.
-        # Apply once more after segmentation, without changing any frame boundaries.
         diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
             subtitle_rows, hotword_entries
         )
@@ -6669,7 +6957,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--calibration-json", action="append", default=[])
     parser.add_argument(
         "--backend",
-        choices=("auto", "mimo_asr", "qwen3_asr", "mlx_whisper", "openai_whisper", "doubao_asr"),
+        choices=(
+            "auto",
+            "mimo_asr",
+            "qwen3_asr",
+            "mlx_whisper",
+            "openai_whisper",
+            "doubao_asr",
+            "doubao_asr_v2",
+        ),
         default="auto",
     )
     parser.add_argument(
@@ -6748,7 +7044,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.fps,
                     srt_base_frame,
                 )
-            write_payload(output_path, payload)
+            write_payload(output_path, build_generate_writeback_payload(payload))
             if args.diagnostic_output:
                 write_payload(
                     Path(args.diagnostic_output).expanduser(),

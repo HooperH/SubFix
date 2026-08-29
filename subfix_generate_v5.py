@@ -53,6 +53,113 @@ def _merge_retry_regions(regions: list[dict[str, Any]], maximum_frames: int) -> 
     return merged
 
 
+def _merge_adaptive_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for region in sorted(regions, key=lambda row: (int(row["start_frame"]), int(row["end_frame"]))):
+        start = int(region["start_frame"])
+        end = max(start + 1, int(region["end_frame"]))
+        reasons = set(region.get("reasons") or [])
+        if merged and start <= int(merged[-1]["end_frame"]):
+            merged[-1]["end_frame"] = max(int(merged[-1]["end_frame"]), end)
+            merged[-1]["reasons"] = sorted(set(merged[-1]["reasons"]) | reasons)
+        else:
+            merged.append({"start_frame": start, "end_frame": end, "reasons": sorted(reasons)})
+    return merged
+
+
+def partition_adaptive_regions(
+    units: list[dict[str, Any]],
+    fps: float,
+    padding_seconds: float = 2.5,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    valid_units = sorted(
+        [
+            dict(unit)
+            for unit in units or []
+            if int(unit.get("end_frame") or 0) > int(unit.get("start_frame") or 0)
+        ],
+        key=lambda unit: (int(unit["start_frame"]), int(unit["end_frame"]), int(unit.get("track_index") or 0)),
+    )
+    risky_regions: list[dict[str, Any]] = []
+    active_units: list[dict[str, Any]] = []
+    recent_units: list[dict[str, Any]] = []
+    echo_lookback_frames = max(1, int(round(3.0 * float(fps))))
+    for unit in valid_units:
+        start = int(unit["start_frame"])
+        end = int(unit["end_frame"])
+        reasons: list[str] = []
+        coverage = unit.get("raw_alignment_coverage")
+        if coverage is not None and float(coverage) < 0.98:
+            reasons.append("low_alignment_coverage")
+        if bool(unit.get("alignment_repaired")):
+            reasons.append("alignment_repaired")
+        if str(unit.get("candidate_kind") or "primary") == "local_retry":
+            reasons.append("local_retry")
+        if reasons:
+            risky_regions.append({"start_frame": start, "end_frame": end, "reasons": reasons})
+
+        active_units = [candidate for candidate in active_units if int(candidate["end_frame"]) > start]
+        for active in active_units:
+            if int(active.get("track_index") or 0) == int(unit.get("track_index") or 0):
+                continue
+            overlap_start = max(start, int(active["start_frame"]))
+            overlap_end = min(end, int(active["end_frame"]))
+            if overlap_end > overlap_start:
+                risky_regions.append(
+                    {
+                        "start_frame": overlap_start,
+                        "end_frame": overlap_end,
+                        "reasons": ["cross_track_overlap"],
+                    }
+                )
+        active_units.append(unit)
+
+        recent_units = [
+            candidate
+            for candidate in recent_units
+            if int(candidate["end_frame"]) > start - echo_lookback_frames
+        ]
+        unit_text = v4.normalize_text(unit.get("text"))
+        if unit_text:
+            for recent in recent_units:
+                if int(recent.get("track_index") or 0) == int(unit.get("track_index") or 0):
+                    continue
+                if unit_text != v4.normalize_text(recent.get("text")):
+                    continue
+                risky_regions.append(
+                    {
+                        "start_frame": min(start, int(recent["start_frame"])),
+                        "end_frame": max(end, int(recent["end_frame"])),
+                        "reasons": ["cross_track_echo"],
+                    }
+                )
+        recent_units.append(unit)
+
+    padding_frames = max(0, int(round(float(padding_seconds) * float(fps))))
+    expanded_risky = _merge_adaptive_regions(
+        [
+            {
+                "start_frame": int(region["start_frame"]) - padding_frames,
+                "end_frame": int(region["end_frame"]) + padding_frames,
+                "reasons": region["reasons"],
+            }
+            for region in _merge_adaptive_regions(risky_regions)
+        ]
+    )
+    safe_regions = _merge_adaptive_regions(
+        [
+            {"start_frame": int(unit["start_frame"]), "end_frame": int(unit["end_frame"]), "reasons": []}
+            for unit in valid_units
+            if not any(
+                int(region["end_frame"]) > int(unit["start_frame"])
+                and int(unit["end_frame"]) > int(region["start_frame"])
+                for region in expanded_risky
+            )
+        ]
+    )
+    return safe_regions, expanded_risky
+
+
 def _payload_overlap_text(
     payload: dict[str, Any],
     window: dict[str, Any],

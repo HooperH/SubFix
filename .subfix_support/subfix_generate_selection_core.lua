@@ -12,6 +12,9 @@ local TRACK_CHECKED_MARK = "☑"
 local TRACK_UNCHECKED_MARK = "☐"
 local FALLBACK_ITEM_SCOPE_EXPAND_MAX_GAP_FRAMES = 2
 local GENERATE_PROGRESS_BAR_WIDTH = 36
+local GENERATE_PROGRESS_STALL_WARNING_SECONDS = 300
+local GENERATE_BACKUP_PROGRESS_CHUNK_SIZE = 25
+local GENERATE_UI_YIELD_INTERVAL_MS = 10
 local GENERATE_WRITEBACK_OVERLAY_GEOMETRY = {120, 90, 1680, 880}
 
 local fusion_app = fu or fusion
@@ -326,6 +329,7 @@ local function resolve_asr_paths()
     local paths = {
         helper = helper_dir .. "/subfix_asr_transcribe.py",
         qwen_manager = helper_dir .. "/subfix_qwen_local_manager.py",
+        process_group = helper_dir .. "/subfix_process_group.py",
         setup = helper_dir .. "/setup_asr_env.sh",
         python = helper_dir .. "/.subfix_asr_env/bin/python",
         runtime_python = helper_dir .. "/runtime/python/bin/python3",
@@ -335,6 +339,7 @@ local function resolve_asr_paths()
     if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
         paths.helper = root .. "/subfix_asr_transcribe.py"
         paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
+        paths.process_group = root .. "/subfix_process_group.py"
         paths.setup = root .. "/setup_asr_env.sh"
         paths.python = root .. "/.subfix_asr_env/bin/python"
         paths.runtime_python = root .. "/runtime/python/bin/python3"
@@ -343,6 +348,7 @@ local function resolve_asr_paths()
     if not file_exists(paths.helper) and file_exists(module_dir .. "/subfix_asr_transcribe.py") then
         paths.helper = module_dir .. "/subfix_asr_transcribe.py"
         paths.qwen_manager = module_dir .. "/subfix_qwen_local_manager.py"
+        paths.process_group = module_dir .. "/subfix_process_group.py"
         paths.setup = module_dir .. "/setup_asr_env.sh"
         paths.python = module_dir .. "/.subfix_asr_env/bin/python"
         paths.runtime_python = module_dir .. "/runtime/python/bin/python3"
@@ -439,20 +445,101 @@ local function generate_prefs_file_path()
     return dir .. "/subfix_generate_prefs.json"
 end
 
+local function normalize_doubao_backend(backend)
+    if trim_text(tostring(backend or "")) == "doubao_asr_v2" then
+        return "doubao_asr_v2"
+    end
+    return "doubao_asr"
+end
+
+local function read_generate_preferences()
+    local text = read_text_file(generate_prefs_file_path())
+    local data = text and text ~= "" and decode_json_text(text) or nil
+    return type(data) == "table" and data or {}
+end
+
 -- 读上次选择的识别模型 backend（无偏好/解析失败 → nil）。
 local function read_last_engine_backend()
-    local text = read_text_file(generate_prefs_file_path())
-    if not text or text == "" then return nil end
-    local data = decode_json_text(text)
-    if type(data) ~= "table" then return nil end
+    local data = read_generate_preferences()
     local b = trim_text(tostring(data.last_engine_backend or ""))
     return b ~= "" and b or nil
 end
 
--- 记住本次选择的识别模型 backend（写偏好文件；失败静默，不影响生成）。
+-- 兼容旧偏好：V2 保留，其余值（含缺失/未知）默认极速版。
+local function read_doubao_backend_preference()
+    local data = read_generate_preferences()
+    return normalize_doubao_backend(data.doubao_backend or data.last_engine_backend)
+end
+
+local function write_generate_preferences(data)
+    data = type(data) == "table" and data or {}
+    local last_engine_backend = trim_text(tostring(data.last_engine_backend or ""))
+    local doubao_backend = normalize_doubao_backend(data.doubao_backend)
+    local content = string.format(
+        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s"\n}\n',
+        json_escape(last_engine_backend),
+        json_escape(doubao_backend)
+    )
+    return write_text_file(generate_prefs_file_path(), content)
+end
+
+-- 记住本次选择的识别模型 backend，同时固化旧偏好中的豆包版本。
 local function save_last_engine_backend(backend)
-    local content = string.format('{\n  "last_engine_backend": "%s"\n}\n', json_escape(backend))
-    write_text_file(generate_prefs_file_path(), content)
+    local data = read_generate_preferences()
+    data.doubao_backend = read_doubao_backend_preference()
+    data.last_engine_backend = backend
+    return write_generate_preferences(data)
+end
+
+local function save_doubao_backend_preference(backend)
+    local data = read_generate_preferences()
+    data.doubao_backend = normalize_doubao_backend(backend)
+    return write_generate_preferences(data)
+end
+
+local function load_generate_hotword_entries()
+    local text = read_text_file(resolve_asr_paths().hotwords)
+    local payload = text and decode_json_text(text) or nil
+    local raw_entries = type(payload) == "table" and payload.entries or {}
+    if type(raw_entries) ~= "table" then return {} end
+    local entries, seen_terms = {}, {}
+    for _, raw_entry in ipairs(raw_entries) do
+        if type(raw_entry) == "table" then
+            local term = trim_text(tostring(raw_entry.term or ""))
+            if term ~= "" and not seen_terms[term] then
+                local aliases, seen_aliases = {}, {}
+                if type(raw_entry.aliases) == "table" then
+                    for _, raw_alias in ipairs(raw_entry.aliases) do
+                        local alias = trim_text(tostring(raw_alias or ""))
+                        if alias ~= "" and alias ~= term and not seen_aliases[alias] then
+                            aliases[#aliases + 1] = alias
+                            seen_aliases[alias] = true
+                        end
+                    end
+                end
+                entries[#entries + 1] = {term = term, aliases = aliases}
+                seen_terms[term] = true
+            end
+        end
+    end
+    return entries
+end
+
+local function save_generate_hotword_entries(entries)
+    local path = resolve_asr_paths().hotwords
+    local parts = {}
+    for _, entry in ipairs(entries or {}) do
+        local aliases = {}
+        for _, alias in ipairs(entry.aliases or {}) do
+            aliases[#aliases + 1] = '"' .. json_escape(alias) .. '"'
+        end
+        parts[#parts + 1] = string.format(
+            '{"term":"%s","aliases":[%s]}',
+            json_escape(entry.term),
+            table.concat(aliases, ",")
+        )
+    end
+    return write_text_file(path, '{"version":1,"entries":[' .. table.concat(parts, ",") .. "]}\n")
 end
 
 local function load_generate_hotword_entries()
@@ -1299,27 +1386,45 @@ local function clear_subtitle_track_clips(timeline, track_index)
     return true, initial_count
 end
 
-local function backup_target_track(timeline, track_index, fps, base_frame)
+local function backup_target_track(timeline, track_index, fps, base_frame, progress_callback)
     local items, items_err = get_subtitle_track_items(track_index, timeline)
-    if not items then return nil, items_err or "无法读取目标字幕轨" end
-    if #items == 0 then return nil end
-    local path = temp_dir() .. "/Backup_GenerateSelection_" .. os.date("%Y%m%d_%H%M%S") .. ".srt"
-    local file = io.open(path, "w")
-    if not file then return nil, "无法创建目标字幕轨备份" end
-    local index = 1
-    for _, item in ipairs(items) do
+    if not items then return nil, items_err or "无法读取目标字幕轨", nil end
+    if #items == 0 then return nil, nil, {} end
+
+    local snapshot_rows = {}
+    for item_position, item in ipairs(items) do
         local ok_start, start_frame = pcall(function() return item:GetStart() end)
         local ok_end, end_frame = pcall(function() return item:GetEnd() end)
         local ok_name, name = pcall(function() return item:GetName() end)
-        if ok_start and ok_end then
-            file:write(tostring(index) .. "\n")
-            file:write(frames_to_srt_time(start_frame, fps, base_frame) .. " --> " .. frames_to_srt_time(end_frame, fps, base_frame) .. "\n")
-            file:write(tostring(ok_name and name or "") .. "\n\n")
-            index = index + 1
+        if not ok_start or not ok_end then
+            return nil, string.format("读取目标字幕轨第 %d 条失败，已停止写回", item_position), nil
+        end
+        snapshot_rows[#snapshot_rows + 1] = {
+            start_frame = tonumber(start_frame) or 0,
+            end_frame = tonumber(end_frame) or 0,
+            text = tostring(ok_name and name or "")
+        }
+
+        local completed = item_position
+        if progress_callback and (
+            completed % GENERATE_BACKUP_PROGRESS_CHUNK_SIZE == 0 or completed == #items
+        ) then
+            if progress_callback(completed, #items) == false then
+                return nil, "已取消", snapshot_rows, "cancelled"
+            end
         end
     end
+
+    local path = temp_dir() .. "/Backup_GenerateSelection_" .. os.date("%Y%m%d_%H%M%S") .. ".srt"
+    local file = io.open(path, "w")
+    if not file then return nil, "无法创建目标字幕轨备份", snapshot_rows end
+    for index, row in ipairs(snapshot_rows) do
+        file:write(tostring(index) .. "\n")
+        file:write(frames_to_srt_time(row.start_frame, fps, base_frame) .. " --> " .. frames_to_srt_time(row.end_frame, fps, base_frame) .. "\n")
+        file:write(tostring(row.text or "") .. "\n\n")
+    end
     file:close()
-    return path, nil
+    return path, nil, snapshot_rows
 end
 
 local function get_subtitle_track_type_and_count(timeline)
@@ -1803,20 +1908,24 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
     local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
-    -- 识别模型：Qwen（本地，backend "auto"，默认）/ 豆包（云端，backend "doubao_asr"）。
+    -- 识别模型：主面板只保留 Qwen（本地）与豆包（云端）两个入口；豆包具体版本
+    -- 在配置窗口内选择，并通过 selected_doubao_backend 映射到实际 helper backend。
     -- 仅决定把哪个 --backend 传给 ASR helper，不改断句/回声/对齐算法本体。默认
     -- Qwen(auto) 时与现状完全一致（build 传 DEFAULT_ASR_BACKEND == "auto"）。UI 复用
     -- 与字幕长度同款的 ☑/☐ 互斥小勾选样式。
     local SUBTITLE_ENGINE_OPTIONS = {
         {label = "Qwen（本地）", backend = "auto"},
-        {label = "豆包（云端）", backend = "doubao_asr"},
+        {label = "豆包（云端）", backend = "doubao"},
     }
     local SUBTITLE_ENGINE_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
     local SUBTITLE_ENGINE_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_engine_index = 1
+    local selected_doubao_backend = read_doubao_backend_preference()
     -- 记住上次选择的识别模型：命中偏好则默认选它（找不到/无偏好则保持默认 Qwen）。
     local last_engine_backend = read_last_engine_backend()
-    if last_engine_backend then
+    if last_engine_backend == "doubao_asr" or last_engine_backend == "doubao_asr_v2" then
+        selected_engine_index = 2
+    elseif last_engine_backend then
         for i, opt in ipairs(SUBTITLE_ENGINE_OPTIONS) do
             if opt.backend == last_engine_backend then
                 selected_engine_index = i
@@ -1950,8 +2059,10 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     refresh_subtitle_engine_buttons()
 
     local function read_selected_backend()
-        local option = SUBTITLE_ENGINE_OPTIONS[selected_engine_index]
-        return option and option.backend or SUBTITLE_ENGINE_OPTIONS[1].backend
+        if selected_engine_index == 2 then
+            return selected_doubao_backend
+        end
+        return "auto"
     end
 
     local hotword_library_window = nil
@@ -2158,12 +2269,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     -- 豆包密钥配置子窗口：点"豆包（云端）"且未配置密钥时按需弹出。复用父对话框
     -- 已在跑的 dispatcher:RunLoop() 作非模态覆盖，子窗口自身不 RunLoop/ExitLoop，
     -- 避免嵌套事件循环。
-    local DOUBAO_API_KEY_GUIDE_URL = "https://console.volcengine.com/speech/new/setting/apikeys?projectName=default"
+    local DOUBAO_API_KEY_GUIDE_URL = "https://console.volcengine.com/speech/new/setting/apikeys"
     local doubao_key_window = dispatcher:AddWindow({
         ID = "GenerateDoubaoKeyWindow",
         WindowTitle = "SubFix · 配置豆包 API Key",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 300, 420, 177}),
-        MinimumSize = {420, 0},
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 300, 420, 228}),
+        MinimumSize = {420, 228},
     },
     ui:VGroup{
         Spacing = 8,
@@ -2175,6 +2286,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             ui:Label{Text = "API Key：", Weight = 0, MinimumSize = {96, 0}},
             ui:LineEdit{ID = "GenerateDoubaoApiKeyInput", PlaceholderText = "火山引擎 API Key", Weight = 1}
         },
+        ui:HGroup{
+            Weight = 0,
+            Spacing = 8,
+            MinimumSize = {0, 36},
+            ui:Label{Text = "识别版本：", Weight = 0, MinimumSize = {96, 0}},
+            ui:ComboBox{ID = "GenerateDoubaoBackendSelector", Weight = 1, MinimumSize = {0, 32}}
+        },
+        ui:VGap(8),
         ui:VGroup{
             Weight = 0,
             Spacing = 0,
@@ -2203,7 +2322,13 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local doubao_key_items = doubao_key_window:GetItems()
     local doubao_api_key_input = doubao_key_items and doubao_key_items.GenerateDoubaoApiKeyInput or nil
+    local doubao_backend_selector = doubao_key_items and doubao_key_items.GenerateDoubaoBackendSelector or nil
     local doubao_key_status_label = doubao_key_items and doubao_key_items.GenerateDoubaoKeyStatusLabel or nil
+    local pending_doubao_backend = selected_doubao_backend
+    if doubao_backend_selector then
+        doubao_backend_selector:AddItem("极速版")
+        doubao_backend_selector:AddItem("2.0 标准版")
+    end
 
     local function set_doubao_key_status(text)
         if doubao_key_status_label then
@@ -2225,12 +2350,26 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         open_doubao_api_key_guide()
     end
 
+    local function refresh_doubao_backend_selector()
+        if not doubao_backend_selector then return end
+        local backend_index = pending_doubao_backend == "doubao_asr_v2" and 1 or 0
+        pcall(function() doubao_backend_selector.CurrentIndex = backend_index end)
+    end
+
     -- 弹出前用已存值预填，方便查看/修改；再 Show（非模态覆盖，父 RunLoop 继续分发事件）。
     local function open_doubao_key_dialog()
         local api_key = read_doubao_api_key()
         if doubao_api_key_input then pcall(function() doubao_api_key_input.Text = api_key end) end
+        pending_doubao_backend = selected_doubao_backend
+        refresh_doubao_backend_selector()
         set_doubao_key_status("密钥仅保存在本机，不会上传或进入版本库。")
         pcall(function() doubao_key_window:Show() end)
+    end
+
+    function doubao_key_window.On.GenerateDoubaoBackendSelector.CurrentIndexChanged(ev)
+        if not doubao_backend_selector then return end
+        local backend_index = tonumber(doubao_backend_selector.CurrentIndex) or 0
+        pending_doubao_backend = backend_index == 1 and "doubao_asr_v2" or "doubao_asr"
     end
 
     function doubao_key_window.On.GenerateDoubaoKeySaveBtn.Clicked(ev)
@@ -2239,20 +2378,39 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             set_doubao_key_status("请输入 API Key")
             return
         end
+        local previous_api_key = read_doubao_api_key()
+        local previous_doubao_backend = selected_doubao_backend
         local ok, err = save_doubao_api_key(api_key)
         if not ok then
             set_doubao_key_status(tostring(err or "保存失败"))
             return
         end
+        selected_doubao_backend = normalize_doubao_backend(pending_doubao_backend)
+        local pref_ok, pref_err = save_doubao_backend_preference(selected_doubao_backend)
+        if not pref_ok then
+            local rollback_ok, rollback_err = save_doubao_api_key(previous_api_key)
+            selected_doubao_backend = previous_doubao_backend
+            local preference_error = tostring(pref_err or "模型偏好保存失败，请检查本机插件支持目录权限")
+            if not rollback_ok then
+                set_doubao_key_status(
+                    preference_error .. "；API Key 回滚失败：" .. tostring(rollback_err or "未知错误")
+                )
+            else
+                set_doubao_key_status(preference_error)
+            end
+            return
+        end
         pcall(function() doubao_key_window:Hide() end)
     end
 
-    -- 取消/关闭：未配置就选了豆包会在生成时静默回退，故切回 Qwen 并提示，避免误解。
+    -- 取消/关闭：已配置时只丢弃本次草稿；未配置时切回 Qwen，避免生成时静默回退。
     local function cancel_doubao_key_dialog()
         pcall(function() doubao_key_window:Hide() end)
-        select_subtitle_engine(1)
-        if items and items.GenerateSelectionInfoLabel then
-            items.GenerateSelectionInfoLabel.Text = "未配置豆包密钥，已切回 Qwen（本地）"
+        if not doubao_credentials_configured() then
+            select_subtitle_engine(1)
+            if items and items.GenerateSelectionInfoLabel then
+                items.GenerateSelectionInfoLabel.Text = "未配置豆包密钥，已切回 Qwen（本地）"
+            end
         end
     end
 
@@ -2316,15 +2474,6 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local qwen_download_detail_label = qwen_download_items and qwen_download_items.GenerateQwenDownloadDetailLabel or nil
     local qwen_download_confirm_btn = qwen_download_items and qwen_download_items.GenerateQwenDownloadConfirmBtn or nil
     local qwen_download_is_ready = false
-    local qwen_status_poll_timer = nil
-    local qwen_status_poll_timer_id = nil
-
-    local function stop_qwen_status_poll()
-        if qwen_status_poll_timer then pcall(function() qwen_status_poll_timer:Stop() end) end
-        if qwen_status_poll_timer_id then ui_timer_handlers[qwen_status_poll_timer_id] = nil end
-        qwen_status_poll_timer = nil
-        qwen_status_poll_timer_id = nil
-    end
 
     local function show_qwen_status(qwen_status)
         qwen_download_is_ready = qwen_status and qwen_status.ready == true
@@ -2346,7 +2495,6 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     local function open_qwen_download_dialog()
-        stop_qwen_status_poll()
         qwen_download_is_ready = false
         if qwen_download_status_label then qwen_download_status_label.Text = "正在检查本地 Qwen 安装状态…" end
         if qwen_download_detail_label then qwen_download_detail_label.Text = "请稍候，窗口会自动更新。" end
@@ -2355,35 +2503,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             qwen_download_confirm_btn.Enabled = false
         end
         pcall(function() qwen_download_window:Show() end)
-
-        local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
-        local root = temp_dir()
-        local output_path = root .. "/qwen_status_" .. uid .. ".json"
-        local done_path = root .. "/qwen_status_done_" .. uid
-        local cmd = build_qwen_status_command(resolve_asr_paths(), output_path)
-        if not cmd then
-            show_qwen_status({state = "missing", ready = false})
-            return
-        end
-        os.execute(string.format("(%s >/dev/null 2>&1; touch %s) &", cmd, shell_quote(done_path)))
-
-        local timer_id = "GenerateQwenStatusPollTimer_" .. uid
-        local timer = ui:Timer({ID = timer_id, Interval = 200, SingleShot = false})
-        qwen_status_poll_timer = timer
-        qwen_status_poll_timer_id = timer_id
-        local timer_registered = register_ui_timer(timer, function()
-            if not file_exists(done_path) then return end
-            local payload = decode_json_text(read_text_file(output_path) or "")
-            os.execute("rm -f " .. shell_quote(output_path) .. " " .. shell_quote(done_path) .. " 2>/dev/null")
-            stop_qwen_status_poll()
-            if type(payload) ~= "table" then payload = {state = "missing", ready = false} end
-            payload.ready = payload.ready == true
-            show_qwen_status(payload)
-        end)
-        if not timer_registered or not pcall(function() timer:Start() end) then
-            stop_qwen_status_poll()
-            show_qwen_status({state = "missing", ready = false})
-        end
+        show_qwen_status(inspect_local_qwen(resolve_asr_paths()))
     end
 
     function qwen_download_window.On.GenerateQwenDownloadConfirmBtn.Clicked(ev)
@@ -2402,7 +2522,6 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     function qwen_download_window.On.GenerateQwenDownloadWindow.Close(ev)
-        stop_qwen_status_poll()
         pcall(function() qwen_download_window:Hide() end)
     end
 
@@ -2462,7 +2581,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         select_subtitle_length(2)
     end
 
-    -- 识别模型：两个互斥按钮，点击即切换 backend 并高亮当前选择
+    -- 识别模型：两个主入口互斥；豆包入口使用配置窗中已保存的具体版本。
     function selection_window.On.GenerateSubtitleEngineQwenBtn.Clicked(ev)
         local now = os.time()
         local is_double = last_qwen_click_time ~= nil and (now - last_qwen_click_time) <= DOUBAO_DOUBLE_CLICK_SECONDS
@@ -2545,6 +2664,9 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     if not selected_audio_sources and not dialog_cancelled then
         selected_audio_sources = collect_checked_audio_sources()
+        selected_max_chars = read_selected_max_chars()
+        selected_backend = read_selected_backend()
+        selected_hotwords_json = hotwords_enabled and resolve_asr_paths().hotwords or nil
         if #selected_audio_sources > 0 then
             print("[SubFix Generate] 音频轨选择窗口提前退出，使用默认勾选轨道")
         end
@@ -2588,25 +2710,13 @@ end
 local function progress_bar_text(progress_state, payload)
     if payload and payload.indeterminate then
         local width = GENERATE_PROGRESS_BAR_WIDTH
-        local fraction = math.max(0, math.min(1, tonumber(progress_state.progress_fraction) or 0))
-        if fraction <= 0 then
-            return "ᗧ" .. string.rep("□", width - 1) .. "⚑", 0
-        end
-        local filled_count = math.floor(fraction * width)
-        local available_count = math.max(1, width - filled_count)
-        local phase = filled_count + math.floor((os.time() - (tonumber(progress_state.started_at) or os.time())) % available_count) + 1
-        phase = math.min(width, phase)
+        local elapsed_seconds = math.max(0, os.time() - (tonumber(progress_state.started_at) or os.time()))
+        local phase = elapsed_seconds % width + 1
         local cells = {}
         for cell_index = 1, width do
-            if cell_index < phase then
-                cells[#cells + 1] = "■"
-            elseif cell_index == phase then
-                cells[#cells + 1] = "ᗧ"
-            else
-                cells[#cells + 1] = "□"
-            end
+            cells[#cells + 1] = cell_index == phase and "ᗧ" or "□"
         end
-        return table.concat(cells) .. "⚑", math.floor(fraction * 100 + 0.5)
+        return table.concat(cells) .. "⚑", 0
     end
     local total = tonumber(payload and payload.progress_total)
     local index = tonumber(payload and payload.progress_index)
@@ -2690,6 +2800,7 @@ local function show_generate_progress_window()
     local progress_state = {
         window = progress_window,
         cancel_requested = false,
+        cancel_allowed = true,
         started_at = os.time(),
         progress_fraction = 0,
         finished = false
@@ -2700,10 +2811,16 @@ local function show_generate_progress_window()
             progress_window:Hide()
             return
         end
+        if progress_state.cancel_allowed == false then return end
         progress_state.cancel_requested = true
     end
 
     function progress_window.On.GenerateProgressWindow.Close(ev)
+        if progress_state.finished then
+            progress_window:Hide()
+            return
+        end
+        if progress_state.cancel_allowed == false then return end
         progress_state.cancel_requested = true
     end
 
@@ -2727,11 +2844,68 @@ local function update_generate_progress_window(progress_state, payload, extra_lo
     if items.GenerateProgressStatusLabel then items.GenerateProgressStatusLabel.Text = status_text end
     if items.GenerateProgressBarLabel then items.GenerateProgressBarLabel.Text = bar end
     if items.GenerateProgressMetaLabel then
-        items.GenerateProgressMetaLabel.Text = "进度 " .. tostring(percent) .. "%  ·  用时 " .. elapsed
-        if payload and tonumber(payload.eta_seconds) and tonumber(payload.eta_seconds) > 0 then
-            items.GenerateProgressMetaLabel.Text = items.GenerateProgressMetaLabel.Text .. "  ·  预计剩余 " .. progress_eta_text(payload.eta_seconds)
+        if payload and payload.indeterminate then
+            items.GenerateProgressMetaLabel.Text = "正在进行中  ·  用时 " .. elapsed
+        else
+            items.GenerateProgressMetaLabel.Text = "进度 " .. tostring(percent) .. "%  ·  用时 " .. elapsed
+            if payload and tonumber(payload.eta_seconds) and tonumber(payload.eta_seconds) > 0 then
+                items.GenerateProgressMetaLabel.Text = items.GenerateProgressMetaLabel.Text .. "  ·  预计剩余 " .. progress_eta_text(payload.eta_seconds)
+            end
         end
     end
+end
+
+local function set_generate_progress_cancel_enabled(progress_state, enabled, text)
+    if not progress_state then return end
+    progress_state.cancel_allowed = enabled ~= false
+    local progress_window = progress_state.window
+    if not progress_window then return end
+    local ok_items, items = pcall(function() return progress_window:GetItems() end)
+    if not ok_items or not items or not items.GenerateProgressCancelBtn then return end
+    items.GenerateProgressCancelBtn.Enabled = enabled ~= false
+    if text and text ~= "" then
+        items.GenerateProgressCancelBtn.Text = tostring(text)
+    end
+end
+
+local function pump_generate_progress_events(progress_state)
+    if not dispatcher or not ui then
+        return not (progress_state and progress_state.cancel_requested)
+    end
+    local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+    local timer_id = "GenerateProgressYieldTimer_" .. uid
+    local yield_timer = ui:Timer({
+        ID = timer_id,
+        Interval = GENERATE_UI_YIELD_INTERVAL_MS,
+        SingleShot = true
+    })
+    local timer_registered = register_ui_timer(yield_timer, function()
+        pcall(function() yield_timer:Stop() end)
+        ui_timer_handlers[timer_id] = nil
+        pcall(function() dispatcher:ExitLoop() end)
+    end)
+    if not timer_registered then
+        return not (progress_state and progress_state.cancel_requested)
+    end
+    local started = pcall(function() yield_timer:Start() end)
+    if not started then
+        ui_timer_handlers[timer_id] = nil
+        return not (progress_state and progress_state.cancel_requested)
+    end
+    pcall(function() dispatcher:RunLoop() end)
+    pcall(function() yield_timer:Stop() end)
+    ui_timer_handlers[timer_id] = nil
+    return not (progress_state and progress_state.cancel_requested)
+end
+
+local function update_generate_postprocess_stage(progress_state, stage, message, progress_index)
+    update_generate_progress_window(progress_state, {
+        stage = stage,
+        message = message,
+        progress_index = progress_index,
+        progress_total = 100
+    }, message)
+    return pump_generate_progress_events(progress_state)
 end
 
 local function show_writeback_progress_overlay(progress_state)
@@ -2754,10 +2928,7 @@ local function finish_generate_progress_window(progress_state, status, message)
     end
     update_generate_progress_window(progress_state, payload, message)
     progress_state.finished = true
-    local ok_items, items = pcall(function() return progress_window:GetItems() end)
-    if ok_items and items and items.GenerateProgressCancelBtn then
-        items.GenerateProgressCancelBtn.Text = "关闭"
-    end
+    set_generate_progress_cancel_enabled(progress_state, true, "关闭")
 end
 
 local function summarize_doubao_asr_failure_reason(reason)
@@ -2897,7 +3068,7 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     local asr_backend = (type(backend) == "string" and backend ~= "") and backend or DEFAULT_ASR_BACKEND
     local qwen_status = inspect_local_qwen(paths)
     local python = paths.python
-    if asr_backend == "doubao_asr" then
+    if asr_backend == "doubao_asr" or asr_backend == "doubao_asr_v2" then
         -- 豆包负责转写，但 v4/v5 仍依赖 Qwen 做强制时间对齐。
         if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
             python = qwen_status.python
@@ -2960,8 +3131,20 @@ local function kill_background_process(pid_file)
     local pid_text = trim_text(read_text_file(pid_file) or "")
     local pid = tonumber(pid_text)
     if pid and pid > 0 then
-        os.execute("kill " .. tostring(pid) .. " 2>/dev/null || true")
+        os.execute("kill -TERM -- -" .. tostring(pid) .. " 2>/dev/null || kill -TERM " .. tostring(pid) .. " 2>/dev/null || true")
+        os.execute("sleep 0.2; kill -KILL -- -" .. tostring(pid) .. " 2>/dev/null || true")
     end
+end
+
+local function progress_payload_signature(payload)
+    return table.concat({
+        tostring(payload and payload.stage or ""),
+        tostring(payload and payload.message or ""),
+        tostring(payload and payload.batch_index or ""),
+        tostring(payload and payload.total_batches or ""),
+        tostring(payload and payload.progress_index or ""),
+        tostring(payload and payload.progress_total or "")
+    }, "\n")
 end
 
 local function run_background_command_with_progress(cmd, progress_path, progress_state)
@@ -2973,30 +3156,61 @@ local function run_background_command_with_progress(cmd, progress_path, progress
     local exit_file = root .. "/asr_exit_" .. uid
     local output = ""
     local cancelled = false
+    local paths = resolve_asr_paths()
+    if not file_exists(paths.runtime_python) then
+        return false, "未找到 SubFix 内置 Python", nil
+    end
+    if not file_exists(paths.process_group) then
+        return false, "缺少 SubFix 后台进程管理器", nil
+    end
+    local grouped_cmd = table.concat({
+        shell_quote(paths.runtime_python),
+        shell_quote(paths.process_group),
+        shell_quote(cmd),
+    }, " ")
 
     local bg_cmd = string.format(
-        "(%s > %s 2>&1; echo $? > %s; touch %s) & echo $! > %s",
-        cmd,
+        "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) &",
+        grouped_cmd,
         shell_quote(stdout_file),
+        shell_quote(pid_file),
         shell_quote(exit_file),
-        shell_quote(done_file),
-        shell_quote(pid_file)
+        shell_quote(done_file)
     )
     os.execute(bg_cmd)
 
     local timer_id = "GenerateProgressPollTimer_" .. uid
     local poll_timer = ui:Timer({ID = timer_id, Interval = 200, SingleShot = false})
-    local last_signature = ""
+    local last_signature = nil
+    local last_progress_changed_at = os.time()
+    local stall_warning_logged = false
 
     local timer_registered = register_ui_timer(poll_timer, function()
         local payload = parse_progress_payload(read_text_file(progress_path) or "")
-        local signature = tostring(payload and payload.stage or "") .. "\n" .. tostring(payload and payload.message or "") .. "\n" .. progress_elapsed_text(progress_state.started_at)
+        local signature = progress_payload_signature(payload)
         if signature ~= last_signature then
             last_signature = signature
-            update_generate_progress_window(progress_state, payload or {stage = "处理中", message = "正在识别音频..."}, payload and payload.message)
-        else
-            update_generate_progress_window(progress_state, payload or {stage = "处理中", message = "正在识别音频..."})
+            last_progress_changed_at = os.time()
+            stall_warning_logged = false
         end
+
+        local display_message = tostring(payload and payload.message or "正在识别音频...")
+        local stalled_seconds = math.max(0, os.time() - last_progress_changed_at)
+        if stalled_seconds >= GENERATE_PROGRESS_STALL_WARNING_SECONDS then
+            display_message = display_message .. " · 长时间无新进度，可取消后重试"
+            if not stall_warning_logged then
+                print(string.format(
+                    "[SubFix Generate] ASR 已 %ds 无新进度；任务仍在运行，可由用户安全取消",
+                    stalled_seconds
+                ))
+                stall_warning_logged = true
+            end
+        end
+        update_generate_progress_window(
+            progress_state,
+            payload or {stage = "处理中", message = "正在识别音频..."},
+            display_message
+        )
 
         if progress_state and progress_state.cancel_requested then
             cancelled = true
@@ -3061,14 +3275,47 @@ local function run_asr_helper_with_progress(audio_source, srt_path, json_path, t
     return true
 end
 
-local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend, hotwords_json)
+local function selected_sources_effective_audio_seconds(sources, fps)
+    local total_seconds = 0
+    local effective_fps = math.max(1, tonumber(fps) or 24)
+    for _, source in ipairs(sources or {}) do
+        local source_start = tonumber(source and source.source_start_seconds)
+        local source_end = tonumber(source and source.source_end_seconds)
+        local duration = source_start and source_end and (source_end - source_start) or 0
+        if duration <= 0 then
+            duration = (
+                (tonumber(source and source.end_frame) or 0) -
+                (tonumber(source and source.start_frame) or 0)
+            ) / effective_fps
+        end
+        total_seconds = total_seconds + math.max(0, duration)
+    end
+    return total_seconds
+end
+
+local function format_generate_audio_duration(seconds)
+    local total = math.max(0, math.floor((tonumber(seconds) or 0) + 0.5))
+    local hours = math.floor(total / 3600)
+    local minutes = math.floor((total % 3600) / 60)
+    local remaining_seconds = total % 60
+    if hours > 0 then
+        return string.format("%dh%02dm%02ds", hours, minutes, remaining_seconds)
+    end
+    if minutes > 0 then
+        return string.format("%dm%02ds", minutes, remaining_seconds)
+    end
+    return string.format("%ds", remaining_seconds)
+end
+
+local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend, hotwords_json, effective_audio_seconds)
     local progress_path = json_path .. ".progress.json"
     local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
     if not cmd then return false, cmd_err end
+    local duration_text = format_generate_audio_duration(effective_audio_seconds)
     update_generate_progress_window(
         progress_state,
-        {stage = "启动批量 ASR", message = string.format("准备识别 %d 段音频", tonumber(source_count) or 0)},
-        string.format("批量识别 %d 段音频", tonumber(source_count) or 0)
+        {stage = "启动批量 ASR", message = string.format("准备识别 %d 段音频 · 有效音频 %s", tonumber(source_count) or 0, duration_text)},
+        string.format("批量识别 %d 段音频 · 有效音频 %s", tonumber(source_count) or 0, duration_text)
     )
     local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
     os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
@@ -3109,6 +3356,11 @@ end
 
 local function install_local_qwen_with_progress()
     local paths = resolve_asr_paths()
+    local existing_status = inspect_local_qwen(paths)
+    if existing_status.ready then
+        show_qwen_install_complete_dialog()
+        return true
+    end
     local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
     local root = temp_dir()
     local output_path = root .. "/subfix_qwen_install_" .. uid .. ".json"
@@ -3273,19 +3525,16 @@ local function merge_generated_rows_for_writeback(row_groups, scope)
     return merged_rows
 end
 
-local function build_composite_rows_for_writeback(timeline, track_index, scope, generated_rows, fps)
-    local ok_items, items = pcall(function() return timeline:GetItemListInTrack("subtitle", track_index) end)
-    items = ok_items and items or {}
+local function build_composite_rows_for_writeback(existing_rows, scope, generated_rows)
     local rows = {}
-    for _, item in ipairs(items or {}) do
-        local ok_start, start_frame = pcall(function() return item:GetStart() end)
-        local ok_end, end_frame = pcall(function() return item:GetEnd() end)
-        local ok_name, name = pcall(function() return item:GetName() end)
-        if ok_start and ok_end and not range_intersects_selection(start_frame, end_frame, scope) then
+    for _, existing_row in ipairs(existing_rows or {}) do
+        local start_frame = tonumber(existing_row.start_frame) or 0
+        local end_frame = tonumber(existing_row.end_frame) or 0
+        if not range_intersects_selection(start_frame, end_frame, scope) then
             rows[#rows + 1] = {
-                start_frame = tonumber(start_frame) or 0,
-                end_frame = tonumber(end_frame) or 0,
-                text = ok_name and tostring(name or "") or ""
+                start_frame = start_frame,
+                end_frame = end_frame,
+                text = tostring(existing_row.text or "")
             }
         end
     end
@@ -3499,11 +3748,13 @@ local function generate_selection_subtitles()
     local raw_selected_track_source_count = #selected_track_sources
     local optimized_track_sources, source_optimization = optimize_selected_track_sources_for_generation(selected_track_sources, fps)
     selected_track_sources = optimized_track_sources or selected_track_sources
+    local effective_audio_seconds = selected_sources_effective_audio_seconds(selected_track_sources, fps)
     print(string.format(
-        "[SubFix Generate] 使用 %d 条音频轨；音频 %d → 去重 %d",
+        "[SubFix Generate] 使用 %d 条音频轨；音频 %d → 去重 %d；有效音频 %s",
         #selected_audio_sources,
         raw_selected_track_source_count,
-        tonumber(source_optimization and source_optimization.deduped_source_count) or #selected_track_sources
+        tonumber(source_optimization and source_optimization.deduped_source_count) or #selected_track_sources,
+        format_generate_audio_duration(effective_audio_seconds)
     ))
     for source_index, source in ipairs(selected_track_sources) do
         print(string.format(
@@ -3552,9 +3803,10 @@ local function generate_selection_subtitles()
         subtitle_mode,
         max_chars,
         backend,
-        hotwords_json
+        hotwords_json,
+        effective_audio_seconds
     )
-    while not helper_ok and helper_status ~= "cancelled" and backend == "doubao_asr" and is_doubao_asr_failure(helper_err) do
+    while not helper_ok and helper_status ~= "cancelled" and (backend == "doubao_asr" or backend == "doubao_asr_v2") and is_doubao_asr_failure(helper_err) do
         -- 进度窗口中的错误文本通常包含 Python 完整日志；隐藏它，改由明确操作的短弹窗呈现。
         pcall(function() progress_state.window:Hide() end)
         local action = show_doubao_asr_failure_action_dialog(helper_err)
@@ -3585,7 +3837,8 @@ local function generate_selection_subtitles()
             subtitle_mode,
             max_chars,
             backend,
-            hotwords_json
+            hotwords_json,
+            effective_audio_seconds
         )
     end
     if not helper_ok then
@@ -3593,12 +3846,24 @@ local function generate_selection_subtitles()
         error(helper_err)
     end
 
-    update_generate_progress_window(progress_state, {stage = "整理结果", message = "正在整理生成字幕", progress_index = 98, progress_total = 100}, "整理生成字幕")
+    local function cancel_postprocess_if_requested(should_continue)
+        if should_continue then return end
+        finish_generate_progress_window(progress_state, "已取消", "已取消，目标字幕轨未修改")
+        error("已取消")
+    end
+
+    cancel_postprocess_if_requested(update_generate_postprocess_stage(
+        progress_state, "解析结果", "正在解析生成结果", 96
+    ))
     local raw_generated_rows, raw_generated_err = parse_generated_json_subtitle_rows(json_path)
     if not raw_generated_rows then
         finish_generate_progress_window(progress_state, "失败", raw_generated_err)
         error(raw_generated_err)
     end
+
+    cancel_postprocess_if_requested(update_generate_postprocess_stage(
+        progress_state, "合并字幕", "正在合并识别结果", 97
+    ))
     local priority_rows, priority_err = nil, nil
     if subtitle_mode == "live" then
         priority_rows, priority_err = merge_generated_rows_for_live_writeback(raw_generated_rows, scope)
@@ -3615,16 +3880,47 @@ local function generate_selection_subtitles()
         error(generated_err)
     end
 
-    local backup_path, backup_err = backup_target_track(timeline, TARGET_SUBTITLE_TRACK, fps, scope.timeline_start_frame)
+    cancel_postprocess_if_requested(update_generate_postprocess_stage(
+        progress_state, "备份字幕", "正在备份目标字幕轨", 98
+    ))
+    local backup_path, backup_err, existing_target_rows, backup_status = backup_target_track(
+        timeline,
+        TARGET_SUBTITLE_TRACK,
+        fps,
+        scope.timeline_start_frame,
+        function(completed, total)
+            local message = string.format("正在备份目标字幕轨 %d/%d", completed, total)
+            update_generate_progress_window(progress_state, {
+                stage = "备份字幕",
+                message = message,
+                progress_index = 98,
+                progress_total = 100
+            }, message)
+            return pump_generate_progress_events(progress_state)
+        end
+    )
+    if backup_status == "cancelled" then
+        cancel_postprocess_if_requested(false)
+    end
+    if not existing_target_rows then
+        finish_generate_progress_window(progress_state, "失败", backup_err or "无法读取目标字幕轨")
+        error(backup_err or "无法读取目标字幕轨")
+    end
+    if backup_err then
+        finish_generate_progress_window(progress_state, "失败", backup_err)
+        error(backup_err)
+    end
     if backup_path then
         print("[SubFix Generate] 已备份目标字幕轨: " .. backup_path)
-    elseif backup_err then
-        print("[SubFix Generate] 备份目标字幕轨失败: " .. tostring(backup_err))
     end
 
-    update_generate_progress_window(progress_state, {stage = "写回时间线", message = "正在写回目标字幕轨", progress_index = 99, progress_total = 100}, "写回目标字幕轨")
+    cancel_postprocess_if_requested(update_generate_postprocess_stage(
+        progress_state, "写回时间线", "正在写回字幕", 99
+    ))
+    -- 清空目标字幕轨后无法保证可逆，因此只在真正写回前关闭取消入口。
+    set_generate_progress_cancel_enabled(progress_state, false, "写回中")
     show_writeback_progress_overlay(progress_state)
-    local composite_rows = build_composite_rows_for_writeback(timeline, TARGET_SUBTITLE_TRACK, scope, generated_rows, fps)
+    local composite_rows = build_composite_rows_for_writeback(existing_target_rows, scope, generated_rows)
     local import_ok, import_err = rebuild_target_subtitle_track_from_rows(project, timeline, composite_rows, fps, scope.timeline_start_frame)
     if not import_ok then
         finish_generate_progress_window(progress_state, "失败", import_err)

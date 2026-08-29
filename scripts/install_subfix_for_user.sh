@@ -28,6 +28,11 @@ cleanup_system_subfix_menu() {
     "$SYSTEM_UTILITY/SubFix_GenerateSelectionSubtitles.lua"; do
     [[ -f "$legacy_path" || -L "$legacy_path" ]] && rm -f -- "$legacy_path"
   done
+  if [[ -L "$SYSTEM_SUPPORT" ]]; then
+    rm -f -- "$SYSTEM_SUPPORT"
+  elif [[ -d "$SYSTEM_SUPPORT" ]]; then
+    rm -rf -- "$SYSTEM_SUPPORT"
+  fi
   return 0
 }
 
@@ -67,11 +72,13 @@ ditto "$SYSTEM_UTILITY/SubFix" "$USER_UTILITY/SubFix"
 ditto "$SYSTEM_SUPPORT" "$USER_SUPPORT"
 
 chown -R "$CONSOLE_USER":staff "$USER_UTILITY/SubFix" "$USER_SUPPORT/runtime" "$USER_SUPPORT/bin"
+[[ -d "$USER_SUPPORT/licenses" ]] && chown -R "$CONSOLE_USER":staff "$USER_SUPPORT/licenses"
 chown "$CONSOLE_USER":staff "$USER_SUPPORT"
 for support_file in \
   subfix_generate_selection_core.lua \
   subfix_update.py \
   subfix_qwen_local_manager.py \
+  subfix_process_group.py \
   subfix_asr_transcribe.py \
   subfix_generate_v4.py \
   subfix_generate_v5.py \

@@ -10,6 +10,7 @@ SOURCE_LUA="$SCRIPT_DIR/SubFix.lua"
 SOURCE_GENERATOR_LUA="$SCRIPT_DIR/生成选区字幕.lua"
 SOURCE_GENERATE_CORE="$SCRIPT_DIR/.subfix_support/subfix_generate_selection_core.lua"
 SOURCE_QWEN_LOCAL_MANAGER="$SCRIPT_DIR/.subfix_support/subfix_qwen_local_manager.py"
+SOURCE_PROCESS_GROUP="$SCRIPT_DIR/.subfix_support/subfix_process_group.py"
 SOURCE_UPDATE_HELPER="$SCRIPT_DIR/.subfix_support/subfix_update.py"
 SOURCE_ASR_HELPER="$SCRIPT_DIR/subfix_asr_transcribe.py"
 SOURCE_GENERATE_V4="$SCRIPT_DIR/subfix_generate_v4.py"
@@ -80,7 +81,7 @@ echo "🔄 正在同步到 DaVinci Resolve 插件目录..."
 echo "📁 源文件: $SOURCE_LUA"
 echo "📁 目标: $SUBFIX_MENU_DIR/SubFix.lua"
 
-for required in "$SOURCE_LUA" "$SOURCE_GENERATOR_LUA" "$SOURCE_GENERATE_CORE" "$SOURCE_QWEN_LOCAL_MANAGER" "$SOURCE_UPDATE_HELPER" "$SOURCE_ASR_HELPER" "$SOURCE_GENERATE_V4" "$SOURCE_GENERATE_V5" "$SOURCE_GENERATE_TEXTNORM" "$SOURCE_ASR_SETUP" "$SOURCE_SEGMENTATION_PROFILE" "$SOURCE_SEGMENTATION_PROFILE_V3" "$SOURCE_SEGMENTATION_PROFILE_V4"; do
+for required in "$SOURCE_LUA" "$SOURCE_GENERATOR_LUA" "$SOURCE_GENERATE_CORE" "$SOURCE_QWEN_LOCAL_MANAGER" "$SOURCE_PROCESS_GROUP" "$SOURCE_UPDATE_HELPER" "$SOURCE_ASR_HELPER" "$SOURCE_GENERATE_V4" "$SOURCE_GENERATE_V5" "$SOURCE_GENERATE_TEXTNORM" "$SOURCE_ASR_SETUP" "$SOURCE_SEGMENTATION_PROFILE" "$SOURCE_SEGMENTATION_PROFILE_V3" "$SOURCE_SEGMENTATION_PROFILE_V4"; do
   if [[ ! -f "$required" ]]; then
     echo "❌ 未找到源文件: $required"
     exit 1
@@ -97,6 +98,7 @@ if cp "$SOURCE_LUA" "$SUBFIX_MENU_DIR/SubFix.lua" \
   && cp "$SOURCE_GENERATOR_LUA" "$SUBFIX_MENU_DIR/生成选区字幕.lua" \
   && cp "$SOURCE_GENERATE_CORE" "$HELPER_DIR/subfix_generate_selection_core.lua" \
   && cp "$SOURCE_QWEN_LOCAL_MANAGER" "$HELPER_DIR/subfix_qwen_local_manager.py" \
+  && cp "$SOURCE_PROCESS_GROUP" "$HELPER_DIR/subfix_process_group.py" \
   && cp "$SOURCE_UPDATE_HELPER" "$HELPER_DIR/subfix_update.py" \
   && cp "$SOURCE_ASR_HELPER" "$HELPER_DIR/subfix_asr_transcribe.py" \
   && cp "$SOURCE_GENERATE_V4" "$HELPER_DIR/subfix_generate_v4.py" \
@@ -106,7 +108,7 @@ if cp "$SOURCE_LUA" "$SUBFIX_MENU_DIR/SubFix.lua" \
   && cp "$SOURCE_SEGMENTATION_PROFILE" "$HELPER_DIR/segmentation_profile.json" \
   && cp "$SOURCE_SEGMENTATION_PROFILE_V3" "$HELPER_DIR/segmentation_profile_v3.json" \
   && cp "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" 2>/dev/null; then
-  chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" 2>/dev/null || true
+  chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" "$HELPER_DIR/subfix_process_group.py" 2>/dev/null || true
   link_qwen_support
   copy_doubao_credentials_if_present
   rm -f "$RESOLVE_DIR/SubFix.lua" "$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua" "$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua" "$RESOLVE_DIR/subfix_asr_transcribe.py" "$RESOLVE_DIR/setup_asr_env.sh" 2>/dev/null || true
@@ -127,6 +129,7 @@ if command -v rsync &> /dev/null; then
     && rsync -av "$SOURCE_GENERATOR_LUA" "$SUBFIX_MENU_DIR/生成选区字幕.lua" \
     && rsync -av "$SOURCE_GENERATE_CORE" "$HELPER_DIR/subfix_generate_selection_core.lua" \
     && rsync -av "$SOURCE_QWEN_LOCAL_MANAGER" "$HELPER_DIR/subfix_qwen_local_manager.py" \
+    && rsync -av "$SOURCE_PROCESS_GROUP" "$HELPER_DIR/subfix_process_group.py" \
     && rsync -av "$SOURCE_UPDATE_HELPER" "$HELPER_DIR/subfix_update.py" \
     && rsync -av "$SOURCE_ASR_HELPER" "$HELPER_DIR/subfix_asr_transcribe.py" \
     && rsync -av "$SOURCE_GENERATE_V4" "$HELPER_DIR/subfix_generate_v4.py" \
@@ -136,7 +139,7 @@ if command -v rsync &> /dev/null; then
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE" "$HELPER_DIR/segmentation_profile.json" \
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V3" "$HELPER_DIR/segmentation_profile_v3.json" \
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" 2>/dev/null; then
-    chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" 2>/dev/null || true
+    chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" "$HELPER_DIR/subfix_process_group.py" 2>/dev/null || true
     link_qwen_support
     copy_doubao_credentials_if_present
     rm -f "$RESOLVE_DIR/SubFix.lua" "$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua" "$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua" "$RESOLVE_DIR/subfix_asr_transcribe.py" "$RESOLVE_DIR/setup_asr_env.sh" 2>/dev/null || true
@@ -169,6 +172,7 @@ echo "cp \"$SOURCE_LUA\" \"$SUBFIX_MENU_DIR/SubFix.lua\""
 echo "cp \"$SOURCE_GENERATOR_LUA\" \"$SUBFIX_MENU_DIR/生成选区字幕.lua\""
 echo "cp \"$SOURCE_GENERATE_CORE\" \"$HELPER_DIR/subfix_generate_selection_core.lua\""
 echo "cp \"$SOURCE_QWEN_LOCAL_MANAGER\" \"$HELPER_DIR/subfix_qwen_local_manager.py\""
+echo "cp \"$SOURCE_PROCESS_GROUP\" \"$HELPER_DIR/subfix_process_group.py\""
 echo "cp \"$SOURCE_UPDATE_HELPER\" \"$HELPER_DIR/subfix_update.py\""
 echo "cp \"$SOURCE_ASR_HELPER\" \"$HELPER_DIR/subfix_asr_transcribe.py\""
 echo "cp \"$SOURCE_GENERATE_V4\" \"$HELPER_DIR/subfix_generate_v4.py\""

@@ -26,6 +26,7 @@ UPDATE_FILE_PATHS = frozenset(
         "SubFix/SubFix.lua",
         "SubFix/生成选区字幕.lua",
         ".subfix_support/subfix_generate_selection_core.lua",
+        ".subfix_support/subfix_process_group.py",
         ".subfix_support/subfix_update.py",
         ".subfix_support/subfix_asr_transcribe.py",
         ".subfix_support/subfix_generate_v4.py",
