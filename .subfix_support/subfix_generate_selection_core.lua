@@ -3160,14 +3160,23 @@ local function run_background_command_with_progress(cmd, progress_path, progress
     if not file_exists(paths.runtime_python) then
         return false, "未找到 SubFix 内置 Python", nil
     end
-    if not file_exists(paths.process_group) then
-        return false, "缺少 SubFix 后台进程管理器", nil
+    local grouped_cmd
+    if file_exists(paths.process_group) then
+        grouped_cmd = table.concat({
+            shell_quote(paths.runtime_python),
+            shell_quote(paths.process_group),
+            shell_quote(cmd),
+        }, " ")
+    else
+        -- v3.2.0 cannot add new paths, so incremental upgrades need an inline equivalent.
+        local inline_group_code = 'import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])'
+        grouped_cmd = table.concat({
+            shell_quote(paths.runtime_python),
+            "-c",
+            shell_quote(inline_group_code),
+            shell_quote(cmd),
+        }, " ")
     end
-    local grouped_cmd = table.concat({
-        shell_quote(paths.runtime_python),
-        shell_quote(paths.process_group),
-        shell_quote(cmd),
-    }, " ")
 
     local bg_cmd = string.format(
         "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) &",
