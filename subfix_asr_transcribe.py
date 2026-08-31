@@ -4372,7 +4372,11 @@ def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None)
         result = query_payload.get("result")
         if query_status == DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE and not isinstance(result, dict):
             result = {}
-        if isinstance(result, dict):
+        # Processing/queued responses may include an empty result object; only terminal states may consume it.
+        if query_status in {
+            DOUBAO_ASR_SUCCESS_STATUS_CODE,
+            DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE,
+        } and isinstance(result, dict):
             segments, words = _doubao_asr_timestamp_payload(result)
             return {
                 "backend": "doubao_asr_v2",
