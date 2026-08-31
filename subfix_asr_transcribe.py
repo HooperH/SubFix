@@ -406,6 +406,8 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "track_composite_count",
         "context_window_count",
         "asr_empty_speech_window_count",
+        "asr_tolerated_empty_speech_window_count",
+        "asr_empty_speech_subwindow_count",
         "asr_single_retry_count",
         "asr_subwindow_retry_count",
         "asr_recovered_window_count",
@@ -513,6 +515,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "alignment_repaired",
         "asr_recovery",
         "speech_seconds",
+        "asr_empty_speech_subwindow_count",
         "asr_punctuation_strength",
         "independent_vad",
         "candidate_kind",
@@ -4649,6 +4652,7 @@ def recover_v4_asr_window(
         "asr_recovery": "not_needed",
         "asr_single_retry_count": 0,
         "asr_subwindow_retry_count": 0,
+        "asr_empty_speech_subwindow_count": 0,
         "speech_seconds": 0.0,
     }
     if generate_v4.normalize_text(payload.get("text")):
@@ -4656,6 +4660,9 @@ def recover_v4_asr_window(
 
     transcribe_fn = transcribe_fn or transcribe_qwen3_asr
     detect_speech_fn = detect_speech_fn or detect_speech_regions
+    # Cloud ASR may validly suppress noise that local VAD classifies as speech;
+    # keep Qwen fail-fast while allowing explicit Doubao backends to continue.
+    is_doubao_backend = str(payload.get("backend") or "") in DOUBAO_ASR_BACKENDS
     window_audio_path = Path(str(window.get("audio_path") or ""))
     speech_regions, _onsets, _speech_diagnostic = detect_speech_fn(window_audio_path)
     speech_seconds = sum(
@@ -4682,6 +4689,9 @@ def recover_v4_asr_window(
         stride_seconds=20.0,
     )
     if len(retry_windows) < 2:
+        if is_doubao_backend:
+            diagnostic["asr_recovery"] = "accepted_doubao_empty_speech"
+            return dict(serial_payload or payload), diagnostic
         raise generate_v4.V4AlignmentError("v4 有人声窗口转写为空，已终止写回")
 
     retry_dir = Path(retry_dir)
@@ -4711,7 +4721,9 @@ def recover_v4_asr_window(
                 for region in retry_regions or []
             )
             if retry_speech_seconds >= 0.30:
-                raise generate_v4.V4AlignmentError("v4 有人声子窗口转写为空，已终止写回")
+                diagnostic["asr_empty_speech_subwindow_count"] += 1
+                if not is_doubao_backend:
+                    raise generate_v4.V4AlignmentError("v4 有人声子窗口转写为空，已终止写回")
             continue
         texts.append(retry_text)
 
@@ -4719,6 +4731,9 @@ def recover_v4_asr_window(
     for text in texts:
         merged_text = generate_v4.merge_asr_transcripts(merged_text, text)
     if not generate_v4.normalize_text(merged_text):
+        if is_doubao_backend:
+            diagnostic["asr_recovery"] = "accepted_doubao_empty_speech"
+            return dict(serial_payload or payload), diagnostic
         raise generate_v4.V4AlignmentError("v4 有人声窗口转写为空，已终止写回")
 
     recovered = dict(serial_payload or payload)
@@ -5366,6 +5381,8 @@ def run_generate_subtitles_batch_plan_v4(
         "near_duplicate_suppressed_count": 0,
         "short_speaker_flip_suppressed_count": 0,
         "asr_empty_speech_window_count": 0,
+        "asr_tolerated_empty_speech_window_count": 0,
+        "asr_empty_speech_subwindow_count": 0,
         "asr_single_retry_count": 0,
         "asr_subwindow_retry_count": 0,
         "asr_recovered_window_count": 0,
@@ -5548,9 +5565,15 @@ def run_generate_subtitles_batch_plan_v4(
                 diagnostic["asr_unrecovered_window_count"] += 1
                 raise
             recovery = str(recovery_diagnostic.get("asr_recovery") or "not_needed")
-            if recovery not in {"not_needed", "accepted_silence"}:
+            if recovery == "accepted_doubao_empty_speech":
+                diagnostic["asr_empty_speech_window_count"] += 1
+                diagnostic["asr_tolerated_empty_speech_window_count"] += 1
+            elif recovery not in {"not_needed", "accepted_silence"}:
                 diagnostic["asr_empty_speech_window_count"] += 1
                 diagnostic["asr_recovered_window_count"] += 1
+            diagnostic["asr_empty_speech_subwindow_count"] += int(
+                recovery_diagnostic.get("asr_empty_speech_subwindow_count") or 0
+            )
             diagnostic["asr_single_retry_count"] += int(
                 recovery_diagnostic.get("asr_single_retry_count") or 0
             )
@@ -5644,6 +5667,9 @@ def run_generate_subtitles_batch_plan_v4(
                     "text": str(raw_payload.get("text") or ""),
                     "asr_recovery": str(recovery_diagnostic.get("asr_recovery") or "not_needed"),
                     "speech_seconds": float(recovery_diagnostic.get("speech_seconds") or 0.0),
+                    "asr_empty_speech_subwindow_count": int(
+                        recovery_diagnostic.get("asr_empty_speech_subwindow_count") or 0
+                    ),
                     "candidate_kind": str(window.get("candidate_kind") or "primary"),
                     "retry_reason": str(window.get("retry_reason") or ""),
                 }
