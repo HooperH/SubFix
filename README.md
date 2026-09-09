@@ -72,7 +72,7 @@ You can also use the helper script:
 The package build script uses the root `SubFix.lua` source file by default:
 
 ```bash
-VERSION=3.2.4 ./build_pkg.sh
+VERSION=3.2.5 ./build_pkg.sh
 ```
 
 Build output is written to `dist/`. Generated packages and zip files are ignored
@@ -159,7 +159,7 @@ Workspace -> Scripts -> SubFix
 打包脚本默认使用根目录下的最新版 `SubFix.lua`：
 
 ```bash
-VERSION=3.2.4 ./build_pkg.sh
+VERSION=3.2.5 ./build_pkg.sh
 ```
 
 构建产物会输出到 `dist/`。安装包和 zip 分发文件已被 Git 忽略，因此仓库保持源码优先。

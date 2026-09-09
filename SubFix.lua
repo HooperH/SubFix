@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.2.4"
+SUBFIX_VERSION = "3.2.5"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -41,10 +41,51 @@ print(string.format("[Hooper AI 2.0] [STARTUP] Lua 主 chunk 起步: +%d ms", st
 -- 使用全局命名空间以避开主 chunk 的 Lua 5.1 local 槽位上限。
 SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
 
-function SUBFIX_WINDOW_GEOMETRY.primary_screen_bounds()
+function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not (io and io.popen) then return nil end
 
-    local jxa = [[ObjC.import("AppKit");$.NSApplication.sharedApplication;const screen=$.NSScreen.screens.objectAtIndex(0);if(!screen){throw new Error("primary screen unavailable");}const frame=screen.frame;const visible=screen.visibleFrame;const left=Number(visible.origin.x);const top=Number(frame.size.height)-Number(visible.origin.y)-Number(visible.size.height);console.log([left,top,Number(visible.size.width),Number(visible.size.height)].join(","));]]
+    -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
+    local jxa = [[(function () {
+    ObjC.import("AppKit");
+    ObjC.import("CoreGraphics");
+    const screens = $.NSScreen.screens;
+    const primary = screens.objectAtIndex(0);
+    const desktopTop = Number(primary.frame.origin.y) + Number(primary.frame.size.height);
+    function screenRect(frame) {
+        return {x: Number(frame.origin.x),
+            y: desktopTop - Number(frame.origin.y) - Number(frame.size.height),
+            width: Number(frame.size.width), height: Number(frame.size.height)};
+    }
+    let selected = primary;
+    let mainWindow = null;
+    let largestArea = 0;
+    try {
+        const raw = $.CGWindowListCopyWindowInfo(17, 0);
+        const windows = ObjC.deepUnwrap(ObjC.castRefToObject(raw));
+        for (const window of windows) {
+            if (!/^(DaVinci Resolve|Resolve)$/i.test(String(window.kCGWindowOwnerName || ""))
+                || Number(window.kCGWindowLayer) !== 0 || Number(window.kCGWindowAlpha) === 0) continue;
+            const bounds = window.kCGWindowBounds;
+            const area = bounds ? Number(bounds.Width) * Number(bounds.Height) : 0;
+            if (area > largestArea) { largestArea = area; mainWindow = bounds; }
+        }
+    } catch (error) {
+        // Window information may be unavailable; retain the primary display fallback.
+    }
+    if (mainWindow) {
+        let largestOverlap = 0;
+        for (let i = 0; i < Number(screens.count); i++) {
+            const screen = screens.objectAtIndex(i);
+            const rect = screenRect(screen.frame);
+            const overlapWidth = Math.max(0, Math.min(rect.x + rect.width, Number(mainWindow.X) + Number(mainWindow.Width)) - Math.max(rect.x, Number(mainWindow.X)));
+            const overlapHeight = Math.max(0, Math.min(rect.y + rect.height, Number(mainWindow.Y) + Number(mainWindow.Height)) - Math.max(rect.y, Number(mainWindow.Y)));
+            const overlap = overlapWidth * overlapHeight;
+            if (overlap > largestOverlap) { largestOverlap = overlap; selected = screen; }
+        }
+    }
+    const visible = screenRect(selected.visibleFrame);
+    return [visible.x, visible.y, visible.width, visible.height].join(",");
+})();]]
     local escaped = jxa:gsub("'", "'\\\"'\\\"'")
     local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
     if not pipe then return nil end
@@ -63,7 +104,7 @@ function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
     local height = tonumber(fallback_geometry and fallback_geometry[4])
     if not fallback_x or not fallback_y or not width or not height then return fallback_geometry end
 
-    local screen = SUBFIX_WINDOW_GEOMETRY.primary_screen_bounds()
+    local screen = SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not screen then return fallback_geometry end
 
     local x = screen.x
@@ -3271,6 +3312,8 @@ local function sync_track_control(target_window)
 end
 
 local function sync_search_control(target_window)
+    -- 批量查找仅借用预览区，不把查找词回写到普通搜索框。
+    if SEARCH_VIEW.input_id == "FindInput" then return end
     local box = find_window_item(target_window, "SearchBox", "MiniSearchBox")
     if not box then return end
 
@@ -3280,7 +3323,12 @@ local function sync_search_control(target_window)
 end
 
 local function update_search_query_from_window(target_window)
-    local box = find_window_item(target_window, "SearchBox", "MiniSearchBox")
+    local box
+    if SEARCH_VIEW.input_id == "FindInput" and SEARCH_VIEW.input_window == target_window then
+        box = find_window_item(target_window, "FindInput")
+    else
+        box = find_window_item(target_window, "SearchBox", "MiniSearchBox")
+    end
     if box then
         current_search_query = trim(box.Text or "")
     else
@@ -6018,6 +6066,11 @@ function long_task_progress_elapsed_text(started_at)
 end
 
 function long_task_progress_bar_text(progress_state, payload)
+    if payload and payload.indeterminate == true then
+        local width = LONG_TASK_PROGRESS_BAR_WIDTH
+        local position = math.max(0, os.time() - progress_state.started_at) % width
+        return string.rep("□", position) .. "ᗧ" .. string.rep("□", width - position - 1) .. "⚑", nil
+    end
     local total = tonumber(payload and payload.progress_total)
     local index = tonumber(payload and payload.progress_index)
     if not total or not index or total <= 0 then
@@ -6097,7 +6150,7 @@ function show_long_task_progress_window(options)
             Weight = 0,
             Spacing = 8,
             ui:HGap(0, 1),
-            ui:Button{ID = "LongTaskProgressCancelBtn", Text = "取消", Weight = 0, MinimumSize = {88, 28}},
+            ui:Button{ID = "LongTaskProgressCancelBtn", Text = options.cancellable == false and "更新中" or "取消", Enabled = options.cancellable ~= false, Weight = 0, MinimumSize = {88, 28}},
             ui:HGap(0, 1)
         }
     })
@@ -6109,6 +6162,7 @@ function show_long_task_progress_window(options)
             progress_window:Hide()
             return
         end
+        if options.cancellable == false then return end
         progress_state.cancel_requested = true
         if type(progress_state.on_cancel) == "function" then
             progress_state.on_cancel(progress_state)
@@ -6145,7 +6199,9 @@ function update_long_task_progress_window(progress_state, payload, status_overri
 
     if items.LongTaskProgressStatusLabel then items.LongTaskProgressStatusLabel.Text = status_text end
     if items.LongTaskProgressBarLabel then items.LongTaskProgressBarLabel.Text = bar end
-    if items.LongTaskProgressMetaLabel then items.LongTaskProgressMetaLabel.Text = "进度 " .. tostring(percent) .. "%  ·  用时 " .. elapsed end
+    if items.LongTaskProgressMetaLabel then
+        items.LongTaskProgressMetaLabel.Text = (percent == nil and "处理中" or ("进度 " .. tostring(percent) .. "%")) .. "  ·  用时 " .. elapsed
+    end
 end
 
 function finish_long_task_progress_window(progress_state, status, message)
@@ -6166,6 +6222,7 @@ function finish_long_task_progress_window(progress_state, status, message)
     local ok_items, items = pcall(function() return progress_window:GetItems() end)
     if ok_items and items and items.LongTaskProgressCancelBtn then
         items.LongTaskProgressCancelBtn.Text = "关闭"
+        items.LongTaskProgressCancelBtn.Enabled = true
     end
 end
 
@@ -6345,6 +6402,13 @@ function run_subfix_background_command(cmd, options)
     local cancelled = false
     local output = ""
 
+    local function background_cancel_requested()
+        if options.progress_state then
+            return options.progress_state.cancel_requested == true
+        end
+        return NORMALIZE_CANCEL_REQUESTED == true or is_normalize_progress_cancelled()
+    end
+
     os.execute(string.format("rm -f %s %s %s %s 2>/dev/null",
         shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
 
@@ -6392,6 +6456,14 @@ function run_subfix_background_command(cmd, options)
     end
 
     local function update_progress_from_file()
+        if options.progress_state then
+            update_long_task_progress_window(options.progress_state, {
+                stage = options.status_prefix,
+                message = options.status_prefix,
+                indeterminate = true
+            })
+            update_background_status(nil)
+        end
         if not progress_file or progress_file == "" then return end
         local progress_text = read_text_file(progress_file)
         if not progress_text or progress_text == "" then return end
@@ -6438,7 +6510,7 @@ function run_subfix_background_command(cmd, options)
 
     register_ui_timer(poll_timer, function()
         update_progress_from_file()
-        if NORMALIZE_CANCEL_REQUESTED == true or is_normalize_progress_cancelled() then
+        if background_cancel_requested() then
             cancelled = true
             kill_normalize_background_process(pid_file)
             stop_and_exit_nested()
@@ -6468,7 +6540,7 @@ function run_subfix_background_command(cmd, options)
     if not nested_ok then
         while true do
             update_progress_from_file()
-            if NORMALIZE_CANCEL_REQUESTED == true or is_normalize_progress_cancelled() then
+            if background_cancel_requested() then
                 cancelled = true
                 kill_normalize_background_process(pid_file)
                 break
@@ -6503,7 +6575,10 @@ function run_subfix_background_command(cmd, options)
         shell_quote(exit_file),
         progress_file and shell_quote(progress_file) or "''"))
 
-    if cancelled or is_normalize_progress_cancelled() then
+    if cancelled then
+        return false, "已取消", "cancelled"
+    end
+    if background_cancel_requested() then
         return false, "已取消", "cancelled"
     end
     return exit_code == 0, output, nil
@@ -18038,33 +18113,27 @@ end
 function show_normalize_length_config_dialog(target_window)
     pending_normalize_length_config_window = resolve_window(target_window) or active_window or win
 
+    local function refresh_options()
+        local align_audio = NormalizeLengthConfigWin:Find("NormalizeLengthAlignAudioCheckbox").Checked == true
+        local fill_gaps = NormalizeLengthConfigWin:Find("NormalizeLengthFillGapsCheckbox").Checked == true
+        NormalizeLengthConfigWin:Find("NormalizeLengthStartBtn").Enabled = align_audio or fill_gaps
+        return align_audio, fill_gaps
+    end
+
     if not NormalizeLengthConfigWin then
         NormalizeLengthConfigWin = dispatcher:AddWindow({
             ID = "NormalizeLengthConfigWin",
             WindowTitle = "规整字幕长度配置",
-            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({360, 240, 320, 170})
+            Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({360, 240, 360, 100})
         },
         ui:VGroup{
-            ContentsMargins = 10,
-            Spacing = 6,
-            ui:Label{
-                Text = "字幕对齐音频偏移",
+            ContentsMargins = {18, 14, 18, 14},
+            Spacing = 16,
+            ui:HGroup{
                 Weight = 0,
-                MinimumSize = {0, 24}
-            },
-            ui:LineEdit{
-                ID = "NormalizeLengthBiasInput",
-                Text = "自动",
-                Weight = 0,
-                MinimumSize = {0, 32},
-                Alignment = {AlignHCenter = true, AlignVCenter = true}
-            },
-            ui:VGap(4),
-            ui:Label{
-                Text = "自动：按本次 Qwen 对齐结果校准。\n手动：-10～10 帧（负数提前，正数延后）",
-                Weight = 0,
-                MinimumSize = {0, 36},
-                WordWrap = true
+                Spacing = 16,
+                ui:CheckBox{ID = "NormalizeLengthAlignAudioCheckbox", Text = "字幕音频对齐", Checked = true, Weight = 1, MinimumSize = {0, 24}},
+                ui:CheckBox{ID = "NormalizeLengthFillGapsCheckbox", Text = "消除字幕空隙", Checked = true, Weight = 1, MinimumSize = {0, 24}}
             },
             ui:HGroup{
                 Weight = 0,
@@ -18079,16 +18148,23 @@ function show_normalize_length_config_dialog(target_window)
             NormalizeLengthConfigWin:Hide()
         end
 
-        function NormalizeLengthConfigWin.On.NormalizeLengthStartBtn.Clicked(ev)
-            local bias_input = NormalizeLengthConfigWin:Find("NormalizeLengthBiasInput")
-            local normalize_bias_mode, normalize_bias_frames = SUBFIX_AUDIO_ALIGN.parse_normalize_length_bias_input(bias_input and bias_input.Text or nil)
-            if bias_input then
-                bias_input.Text = normalize_bias_mode == "auto" and "自动" or tostring(normalize_bias_frames)
-            end
+        function NormalizeLengthConfigWin.On.NormalizeLengthAlignAudioCheckbox.Clicked(ev)
+            refresh_options()
+        end
 
+        function NormalizeLengthConfigWin.On.NormalizeLengthFillGapsCheckbox.Clicked(ev)
+            refresh_options()
+        end
+
+        function NormalizeLengthConfigWin.On.NormalizeLengthStartBtn.Clicked(ev)
+            local align_audio, fill_gaps = refresh_options()
+            if not align_audio and not fill_gaps then return end
             local target = pending_normalize_length_config_window or active_window or win
             pending_normalize_length_window = target
-            pending_normalize_length_options = {bias_frames = normalize_bias_frames, bias_mode = normalize_bias_mode, start_mode = "balanced"}
+            pending_normalize_length_options = {
+                align_audio = align_audio, fill_gaps = fill_gaps,
+                bias_frames = 0, bias_mode = "auto", start_mode = "balanced"
+            }
             NormalizeLengthConfigWin:Hide()
             update_shared_status(target, "正在规整字幕长度...")
             if not restart_ui_timer(normalize_length_timer) then
@@ -18104,11 +18180,8 @@ function show_normalize_length_config_dialog(target_window)
         end
     end
 
-    local bias_input = NormalizeLengthConfigWin:Find("NormalizeLengthBiasInput")
-    if bias_input then
-        local bias_mode, bias_frames = SUBFIX_AUDIO_ALIGN.parse_normalize_length_bias_input(bias_input.Text)
-        bias_input.Text = bias_mode == "auto" and "自动" or tostring(bias_frames)
-    end
+    refresh_options()
+    NormalizeLengthConfigWin:SetAttrs({Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({360, 240, 360, 100})})
     NormalizeLengthConfigWin:Show()
     return NormalizeLengthConfigWin
 end
@@ -18219,8 +18292,10 @@ register_ui_timer(pre_delivery_final_check_timer, function()
     run_pre_delivery_final_check(target_window)
 end)
 
-function schedule_debounced_search(target_window)
+function schedule_debounced_search(target_window, input_id)
     pending_search_window = target_window or active_window or mini_win or win
+    SEARCH_VIEW.input_window = pending_search_window
+    SEARCH_VIEW.input_id = input_id
     restart_ui_timer(search_debounce_timer)
 end
 
@@ -18438,6 +18513,11 @@ function win.On.SearchBox.TextChanged(ev)
     if suppress_search_change_events then return end
     -- 同样走防抖，主窗口列表行数也很多时同样受益
     schedule_debounced_search(win)
+end
+
+function win.On.FindInput.TextChanged(ev)
+    if suppress_search_change_events then return end
+    schedule_debounced_search(win, "FindInput")
 end
 
 -- 批量替换按钮
@@ -19023,7 +19103,7 @@ function win.On.BtnStep2.Clicked(ev)
     show_chinese_number_conversion_direction_dialog(win)
 end
 
--- 3️⃣ 规整字幕长度（轻量音频吸附 + 小空隙填补）
+-- 3️⃣ 规整字幕长度（可独立选择音频对齐和小空隙填补）
 function run_normalize_subtitle_length(target_window, options)
     options = type(options) == "table" and options or {}
     local window = resolve_window(target_window) or win
@@ -19033,6 +19113,13 @@ function run_normalize_subtitle_length(target_window, options)
         return
     end
 
+    -- 未传选项时保持旧行为；兼容旧调用中的 start_mode = "off"。
+    local align_audio = options.align_audio ~= false and options.start_mode ~= "off"
+    local fill_gaps = options.fill_gaps ~= false
+    if not align_audio and not fill_gaps then
+        update_shared_status(window, "请至少选择一项操作：字幕音频对齐或消除字幕空隙")
+        return
+    end
     local normalize_progress = start_normalize_progress(window, #current_rows)
     local fps = tonumber(current_fps) or 24.0
     local normalize_bias_frames = SUBFIX_AUDIO_ALIGN.clamp_normalize_length_bias_frames(options.bias_frames)
@@ -19046,7 +19133,7 @@ function run_normalize_subtitle_length(target_window, options)
     local audio_alignment_effective = false
     local stable_align_err = nil
     local audio_alignment_stats = nil
-    if normalize_start_mode ~= "off" then
+    if align_audio then
         update_shared_status(window, "正在规整字幕长度：正在对齐音频...")
         update_normalize_progress({stage = "CTC 对齐", message = "正在对齐音频...", log = "进入 CTC 对齐阶段，起点模式 " .. tostring(normalize_start_mode) .. "，偏移模式 " .. tostring(normalize_bias_mode) .. "，偏移帧 " .. tostring(normalize_bias_frames)})
         audio_aligned_count, audio_alignment_effective, stable_align_err, audio_alignment_stats =
@@ -19058,6 +19145,12 @@ function run_normalize_subtitle_length(target_window, options)
             return
         end
         if audio_aligned_count == nil then
+            if not fill_gaps then
+                local message = "字幕音频对齐失败：" .. tostring(stable_align_err or "未知错误") .. "；请检查音频源后重试"
+                update_shared_status(window, message)
+                finish_normalize_progress("failed", message)
+                return
+            end
             LogMsg("受保护音频修正失败，继续执行纯规整空隙: " .. tostring(stable_align_err or "未知错误"))
             update_normalize_progress({
                 stage = "Qwen3 对齐未生效",
@@ -19069,15 +19162,15 @@ function run_normalize_subtitle_length(target_window, options)
             LogMsg(tostring(stable_align_err or "音频修正未生效"))
             update_normalize_progress({
                 stage = "Qwen3 对齐未生效",
-                message = tostring(stable_align_err or "Qwen3 对齐未生效，继续规整空隙"),
+                message = tostring(stable_align_err or (fill_gaps and "Qwen3 对齐未生效，继续规整空隙" or "Qwen3 对齐未移动字幕")),
                 log = tostring(stable_align_err or "Qwen3 对齐未生效")
             })
         end
     else
         update_normalize_progress({
             stage = "规整空隙",
-            message = "修正起点已关闭，保留原始起点",
-            log = "跳过 CTC 起点修正，只规整长度和空隙"
+            message = "未选择音频对齐，仅消除字幕空隙",
+            log = "跳过音频对齐，保留原始起点"
         })
     end
     audio_aligned_count = tonumber(audio_aligned_count) or 0
@@ -19087,42 +19180,44 @@ function run_normalize_subtitle_length(target_window, options)
         finish_normalize_progress("cancelled", cancel_msg)
         return
     end
-    update_normalize_progress({stage = "填补空隙", message = "正在填补字幕之间的小空隙...", progress_index = 98, progress_total = 100, log = "开始填补小空隙"})
     local count = 0
     local total = #current_rows
     local report_entries = {}
     local active_gap_threshold = gap_threshold
 
-    for i = 1, total - 1 do
-        local curr = current_rows[i]
-        local nxt = current_rows[i + 1]
-        if curr and nxt then
-            local curr_end = tonumber(curr.end_frame)
-            local nxt_start = tonumber(nxt.start_frame)
-            local gap = nil
+    if fill_gaps then
+        update_normalize_progress({stage = "填补空隙", message = "正在填补字幕之间的小空隙...", progress_index = 98, progress_total = 100, log = "开始填补小空隙"})
+        for i = 1, total - 1 do
+            local curr = current_rows[i]
+            local nxt = current_rows[i + 1]
+            if curr and nxt then
+                local curr_end = tonumber(curr.end_frame)
+                local nxt_start = tonumber(nxt.start_frame)
+                local gap = nil
 
-            if curr_end and nxt_start then
-                gap = nxt_start - curr_end
-            end
+                if curr_end and nxt_start then
+                    gap = nxt_start - curr_end
+                end
 
-            if gap and gap > 0 and gap <= active_gap_threshold then
-                local original_end = curr.end_frame
-                curr.end_frame = nxt_start
-                curr.target_abs_frame = math.floor((curr.start_frame + curr.end_frame) / 2)
-                count = count + 1
-                -- 记录可还原条目：原文/修改后用「原始字幕文本」+「填补 N 帧空隙」作展示
-                local entry = report_helpers.format_batch_change_report_line(
-                    curr.index or i,
-                    tostring(curr.text or ""),
-                    string.format("[填补 %d 帧空隙]  %s", gap, tostring(curr.text or "")),
-                    {
-                        row_id = curr.id,
-                        revert_kind = "end_frame",
-                        original_end_frame = original_end,
-                        updated_end_frame = nxt_start,
-                    }
-                )
-                table.insert(report_entries, entry)
+                if gap and gap > 0 and gap <= active_gap_threshold then
+                    local original_end = curr.end_frame
+                    curr.end_frame = nxt_start
+                    curr.target_abs_frame = math.floor((curr.start_frame + curr.end_frame) / 2)
+                    count = count + 1
+                    -- 记录可还原条目：原文/修改后用「原始字幕文本」+「填补 N 帧空隙」作展示
+                    local entry = report_helpers.format_batch_change_report_line(
+                        curr.index or i,
+                        tostring(curr.text or ""),
+                        string.format("[填补 %d 帧空隙]  %s", gap, tostring(curr.text or "")),
+                        {
+                            row_id = curr.id,
+                            revert_kind = "end_frame",
+                            original_end_frame = original_end,
+                            updated_end_frame = nxt_start,
+                        }
+                    )
+                    table.insert(report_entries, entry)
+                end
             end
         end
     end
@@ -19138,7 +19233,14 @@ function run_normalize_subtitle_length(target_window, options)
     local moved_backward_count = tonumber(audio_alignment_stats and audio_alignment_stats.moved_backward_better) or 0
     local diagnostic_json_path = audio_alignment_stats and audio_alignment_stats.diagnostic_json_path
     local diagnostic_suffix = diagnostic_json_path and diagnostic_json_path ~= "" and (" 诊断: " .. tostring(diagnostic_json_path)) or ""
-    if audio_alignment_effective then
+    if not align_audio then
+        msg = string.format("规整字幕长度完成：已消除 %d 处小空隙，未执行音频对齐。点“更新时间线”写回。", count)
+    elseif not fill_gaps then
+        msg = string.format("字幕音频对齐完成：保持原位 %d 条，后移修正 %d 条，前移修正 %d 条；未执行消除空隙。%s 点“更新时间线”写回。", preserved_count, moved_forward_count, moved_backward_count, diagnostic_suffix)
+        if not audio_alignment_effective then
+            msg = "字幕音频对齐未移动字幕：" .. tostring(stable_align_err or "未找到更合适的边界") .. "；未执行消除空隙。" .. diagnostic_suffix
+        end
+    elseif audio_alignment_effective then
         msg = string.format("[Hooper AI 2.0] 🧲 规整字幕长度完成：保持原位 %d 条，后移修正 %d 条，前移修正 %d 条，填补 %d 处小空隙。%s 点“更新时间线”写回。", preserved_count, moved_forward_count, moved_backward_count, count, diagnostic_suffix)
     else
         msg = string.format("[Hooper AI 2.0] 🧲 仅规整空隙，Qwen3 对齐未生效：%s；保持原位 %d 条，填补 %d 处小空隙。%s 点“更新时间线”写回。", tostring(stable_align_err or "未移动字幕"), preserved_count, count, diagnostic_suffix)
@@ -19626,6 +19728,8 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     local max_subtitle_duration_seconds = tonumber(PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS) or 6
     local max_subtitle_chars = tonumber(PRE_DELIVERY_MAX_SUBTITLE_CHARS) or 24
     local subtitle_gap_warning_frames = tonumber(PRE_DELIVERY_SUBTITLE_GAP_WARNING_FRAMES) or 3
+    -- 与消除空隙保持相同范围；更长的停顿不能仅凭字幕间隔判定异常。
+    local subtitle_gap_max_frames = math.max(1, math.floor(rate * 2 + 0.5))
     local cut_tolerance_frames = tonumber(PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES) or 6
     local cut_frames = collect_visible_timeline_cut_frames(timeline)
     local transition_alignment_cuts = collect_timeline_transition_alignment_cuts(timeline)
@@ -19699,7 +19803,7 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             end
             if previous_row and previous_end then
                 local gap_frames = row_start - previous_end
-                if gap_frames > subtitle_gap_warning_frames then
+                if gap_frames > subtitle_gap_warning_frames and gap_frames <= subtitle_gap_max_frames then
                     local gap_marker_frame = math.floor(((previous_end + row_start) / 2) + 0.5)
                     add_issue(
                         row,
@@ -21775,6 +21879,37 @@ function show_subfix_update_confirm(payload)
     return action
 end
 
+function run_subfix_update_with_progress(cmd, output_path, task_name, cancellable)
+    local progress_state, progress_error = show_long_task_progress_window({
+        title = "SubFix · " .. task_name,
+        cancellable = cancellable
+    })
+    if not progress_state then return false, progress_error end
+    local message = "正在" .. task_name .. "..."
+    update_long_task_progress_window(progress_state, {message = message, indeterminate = true})
+    local call_ok, ok, output, status = pcall(run_subfix_background_command, cmd, {
+        status_window = win,
+        status_prefix = message,
+        status_started_at = progress_state.started_at,
+        progress_state = progress_state
+    })
+    local result = decode_json_text(read_text_file(output_path) or "")
+    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
+    if status == "cancelled" then
+        message = "已取消" .. task_name
+        finish_long_task_progress_window(progress_state, "cancelled", message)
+        return false, message
+    end
+    if not call_ok or not ok or type(result) ~= "table" or result.ok ~= true then
+        message = trim_text(tostring((not call_ok and ok) or (type(result) == "table" and result.error) or output or ""))
+        if message == "" then message = task_name .. "失败，请重试" end
+        finish_long_task_progress_window(progress_state, "failed", message)
+        return false, message
+    end
+    finish_long_task_progress_window(progress_state, "done", task_name .. "完成")
+    return true, result
+end
+
 function run_subfix_update(payload)
     local helper = subfix_update_helper_path()
     if not helper then return false, "缺少更新器，请先安装包含更新功能的 SubFix 版本" end
@@ -21788,34 +21923,37 @@ function run_subfix_update(payload)
         "--version", shell_quote(tostring(payload.version or "")),
         "--output", shell_quote(output_path)
     }, " ")
-    local ok, output = run_subfix_background_command(cmd, {status_window = win, status_prefix = "正在下载并安装更新"})
-    local result = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
-    if not ok or type(result) ~= "table" or result.ok ~= true then
-        return false, tostring(type(result) == "table" and result.error or output or "更新安装失败")
-    end
+    -- 安装器会替换多个文件，不能在写入途中终止。
+    local ok, result = run_subfix_update_with_progress(cmd, output_path, "下载并安装更新", false)
+    if not ok then return false, result end
     return true, "更新已安装。请完全退出并重新启动 DaVinci Resolve 后使用 v" .. tostring(payload.version)
 end
 
 function win.On.CheckUpdateBtn.Clicked(ev)
-    local helper = subfix_update_helper_path()
-    if not helper then update_shared_status(win, "缺少更新器；请先安装含更新功能的版本"); return end
-    local python = subfix_update_python_path(helper)
-    if not python then update_shared_status(win, "未找到 Python 3，无法检查更新"); return end
-    local output_path = "/tmp/subfix_update_check_" .. tostring(os.time()) .. ".json"
-    local cmd = table.concat({shell_quote(python), shell_quote(helper), "check", "--current-version", shell_quote(SUBFIX_VERSION), "--output", shell_quote(output_path)}, " ")
-    update_shared_status(win, "正在检查 SubFix 更新...")
-    local ok, output = run_subfix_background_command(cmd, {status_window = win, status_prefix = "正在检查更新"})
-    local payload = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
-    if not ok or type(payload) ~= "table" or payload.ok ~= true then
-        update_shared_status(win, tostring(type(payload) == "table" and payload.error or output or "检查更新失败")); return
-    end
-    if show_subfix_update_confirm(payload) == "install" then
-        local installed, message = run_subfix_update(payload)
-        update_shared_status(win, message)
-    else
-        update_shared_status(win, "已取消更新")
+    if SUBFIX_UPDATE_RUNNING then return end
+    SUBFIX_UPDATE_RUNNING = true
+    pcall(function() win:GetItems().CheckUpdateBtn.Enabled = false end)
+    local succeeded, failure = pcall(function()
+        local helper = subfix_update_helper_path()
+        if not helper then update_shared_status(win, "缺少更新器；请先安装含更新功能的版本"); return end
+        local python = subfix_update_python_path(helper)
+        if not python then update_shared_status(win, "未找到 Python 3，无法检查更新"); return end
+        local output_path = "/tmp/subfix_update_check_" .. tostring(os.time()) .. ".json"
+        local cmd = table.concat({shell_quote(python), shell_quote(helper), "check", "--current-version", shell_quote(SUBFIX_VERSION), "--output", shell_quote(output_path)}, " ")
+        update_shared_status(win, "正在检查 SubFix 更新...")
+        local ok, payload = run_subfix_update_with_progress(cmd, output_path, "检查更新", true)
+        if not ok then update_shared_status(win, payload); return end
+        if show_subfix_update_confirm(payload) == "install" then
+            local installed, message = run_subfix_update(payload)
+            update_shared_status(win, message)
+        else
+            update_shared_status(win, "已取消更新")
+        end
+    end)
+    SUBFIX_UPDATE_RUNNING = false
+    pcall(function() win:GetItems().CheckUpdateBtn.Enabled = true end)
+    if not succeeded then
+        update_shared_status(win, "更新流程失败，请重试：" .. tostring(failure))
     end
 end
 

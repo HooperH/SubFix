@@ -18,6 +18,8 @@ UPDATE_HELPER_FILE="${UPDATE_HELPER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_u
 ASR_HELPER_FILE="${ASR_HELPER_FILE:-${SCRIPT_DIR}/subfix_asr_transcribe.py}"
 GENERATE_V4_FILE="${GENERATE_V4_FILE:-${SCRIPT_DIR}/subfix_generate_v4.py}"
 GENERATE_V5_FILE="${GENERATE_V5_FILE:-${SCRIPT_DIR}/subfix_generate_v5.py}"
+GENERATE_TEXTNORM_FILE="${GENERATE_TEXTNORM_FILE:-${SCRIPT_DIR}/subfix_generate_textnorm.py}"
+QWEN_LOCAL_MANAGER_FILE="${QWEN_LOCAL_MANAGER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_qwen_local_manager.py}"
 ASR_SETUP_FILE="${ASR_SETUP_FILE:-${SCRIPT_DIR}/setup_asr_env.sh}"
 SEGMENTATION_PROFILE_FILE="${SEGMENTATION_PROFILE_FILE:-${SCRIPT_DIR}/.subfix_support/segmentation_profile.json}"
 SEGMENTATION_PROFILE_V3_FILE="${SEGMENTATION_PROFILE_V3_FILE:-${SCRIPT_DIR}/.subfix_support/segmentation_profile_v3.json}"
@@ -46,7 +48,7 @@ OUTPUT_ZIP_PATH="${RELEASE_ROOT}/${OUTPUT_ZIP_NAME}"
 
 echo "📦 开始构建 ${PKG_NAME} v${VERSION} 安装包..."
 
-for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
+for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$GENERATE_TEXTNORM_FILE" "$QWEN_LOCAL_MANAGER_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
     if [ ! -f "$required" ]; then
         echo "❌ 错误：源文件不存在：$required"
         exit 1
@@ -67,6 +69,8 @@ cp "$UPDATE_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_up
 cp "$ASR_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_asr_transcribe.py"
 cp "$GENERATE_V4_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_v4.py"
 cp "$GENERATE_V5_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_v5.py"
+cp "$GENERATE_TEXTNORM_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_textnorm.py"
+cp "$QWEN_LOCAL_MANAGER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_qwen_local_manager.py"
 cp "$ASR_SETUP_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/setup_asr_env.sh"
 cp "$SEGMENTATION_PROFILE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile.json"
 cp "$SEGMENTATION_PROFILE_V3_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile_v3.json"
@@ -142,6 +146,8 @@ cp "$UPDATE_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_update.py"
 cp "$ASR_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_asr_transcribe.py"
 cp "$GENERATE_V4_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_v4.py"
 cp "$GENERATE_V5_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_v5.py"
+cp "$GENERATE_TEXTNORM_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_textnorm.py"
+cp "$QWEN_LOCAL_MANAGER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_qwen_local_manager.py"
 cp "$ASR_SETUP_FILE" "${RELEASE_DIR}/.subfix_support/setup_asr_env.sh"
 cp "$SEGMENTATION_PROFILE_FILE" "${RELEASE_DIR}/.subfix_support/segmentation_profile.json"
 cp "$SEGMENTATION_PROFILE_V3_FILE" "${RELEASE_DIR}/.subfix_support/segmentation_profile_v3.json"
