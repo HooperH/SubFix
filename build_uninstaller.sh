@@ -1,121 +1,42 @@
 #!/bin/bash
-
-# =============================================================================
-# SubFix - 删除程序构建脚本
-# 功能：优先生成 macOS .app；若当前环境不支持，则回退为 .command
-# =============================================================================
-
+# Keep the familiar app entry point and reuse the auditable uninstall backend.
 set -euo pipefail
-
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)}"
-APP_NAME="${APP_NAME:-卸载_SubFix.app}"
-COMMAND_NAME="${COMMAND_NAME:-卸载_SubFix.command}"
-APP_PATH="${OUTPUT_DIR}/${APP_NAME}"
-COMMAND_PATH="${OUTPUT_DIR}/${COMMAND_NAME}"
-TMP_SCRIPT="${TMPDIR:-/tmp}/SubFix_uninstall.applescript"
-TARGET_DIR="/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
-SUBFIX_MENU_DIR="${TARGET_DIR}/SubFix"
-TARGET_PATH="${SUBFIX_MENU_DIR}/SubFix.lua"
-LEGACY_MAIN_PATH="${TARGET_DIR}/SubFix.lua"
-GENERATOR_PATH="${SUBFIX_MENU_DIR}/生成选区字幕.lua"
-LEGACY_SUBFIX_GENERATOR_PATH="${SUBFIX_MENU_DIR}/SubFix_GenerateSelectionSubtitles.lua"
-LEGACY_GENERATOR_PATH="${TARGET_DIR}/SubFix_GenerateSelectionSubtitles.lua"
-SUPPORT_DIR="${TARGET_DIR}/.subfix_support"
-GENERATE_CORE_PATH="${SUPPORT_DIR}/subfix_generate_selection_core.lua"
-ASR_HELPER_PATH="${SUPPORT_DIR}/subfix_asr_transcribe.py"
-ASR_SETUP_PATH="${SUPPORT_DIR}/setup_asr_env.sh"
-
-echo "🗑️ 开始构建删除程序..."
-
+APP_PATH="$OUTPUT_DIR/${APP_NAME:-卸载_SubFix.app}"
+SOURCE="$SCRIPT_DIR/卸载_SubFix.command"
 mkdir -p "$OUTPUT_DIR"
-rm -rf "$APP_PATH"
-rm -f "$COMMAND_PATH"
-
-build_app() {
-    if ! command -v osacompile >/dev/null 2>&1; then
-        return 1
-    fi
-
-    cat > "$TMP_SCRIPT" <<'EOF'
-set subfixMenuDir to "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/SubFix"
-set targetPath to subfixMenuDir & "/SubFix.lua"
-set legacyMainPath to "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/SubFix.lua"
-set generatorPath to subfixMenuDir & "/生成选区字幕.lua"
-set legacySubfixGeneratorPath to subfixMenuDir & "/SubFix_GenerateSelectionSubtitles.lua"
-set legacyGeneratorPath to "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/SubFix_GenerateSelectionSubtitles.lua"
-set supportDir to "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support"
-set generateCorePath to supportDir & "/subfix_generate_selection_core.lua"
-set asrHelperPath to supportDir & "/subfix_asr_transcribe.py"
-set asrSetupPath to supportDir & "/setup_asr_env.sh"
-set userHome to POSIX path of (path to home folder)
-set userUtility to userHome & "Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
-set userSupport to userUtility & "/.subfix_support"
-set commandText to "rm -f " & quoted form of targetPath & " " & quoted form of legacyMainPath & " " & quoted form of generatorPath & " " & quoted form of legacySubfixGeneratorPath & " " & quoted form of legacyGeneratorPath & " " & quoted form of generateCorePath & " " & quoted form of asrHelperPath & " " & quoted form of asrSetupPath & "; rmdir " & quoted form of subfixMenuDir & " 2>/dev/null || true; rm -rf " & quoted form of supportDir & " " & quoted form of (userUtility & "/SubFix") & " " & quoted form of userSupport
-do shell script commandText with administrator privileges
-EOF
-
-    osacompile -l AppleScript -o "$APP_PATH" "$TMP_SCRIPT" >/dev/null 2>&1
-}
-
-build_command() {
-    cat > "$COMMAND_PATH" <<EOF
-#!/bin/bash
-set -euo pipefail
-
-TARGET_PATH="$TARGET_PATH"
-LEGACY_MAIN_PATH="$LEGACY_MAIN_PATH"
-SUBFIX_MENU_DIR="$SUBFIX_MENU_DIR"
-GENERATOR_PATH="$GENERATOR_PATH"
-LEGACY_SUBFIX_GENERATOR_PATH="$LEGACY_SUBFIX_GENERATOR_PATH"
-LEGACY_GENERATOR_PATH="$LEGACY_GENERATOR_PATH"
-SUPPORT_DIR="$SUPPORT_DIR"
-GENERATE_CORE_PATH="$GENERATE_CORE_PATH"
-ASR_HELPER_PATH="$ASR_HELPER_PATH"
-ASR_SETUP_PATH="$ASR_SETUP_PATH"
-USER_UTILITY="\$HOME/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
-USER_SUPPORT="\$USER_UTILITY/.subfix_support"
-
-echo "即将删除："
-echo "\$TARGET_PATH"
-echo "\$LEGACY_MAIN_PATH"
-echo "\$GENERATOR_PATH"
-echo "\$LEGACY_SUBFIX_GENERATOR_PATH"
-echo "\$LEGACY_GENERATOR_PATH"
-echo "\$GENERATE_CORE_PATH"
-echo "\$ASR_HELPER_PATH"
-echo "\$ASR_SETUP_PATH"
-echo "\$SUPPORT_DIR"
-echo "\$USER_UTILITY/SubFix"
-echo "\$USER_SUPPORT"
-if sudo rm -f "\$TARGET_PATH" "\$LEGACY_MAIN_PATH" "\$GENERATOR_PATH" "\$LEGACY_SUBFIX_GENERATOR_PATH" "\$LEGACY_GENERATOR_PATH" "\$GENERATE_CORE_PATH" "\$ASR_HELPER_PATH" "\$ASR_SETUP_PATH" && { sudo rmdir "\$SUBFIX_MENU_DIR" 2>/dev/null || true; } && sudo rm -rf "\$SUPPORT_DIR" "\$USER_UTILITY/SubFix" "\$USER_SUPPORT"; then
-    echo ""
-    echo "✅ SubFix 卸载成功，请重启 DaVinci Resolve。"
-else
-    echo ""
-    echo "❌ 卸载失败，请检查密码或手动删除文件。"
-    exit 1
+if [[ -e "$APP_PATH" ]]; then
+  echo "卸载构建目录包含旧应用，请使用新的输出目录。" >&2
+  exit 1
 fi
-
-echo ""
-read -r -p "按回车键退出..." _
-EOF
-
-    chmod +x "$COMMAND_PATH"
-}
-
-if build_app; then
-    echo "✅ 删除程序已生成：$APP_PATH"
-else
-    echo "ℹ️ 当前环境无法稳定生成 .app，回退为 .command 删除程序。"
-    build_command
-    echo "✅ 删除程序已生成：$COMMAND_PATH"
-fi
-
-echo ""
-echo "💡 使用说明："
-if [ -d "$APP_PATH" ]; then
-    echo "   直接双击【${APP_NAME}】即可运行。"
-else
-    echo "   直接双击【${COMMAND_NAME}】即可运行。"
-    echo "   终端会要求输入管理员密码以删除插件文件。"
-fi
+bash -n "$SOURCE"
+/usr/bin/osacompile -o "$APP_PATH" <<'APPLESCRIPT'
+on run
+  try
+    set scriptPath to POSIX path of (path to resource "uninstall.sh")
+    set userHome to POSIX path of (path to home folder)
+    set baseCommand to "/usr/bin/env HOME=" & quoted form of userHome & " /bin/bash " & quoted form of scriptPath
+    set previewText to do shell script (baseCommand & " --dry-run")
+    display dialog previewText with title "卸载 SubFix" buttons {"取消", "卸载"} default button "取消" cancel button "取消" with icon caution
+    set needsAdmin to do shell script (baseCommand & " --needs-admin")
+    set uninstallCommand to "printf 'UNINSTALL\\n' | " & baseCommand
+    if needsAdmin is "yes" then
+      set resultText to do shell script uninstallCommand with administrator privileges
+    else
+      set resultText to do shell script uninstallCommand
+    end if
+    display dialog resultText with title "卸载 SubFix" buttons {"完成"} default button "完成"
+  on error errorText number errorNumber
+    if errorNumber is not -128 then
+      display dialog "卸载未完成：" & errorText & return & "请检查目录权限后重试。" with title "卸载 SubFix" buttons {"关闭"} default button "关闭" with icon stop
+    end if
+  end try
+end run
+APPLESCRIPT
+cp "$SOURCE" "$APP_PATH/Contents/Resources/uninstall.sh"
+chmod 755 "$APP_PATH/Contents/Resources/uninstall.sh"
+# Adding resources invalidates osacompile's signature; sign the finished bundle.
+/usr/bin/codesign --force --sign - "$APP_PATH"
+/usr/bin/codesign --verify --deep --strict "$APP_PATH"
+echo "✅ 已生成卸载程序：$APP_PATH"

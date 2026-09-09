@@ -408,7 +408,7 @@ local function build_qwen_status_command(paths, output_path)
         return nil, "未找到本地 Qwen 安装管理器"
     end
     return table.concat({
-        shell_quote(paths.runtime_python), shell_quote(paths.qwen_manager),
+        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
         "--action", "status", "--output", shell_quote(output_path),
     }, " "), nil
 end
@@ -430,7 +430,7 @@ local function build_qwen_install_command(paths, output_path, progress_path)
     if not file_exists(paths.runtime_python) then return nil, "未找到 SubFix 内置 Python" end
     if not file_exists(paths.qwen_manager) then return nil, "缺少本地 Qwen 安装管理器" end
     return table.concat({
-        shell_quote(paths.runtime_python), shell_quote(paths.qwen_manager),
+        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
         "--action", "install", "--output", shell_quote(output_path),
         "--progress-json", shell_quote(progress_path),
     }, " "), nil
@@ -3218,8 +3218,10 @@ local function run_background_command_with_progress(cmd, progress_path, progress
         }, " ")
     end
 
+    -- Detach the waiting shell too: inherited host pipes can keep launch blocked
+    -- until the worker exits, preventing the progress event loop from starting.
     local bg_cmd = string.format(
-        "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) &",
+        "(%s > %s 2>&1 & worker_pid=$!; echo $worker_pid > %s; wait $worker_pid; echo $? > %s; touch %s) </dev/null >/dev/null 2>&1 &",
         grouped_cmd,
         shell_quote(stdout_file),
         shell_quote(pid_file),

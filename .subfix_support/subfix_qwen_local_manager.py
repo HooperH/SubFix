@@ -44,6 +44,11 @@ class SubFixQwenPaths:
 
     @property
     def env_dir(self) -> Path:
+        # Resolve scans its script tree on the UI thread when pip creates files.
+        return self.data_root / "envs" / "qwen-local"
+
+    @property
+    def legacy_env_dir(self) -> Path:
         return self.root / "envs" / "qwen-local"
 
     @property
@@ -60,6 +65,10 @@ class SubFixQwenPaths:
 
     @property
     def ready_marker(self) -> Path:
+        return self.data_root / ".subfix-qwen-local-ready.json"
+
+    @property
+    def legacy_plugin_ready_marker(self) -> Path:
         return self.root / ".subfix-qwen-local-ready.json"
 
     @property
@@ -150,22 +159,30 @@ def has_model_artifacts(paths: SubFixQwenPaths) -> bool:
     return any((root / "models--Qwen--Qwen3-ASR-1.7B" / "snapshots").is_dir() for root in huggingface_cache_roots())
 
 
-def has_ready_marker(paths: SubFixQwenPaths) -> bool:
-    return paths.ready_marker.is_file() or paths.legacy_ready_marker.is_file()
+def ready_environment_python(paths: SubFixQwenPaths) -> Path | None:
+    if paths.env_python.is_file() and paths.ready_marker.is_file():
+        return paths.env_python
+    legacy_python = paths.legacy_env_dir / "bin" / "python"
+    # A legacy marker must never certify a newly created, incomplete environment.
+    if legacy_python.is_file() and (paths.legacy_plugin_ready_marker.is_file() or paths.legacy_ready_marker.is_file()):
+        return legacy_python
+    return None
 
 
 def inspect_install(paths: SubFixQwenPaths) -> dict[str, object]:
     model_dir = existing_model_dir(paths)
-    if not paths.env_python.is_file() or not has_model_artifacts(paths):
+    environment_exists = paths.env_python.is_file() or (paths.legacy_env_dir / "bin" / "python").is_file()
+    if not environment_exists or not has_model_artifacts(paths):
         return {"state": "missing", "ready": False}
     # The marker is written only after the installer verifies the dependency;
     # do not re-import qwen_asr/torch on Resolve's synchronous status path.
-    if model_dir is None or not has_ready_marker(paths):
+    python = ready_environment_python(paths)
+    if model_dir is None or python is None:
         return {"state": "repair_required", "ready": False}
     return {
         "state": "installed",
         "ready": True,
-        "python": str(paths.env_python),
+        "python": str(python),
         "model": str(model_dir),
     }
 
