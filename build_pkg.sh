@@ -11,6 +11,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PKG_NAME="${PKG_NAME:-SubFix}"
 IDENTIFIER="${IDENTIFIER:-com.mediastorm.subfix}"
 SOURCE_FILE="${SOURCE_FILE:-${SCRIPT_DIR}/SubFix.lua}"
+GENERATOR_FILE="${GENERATOR_FILE:-${SCRIPT_DIR}/生成选区字幕.lua}"
+GENERATE_CORE_FILE="${GENERATE_CORE_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_generate_selection_core.lua}"
+PROCESS_GROUP_FILE="${PROCESS_GROUP_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_process_group.py}"
+UPDATE_HELPER_FILE="${UPDATE_HELPER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_update.py}"
+ASR_HELPER_FILE="${ASR_HELPER_FILE:-${SCRIPT_DIR}/subfix_asr_transcribe.py}"
+GENERATE_V4_FILE="${GENERATE_V4_FILE:-${SCRIPT_DIR}/subfix_generate_v4.py}"
+GENERATE_V5_FILE="${GENERATE_V5_FILE:-${SCRIPT_DIR}/subfix_generate_v5.py}"
+GENERATE_TEXTNORM_FILE="${GENERATE_TEXTNORM_FILE:-${SCRIPT_DIR}/subfix_generate_textnorm.py}"
+QWEN_LOCAL_MANAGER_FILE="${QWEN_LOCAL_MANAGER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_qwen_local_manager.py}"
+ASR_SETUP_FILE="${ASR_SETUP_FILE:-${SCRIPT_DIR}/setup_asr_env.sh}"
+SEGMENTATION_PROFILE_FILE="${SEGMENTATION_PROFILE_FILE:-${SCRIPT_DIR}/.subfix_support/segmentation_profile.json}"
+SEGMENTATION_PROFILE_V3_FILE="${SEGMENTATION_PROFILE_V3_FILE:-${SCRIPT_DIR}/.subfix_support/segmentation_profile_v3.json}"
+SEGMENTATION_PROFILE_V4_FILE="${SEGMENTATION_PROFILE_V4_FILE:-${SCRIPT_DIR}/.subfix_support/segmentation_profile_v4.json}"
 INSTALL_PATH="Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility"
 BUILD_ROOT="${BUILD_ROOT:-${SCRIPT_DIR}/build}"
 PAYLOAD_DIR="${BUILD_ROOT}/payload"
@@ -35,19 +48,38 @@ OUTPUT_ZIP_PATH="${RELEASE_ROOT}/${OUTPUT_ZIP_NAME}"
 
 echo "📦 开始构建 ${PKG_NAME} v${VERSION} 安装包..."
 
-if [ ! -f "$SOURCE_FILE" ]; then
-    echo "❌ 错误：源文件不存在：$SOURCE_FILE"
-    exit 1
-fi
+for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$GENERATE_TEXTNORM_FILE" "$QWEN_LOCAL_MANAGER_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
+    if [ ! -f "$required" ]; then
+        echo "❌ 错误：源文件不存在：$required"
+        exit 1
+    fi
+done
 
 echo "🧹 清理旧的构建与发布目录..."
 rm -rf "$BUILD_ROOT" "$RELEASE_DIR"
 rm -f "$OUTPUT_ZIP_PATH"
-mkdir -p "$PAYLOAD_DIR/${INSTALL_PATH}" "$RELEASE_DIR"
+mkdir -p "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix" "$RELEASE_DIR/.subfix_support" "$RELEASE_DIR/SubFix"
 
 echo "📄 拷贝源文件到安装载荷目录..."
-cp "$SOURCE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix.lua"
-chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix.lua"
+cp "$SOURCE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua"
+cp "$GENERATOR_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua"
+cp "$GENERATE_CORE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_selection_core.lua"
+cp "$PROCESS_GROUP_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_process_group.py"
+cp "$UPDATE_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_update.py"
+cp "$ASR_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_asr_transcribe.py"
+cp "$GENERATE_V4_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_v4.py"
+cp "$GENERATE_V5_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_v5.py"
+cp "$GENERATE_TEXTNORM_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_textnorm.py"
+cp "$QWEN_LOCAL_MANAGER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_qwen_local_manager.py"
+cp "$ASR_SETUP_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/setup_asr_env.sh"
+cp "$SEGMENTATION_PROFILE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile.json"
+cp "$SEGMENTATION_PROFILE_V3_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile_v3.json"
+cp "$SEGMENTATION_PROFILE_V4_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/segmentation_profile_v4.json"
+chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua"
+chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua"
+chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_asr_transcribe.py"
+chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_process_group.py"
+chmod 755 "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/setup_asr_env.sh"
 
 echo "🗑️ 构建卸载程序..."
 if [ ! -x "$UNINSTALLER_SCRIPT" ]; then
@@ -70,6 +102,7 @@ if [ -z "$UNINSTALLER_ARTIFACT_PATH" ]; then
 fi
 
 echo "🔨 正在生成 .pkg 安装包..."
+python3 "$SCRIPT_DIR/scripts/check_release_privacy.py" "$PAYLOAD_DIR"
 pkgbuild \
     --root "$PAYLOAD_DIR" \
     --identifier "$IDENTIFIER" \
@@ -106,7 +139,20 @@ else
 fi
 
 echo "📦 整理分发目录..."
-cp "$SOURCE_FILE" "${RELEASE_DIR}/SubFix.lua"
+cp "$SOURCE_FILE" "${RELEASE_DIR}/SubFix/SubFix.lua"
+cp "$GENERATOR_FILE" "${RELEASE_DIR}/SubFix/生成选区字幕.lua"
+cp "$GENERATE_CORE_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_selection_core.lua"
+cp "$PROCESS_GROUP_FILE" "${RELEASE_DIR}/.subfix_support/subfix_process_group.py"
+cp "$UPDATE_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_update.py"
+cp "$ASR_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_asr_transcribe.py"
+cp "$GENERATE_V4_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_v4.py"
+cp "$GENERATE_V5_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_v5.py"
+cp "$GENERATE_TEXTNORM_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_textnorm.py"
+cp "$QWEN_LOCAL_MANAGER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_qwen_local_manager.py"
+cp "$ASR_SETUP_FILE" "${RELEASE_DIR}/.subfix_support/setup_asr_env.sh"
+cp "$SEGMENTATION_PROFILE_FILE" "${RELEASE_DIR}/.subfix_support/segmentation_profile.json"
+cp "$SEGMENTATION_PROFILE_V3_FILE" "${RELEASE_DIR}/.subfix_support/segmentation_profile_v3.json"
+cp "$SEGMENTATION_PROFILE_V4_FILE" "${RELEASE_DIR}/.subfix_support/segmentation_profile_v4.json"
 if [ -d "$UNINSTALLER_ARTIFACT_PATH" ]; then
     cp -R "$UNINSTALLER_ARTIFACT_PATH" "${RELEASE_DIR}/"
 else
@@ -126,5 +172,7 @@ echo "✅ 分发 ZIP 已生成：$OUTPUT_ZIP_PATH"
 echo ""
 echo "💡 分发目录包含："
 echo "   - 安装程序：${OUTPUT_PKG_NAME}"
-echo "   - 源代码：SubFix.lua"
+echo "   - 主入口：SubFix/SubFix.lua"
+echo "   - 生成入口：SubFix/生成选区字幕.lua"
+echo "   - 支持文件：.subfix_support/"
 echo "   - 删除程序：$(basename "$UNINSTALLER_ARTIFACT_PATH")"

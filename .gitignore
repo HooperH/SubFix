@@ -1,6 +1,32 @@
 .DS_Store
+__pycache__/
+tests/__pycache__/
+*.pyc
+.pytest_cache/
+.subfix_asr_env/
+
+# ASR/forced-alignment model binaries, third-party toolchains, and vendored
+# python wheels under .subfix_support/. These are large (multi-GB) build
+# artifacts, not source — never commit them. The curated JSON profiles and
+# the Lua core under .subfix_support/ (not covered by these patterns) ARE
+# tracked as training/config data.
+.subfix_support/qwen3-asr.cpp/
+.subfix_support/models/
+.subfix_support/hf/
+.subfix_support/python-tools/
+
+# 豆包(火山引擎)云端 ASR 真实密钥，绝不进 git。仅追踪
+# doubao_credentials.json.example 模板。两条模式覆盖仓库根(与 helper .py 同级)
+# 与部署布局下的 .subfix_support/ 等任意子目录。
+doubao_credentials.json
+**/doubao_credentials.json
+
+# 运行时生成的生成偏好（记住上次识别模型等），不进 git。
+subfix_generate_prefs.json
+**/subfix_generate_prefs.json
 
 # Local build output and packaged release artifacts.
+/.worktrees/
 build/
 dist/
 *.pkg
@@ -9,3 +35,10 @@ dist/
 # Historical local note for the packaged 2.0 build. The GitHub share project
 # intentionally tracks the latest root SubFix.lua instead.
 SubFix-2.0-更新说明.md
+
+# Private development data must never enter this public snapshot.
+.subfix_support/calibration_samples/
+tests/fixtures/
+docs/superpowers/
+*.bak-*
+*.log
