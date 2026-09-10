@@ -1,8 +1,8 @@
-# SubFix v3.2.9
+# SubFix v3.2.10
 
 ## 安装
 
-解压后打开 SubFix-v3.2.9-macOS.pkg，可直接覆盖安装，无需先卸载。
+解压后打开 SubFix-v3.2.10-macOS.pkg，可直接覆盖安装，无需先卸载。
 支持 Apple Silicon Mac。安装包未签名；若 macOS 提示无法验证开发者，请按系统提示在“系统设置 → 隐私与安全性”中允许打开。
 
 ## 本次更新
