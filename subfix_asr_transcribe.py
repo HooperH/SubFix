@@ -456,6 +456,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "audio_refinement_suggested_energy_valley_count",
         "audio_refinement_suggested_silence_count",
         "energy_valley_boundary_count",
+        "original_gap_preserved_count",
         "confirmed_silence_preserved_count",
         "overlong_tail_reclaimed_count",
         "tail_extended_row_count",
@@ -6133,15 +6134,6 @@ def run_generate_subtitles_batch_plan_v4(
             getattr(args, "max_chars", None),
         )
         diagnostic["hard_char_split_count"] = hard_char_split_count
-        tail_extension_max_gap_frames = int(
-            round(generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS * float(args.fps or 30.0))
-        )
-        subtitle_rows, tail_extended_row_count = generate_v4.extend_subtitle_row_tails(
-            subtitle_rows,
-            float(args.fps or 30.0),
-            tail_extension_max_gap_frames,
-        )
-        diagnostic["tail_extended_row_count"] = tail_extended_row_count
         subtitle_rows = generate_v4.restore_display_spacing(subtitle_rows, canonical_units)
         subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
         diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
@@ -6186,6 +6178,18 @@ def run_generate_subtitles_batch_plan_v4(
                 for row in subtitle_rows
             )
             diagnostic.update(refinement_diagnostic)
+        # Display continuity is the final timing step. In v5, keep the original
+        # long pauses protected above instead of filling them from duration alone.
+        tail_extension_gap_seconds = generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS
+        if v5_mode:
+            tail_extension_gap_seconds = min(tail_extension_gap_seconds, 0.20)
+        tail_extension_max_gap_frames = int(round(tail_extension_gap_seconds * float(args.fps or 30.0)))
+        subtitle_rows, tail_extended_row_count = generate_v4.extend_subtitle_row_tails(
+            subtitle_rows,
+            float(args.fps or 30.0),
+            tail_extension_max_gap_frames,
+        )
+        diagnostic["tail_extended_row_count"] = tail_extended_row_count
         diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
             subtitle_rows, hotword_entries
         )

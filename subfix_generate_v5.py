@@ -565,8 +565,6 @@ def refine_subtitle_boundaries(
     regions = _speech_regions(levels, sample_rate, hop_samples, fps, track_start_frame)
     search_frames = max(1, int(round(12)))
     output: list[dict[str, Any]] = []
-    refined_count = 0
-    shrink_rejected_count = 0
     for raw_row in sorted(rows or [], key=lambda row: (int(row.get("start_frame") or 0), int(row.get("end_frame") or 0))):
         row = dict(raw_row)
         original_start = int(row.get("start_frame") or 0)
@@ -575,33 +573,27 @@ def refine_subtitle_boundaries(
         row["original_end_frame"] = original_end
         region = _nearest_region(regions, original_start, original_end, search_frames)
         if region is not None:
-            # Energy thresholds miss quiet leading syllables; keep the text-aligned onset as the latest allowed start.
+            # Energy islands often cover only a loud syllable. They may expand,
+            # but never crop, the already aligned text span.
             refined_start = max(original_start - search_frames, min(original_start, region[0]))
-            refined_end = max(refined_start + 1, max(original_end - search_frames, min(original_end + search_frames, region[1])))
-            original_duration = original_end - original_start
-            refined_duration = refined_end - refined_start
-            minimum_duration = min(original_duration, max(2, int(round(0.35 * fps))))
-            if refined_duration < minimum_duration or refined_duration * 2 < original_duration:
-                row["timing_decision"] = "refinement_rejected_too_short"
-                shrink_rejected_count += 1
-                output.append(row)
-                continue
+            refined_end = max(original_end, min(original_end + search_frames, region[1]))
             row["start_frame"] = refined_start
             row["end_frame"] = refined_end
-            if refined_start != original_start or refined_end != original_end:
-                refined_count += 1
         row["timing_decision"] = "audio_refined" if region is not None else "forced_alignment_kept"
         output.append(row)
 
     valley_count = 0
-    preserved_silence = 0
+    preserved_gaps = 0
     maximum_continuous_gap = max(1, int(round(0.20 * fps)))
     for left, right in zip(output, output[1:]):
-        left_end = int(left.get("end_frame") or 0)
-        right_start = int(right.get("start_frame") or 0)
+        # Decide from pre-refinement bounds, not gaps created by amplitude guesses.
+        left_end = int(left["original_end_frame"])
+        right_start = int(right["original_start_frame"])
         gap = right_start - left_end
-        if gap <= 0:
-            boundary = min(right_start, max(int(left.get("start_frame") or 0) + 1, (left_end + right_start) // 2))
+        if gap < 0:
+            raise ValueError("字幕原始对齐范围重叠，无法安全修正边界")
+        if gap == 0:
+            boundary = right_start
             left["end_frame"] = boundary
             right["start_frame"] = boundary
             continue
@@ -620,12 +612,15 @@ def refine_subtitle_boundaries(
             right["timing_decision"] = "energy_valley_boundary"
             valley_count += 1
         else:
-            preserved_silence += 1
+            left["end_frame"] = left_end
+            right["start_frame"] = right_start
+            preserved_gaps += 1
     return output, {
-        "audio_refined_row_count": refined_count,
-        "audio_refinement_shrink_rejected_count": shrink_rejected_count,
+        "audio_refined_row_count": sum(row["start_frame"] != row["original_start_frame"] or row["end_frame"] != row["original_end_frame"] for row in output),
+        "audio_refinement_shrink_rejected_count": 0,
         "energy_valley_boundary_count": valley_count,
-        "confirmed_silence_preserved_count": preserved_silence,
+        "original_gap_preserved_count": preserved_gaps,
+        "confirmed_silence_preserved_count": 0,
     }
 
 
@@ -640,18 +635,21 @@ def preserve_refined_row_order(
     for row in output:
         original_start = int(row["original_start_frame"])
         original_end = int(row["original_end_frame"])
-        # Retaining one original frame makes either boundary safe to restore below.
-        row["start_frame"] = min(int(row["start_frame"]), original_end - 1)
-        row["end_frame"] = max(int(row["end_frame"]), original_start + 1)
+        row["start_frame"] = min(int(row["start_frame"]), original_start)
+        row["end_frame"] = max(int(row["end_frame"]), original_end)
         if row["start_frame"] >= row["end_frame"]:
             row["start_frame"], row["end_frame"] = original_start, original_end
     conflicts = 0
     for left, right in zip(output, output[1:]):
-        if int(left["original_end_frame"]) <= int(right["original_start_frame"]) and left["end_frame"] > right["start_frame"]:
+        if int(left["original_end_frame"]) > int(right["original_start_frame"]):
+            raise ValueError("字幕原始对齐范围重叠，无法安全修正边界")
+        different_track = left.get("speaker_track_index") != right.get("speaker_track_index")
+        if different_track or left["end_frame"] > right["start_frame"]:
+            had_overlap = left["end_frame"] > right["start_frame"]
             left["end_frame"] = min(left["end_frame"], int(left["original_end_frame"]))
             right["start_frame"] = max(right["start_frame"], int(right["original_start_frame"]))
             left["timing_decision"] = right["timing_decision"] = "original_handoff_preserved"
-            conflicts += 1
+            conflicts += int(had_overlap)
     return output, conflicts
 
 
