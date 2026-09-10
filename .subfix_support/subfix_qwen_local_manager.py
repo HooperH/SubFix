@@ -19,6 +19,8 @@ from typing import Callable
 
 
 QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
+QWEN_PYPI_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+MODEL_DOWNLOAD_SOURCES = (("modelscope", "魔搭国内源"), ("huggingface", "Hugging Face 备用源"))
 QWEN_ASR_REQUIRED_MODEL_FILES = (
     "config.json",
     "model.safetensors.index.json",
@@ -309,6 +311,7 @@ def create_or_reuse_venv(base_python: Path, env_dir: Path) -> None:
 
 def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_path: Path) -> None:
     common = [str(env_python), "-m", "pip", "install", "--upgrade",
+              "--index-url", QWEN_PYPI_INDEX_URL,
               "--timeout", "60", "--retries", "5", "--disable-pip-version-check",
               "--no-input", "--progress-bar", "off"]
     # venv seeds pip 25.0.1; upgrading in the dependency command leaves that
@@ -327,6 +330,7 @@ def install_qwen_dependencies(env_python: Path, report: ProgressReporter, log_pa
             "qwen-asr",
             "torch",
             "huggingface_hub",
+            "modelscope",
         ],
         error_prefix="安装本地 Qwen 依赖失败",
         log_path=log_path,
@@ -349,13 +353,42 @@ def directory_size_bytes(directory: Path) -> int:
     return total
 
 
-def fetch_model_total_bytes(env_python: Path) -> int | None:
-    script = (
-        "from huggingface_hub import HfApi\n"
-        "import json, sys\n"
-        "info = HfApi().model_info(sys.argv[1], files_metadata=True)\n"
-        "print(json.dumps(sum(int(getattr(item, 'size', 0) or 0) for item in info.siblings)))\n"
+def ensure_modelscope_downloader(env_python: Path, report: ProgressReporter, log_path: Path) -> None:
+    try:
+        probe = subprocess.run(
+            [str(env_python), "-c", "from modelscope.hub.snapshot_download import snapshot_download"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        )
+        if probe.returncode == 0:
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # Older installations can already run Qwen but lack the domestic downloader.
+    run_checked(
+        [str(env_python), "-m", "pip", "install", "--upgrade", "--index-url", QWEN_PYPI_INDEX_URL,
+         "--timeout", "60", "--retries", "5", "--disable-pip-version-check", "--no-input", "modelscope"],
+        error_prefix="安装魔搭下载工具失败", log_path=log_path, report=report,
+        heartbeat=("准备下载工具", "正在通过国内镜像安装魔搭下载工具"),
     )
+
+
+def fetch_model_total_bytes(env_python: Path, source: str = "modelscope") -> int | None:
+    if source == "modelscope":
+        script = (
+            "from modelscope.hub.api import HubApi\n"
+            "import sys\n"
+            "files = HubApi().get_model_files(sys.argv[1], recursive=True)\n"
+            "print(sum(int(item.get('Size', 0) or 0) for item in files if item.get('Type') != 'tree'))\n"
+        )
+    elif source == "huggingface":
+        script = (
+            "from huggingface_hub import HfApi\n"
+            "import sys\n"
+            "info = HfApi().model_info(sys.argv[1], files_metadata=True)\n"
+            "print(sum(int(getattr(item, 'size', 0) or 0) for item in info.siblings))\n"
+        )
+    else:
+        raise ValueError(f"未知模型下载源：{source}")
     try:
         result = subprocess.run(
             [str(env_python), "-c", script, QWEN_ASR_MODEL_ID],
@@ -364,7 +397,7 @@ def fetch_model_total_bytes(env_python: Path) -> int | None:
             text=True,
             timeout=30,
         )
-        total = int(result.stdout.strip())
+        total = int(result.stdout.strip().rsplit("\n", 1)[-1])
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return None
     return total if total > 0 else None
@@ -425,16 +458,30 @@ def report_model_download_progress(
         stop_event.wait(1)
 
 
-def download_model(env_python: Path, model_dir: Path, report: ProgressReporter, log_path: Path) -> None:
-    script = (
-        "from huggingface_hub import snapshot_download\n"
-        "import sys\n"
-        "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])\n"
-    )
+def download_model_from_source(
+    env_python: Path, model_dir: Path, report: ProgressReporter, log_path: Path, source: str,
+) -> None:
+    if source == "modelscope":
+        script = (
+            # Desktop installs should not probe cloud metadata for intranet acceleration.
+            "import os, sys\n"
+            "os.environ['MODELSCOPE_DOWNLOAD_INTRA_CLOUD'] = 'false'\n"
+            "os.environ['INTRA_CLOUD_ACCELERATION'] = 'false'\n"
+            "from modelscope.hub.snapshot_download import snapshot_download\n"
+            "snapshot_download(model_id=sys.argv[1], local_dir=sys.argv[2])\n"
+        )
+    elif source == "huggingface":
+        script = (
+            "from huggingface_hub import snapshot_download\n"
+            "import sys\n"
+            "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])\n"
+        )
+    else:
+        raise ValueError(f"未知模型下载源：{source}")
     stop_event = threading.Event()
     monitor = threading.Thread(
         target=report_model_download_progress,
-        args=(model_dir, fetch_model_total_bytes(env_python), report, stop_event),
+        args=(model_dir, fetch_model_total_bytes(env_python, source), report, stop_event),
         daemon=True,
     )
     monitor.start()
@@ -444,9 +491,30 @@ def download_model(env_python: Path, model_dir: Path, report: ProgressReporter, 
             error_prefix="下载 Qwen3-ASR 模型失败",
             log_path=log_path,
         )
+        if not model_directory_is_complete(model_dir):
+            raise RuntimeError("模型下载未返回完整文件")
     finally:
         stop_event.set()
         monitor.join(timeout=2)
+
+
+def download_model(env_python: Path, model_dir: Path, report: ProgressReporter, log_path: Path) -> None:
+    errors = []
+    for source, label in MODEL_DOWNLOAD_SOURCES:
+        def source_report(stage: str, message: str, source_label: str = label, **details: object) -> None:
+            report(stage, f"{source_label}：{message}", **details)
+
+        source_report("连接模型仓库", "正在准备下载 Qwen3-ASR-1.7B")
+        try:
+            if source == "modelscope":
+                ensure_modelscope_downloader(env_python, source_report, log_path)
+            download_model_from_source(env_python, model_dir, source_report, log_path, source)
+            return
+        except RuntimeError as exc:
+            errors.append(f"{label}：{exc}")
+            if source == "modelscope":
+                report("切换下载源", "魔搭下载失败，正在尝试 Hugging Face 备用源；保留已下载文件")
+    raise RuntimeError("模型下载源均失败，请检查网络后重试。\n" + "\n".join(errors))
 
 
 def write_ready_marker(paths: SubFixQwenPaths, model_dir: Path) -> None:
