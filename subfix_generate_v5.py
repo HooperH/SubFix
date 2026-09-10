@@ -575,7 +575,8 @@ def refine_subtitle_boundaries(
         row["original_end_frame"] = original_end
         region = _nearest_region(regions, original_start, original_end, search_frames)
         if region is not None:
-            refined_start = max(original_start - search_frames, min(original_start + search_frames, region[0]))
+            # Energy thresholds miss quiet leading syllables; keep the text-aligned onset as the latest allowed start.
+            refined_start = max(original_start - search_frames, min(original_start, region[0]))
             refined_end = max(refined_start + 1, max(original_end - search_frames, min(original_end + search_frames, region[1])))
             original_duration = original_end - original_start
             refined_duration = refined_end - refined_start
