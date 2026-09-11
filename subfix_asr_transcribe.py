@@ -16,17 +16,20 @@ import json
 import math
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 import wave
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +104,370 @@ class _LazyGenerateTextnorm:
 
 
 generate_textnorm = _LazyGenerateTextnorm()
+
+
+GIB = 1024 ** 3
+LOCAL_QWEN_MIN_TOTAL_BYTES = 16 * GIB
+LOCAL_QWEN_ASR_MIN_AVAILABLE_BYTES = 8 * GIB
+LOCAL_QWEN_ASR_MIN_FREE_PERCENT = 20
+LOCAL_QWEN_GGUF_MIN_AVAILABLE_BYTES = 4 * GIB
+LOCAL_QWEN_GGUF_MIN_FREE_PERCENT = 15
+LOCAL_QWEN_MIN_DISK_FREE_BYTES = 10 * GIB
+LOCAL_QWEN_ASR_TIMEOUT_SECONDS = 15 * 60.0
+LOCAL_QWEN_GGUF_TIMEOUT_SECONDS = 10 * 60.0
+LOCAL_QWEN_MONITOR_INTERVAL_SECONDS = 0.5
+LOCAL_QWEN_LOG_LIMIT_BYTES = 256 * 1024
+
+
+class LocalQwenSafetyError(RuntimeError):
+    """Local Qwen execution stopped before it could exhaust host resources."""
+
+    subfix_resource_stop = True
+
+
+def is_local_qwen_memory_error(exc: BaseException | str) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "out of memory",
+            "cannot allocate memory",
+            "can't allocate memory",
+            "std::bad_alloc",
+            "memory allocation failed",
+        )
+    )
+
+
+def is_local_qwen_resource_error(exc: BaseException | str) -> bool:
+    message = str(exc).lower()
+    return is_local_qwen_memory_error(message) or any(
+        marker in message
+        for marker in ("no space left on device", "disk full", "errno 28")
+    )
+
+
+def raise_for_local_qwen_returncode(returncode: int, stage: str, log_text: str) -> None:
+    if returncode == 0:
+        return
+    if returncode < 0 or returncode in {134, 137} or is_local_qwen_resource_error(log_text):
+        raise LocalQwenSafetyError(
+            f"本地 Qwen {stage.upper()} 子进程因信号、OOM 或资源压力异常终止 ({returncode})；"
+            "请缩小选区后重试或改用云端识别"
+        )
+
+
+@dataclass(frozen=True)
+class LocalResourceSnapshot:
+    total_memory_bytes: int
+    free_memory_percent: int
+    temp_disk_free_bytes: int
+    data_disk_free_bytes: int
+
+    @property
+    def available_memory_bytes(self) -> int:
+        return self.total_memory_bytes * self.free_memory_percent // 100
+
+
+def parse_memory_pressure_output(output: str) -> tuple[int, int]:
+    total_match = re.search(r"The system has\s+(\d+)(?:\s+memory bytes|\s+\()", output)
+    free_match = re.search(r"System-wide memory free percentage:\s*(\d+)%", output)
+    if not total_match or not free_match:
+        raise LocalQwenSafetyError(
+            "本地 Qwen 安全检查失败：无法解析 memory_pressure -Q 输出；请重新启动插件后重试，"
+            "若仍失败请运行系统内存检查"
+        )
+    total_bytes = int(total_match.group(1))
+    free_percent = int(free_match.group(1))
+    if total_bytes <= 0 or not 0 <= free_percent <= 100:
+        raise LocalQwenSafetyError("本地 Qwen 安全检查失败：memory_pressure -Q 数值无效")
+    return total_bytes, free_percent
+
+
+def read_local_resource_snapshot() -> LocalResourceSnapshot:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/memory_pressure", "-Q"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LocalQwenSafetyError(f"本地 Qwen 安全检查失败：无法运行 memory_pressure -Q: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise LocalQwenSafetyError(
+            f"本地 Qwen 安全检查失败：memory_pressure -Q 返回 {result.returncode}: {detail[:300]}"
+        )
+    total_bytes, free_percent = parse_memory_pressure_output(result.stdout)
+    try:
+        temp_free = shutil.disk_usage(tempfile.gettempdir()).free
+        data_path = Path("/System/Volumes/Data")
+        data_free = shutil.disk_usage(data_path if data_path.exists() else Path("/")).free
+    except OSError as exc:
+        raise LocalQwenSafetyError(f"本地 Qwen 安全检查失败：无法读取磁盘余量: {exc}") from exc
+    return LocalResourceSnapshot(total_bytes, free_percent, temp_free, data_free)
+
+
+def assert_local_qwen_resources(snapshot: LocalResourceSnapshot, stage: str) -> None:
+    if stage == "asr":
+        if snapshot.total_memory_bytes < LOCAL_QWEN_MIN_TOTAL_BYTES:
+            raise LocalQwenSafetyError(
+                "本地 Qwen ASR 至少需要 16 GiB 物理内存；请改用云端识别"
+            )
+        minimum_available = LOCAL_QWEN_ASR_MIN_AVAILABLE_BYTES
+        minimum_percent = LOCAL_QWEN_ASR_MIN_FREE_PERCENT
+    elif stage == "gguf":
+        minimum_available = LOCAL_QWEN_GGUF_MIN_AVAILABLE_BYTES
+        minimum_percent = LOCAL_QWEN_GGUF_MIN_FREE_PERCENT
+    else:
+        raise ValueError(f"未知本地 Qwen 资源阶段: {stage}")
+    if (
+        snapshot.available_memory_bytes < minimum_available
+        or snapshot.free_memory_percent < minimum_percent
+    ):
+        raise LocalQwenSafetyError(
+            "本地 Qwen 可用内存不足："
+            f"当前约 {snapshot.available_memory_bytes / GIB:.1f} GiB/{snapshot.free_memory_percent}%，"
+            f"需要至少 {minimum_available / GIB:.0f} GiB/{minimum_percent}%；"
+            "请关闭占内存程序或缩小选区后重试"
+        )
+    if min(snapshot.temp_disk_free_bytes, snapshot.data_disk_free_bytes) < LOCAL_QWEN_MIN_DISK_FREE_BYTES:
+        raise LocalQwenSafetyError(
+            "本地 Qwen 临时磁盘或系统 Data 卷余量不足 10 GiB；请释放系统磁盘至少 10 GiB 后重试"
+        )
+
+
+def local_qwen_rss_limit(snapshot: LocalResourceSnapshot, stage: str) -> int:
+    if stage == "asr":
+        return min(16 * GIB, max(8 * GIB, snapshot.total_memory_bytes // 4))
+    if stage == "gguf":
+        return 8 * GIB
+    raise ValueError(f"未知本地 Qwen 资源阶段: {stage}")
+
+
+def read_process_rss_bytes(pid: int) -> int | None:
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-o", "rss=", "-p", str(pid)],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LocalQwenSafetyError(f"本地 Qwen 安全检查失败：无法读取子进程 RSS: {exc}") from exc
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return int(result.stdout.strip().splitlines()[0]) * 1024
+    except ValueError as exc:
+        raise LocalQwenSafetyError("本地 Qwen 安全检查失败：无法解析子进程 RSS") from exc
+
+
+def read_process_group_rss_bytes(pgid: int) -> int | None:
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pgid=,rss="],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LocalQwenSafetyError(f"本地 Qwen 安全检查失败：无法读取子进程组 RSS: {exc}") from exc
+    if result.returncode != 0:
+        raise LocalQwenSafetyError("本地 Qwen 安全检查失败：ps 无法读取子进程组 RSS")
+    total_rss = 0
+    found = False
+    try:
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                raise ValueError(f"字段数量={len(fields)}")
+            row_pgid, row_rss = (int(value) for value in fields)
+            if row_pgid == pgid:
+                found = True
+                total_rss += row_rss * 1024
+    except ValueError as exc:
+        raise LocalQwenSafetyError("本地 Qwen 安全检查失败：无法解析子进程组 RSS") from exc
+    return total_rss if found else None
+
+
+def process_group_is_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def terminate_local_qwen_process(proc: subprocess.Popen[Any]) -> None:
+    pgid = getattr(proc, "_subfix_process_group_id", None)
+    if isinstance(pgid, int) and pgid > 0:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 3.0
+        while process_group_is_alive(pgid) and time.monotonic() < deadline:
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=0.05)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(0.05)
+        if process_group_is_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if proc.poll() is None:
+            proc.wait(timeout=3.0)
+        kill_deadline = time.monotonic() + 3.0
+        while process_group_is_alive(pgid) and time.monotonic() < kill_deadline:
+            time.sleep(0.05)
+        if process_group_is_alive(pgid):
+            raise LocalQwenSafetyError("本地 Qwen 子进程组无法完全退出，请重新启动插件后重试")
+        return
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        proc.wait()
+        return
+    try:
+        proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=3.0)
+
+
+def monitor_local_qwen_process(
+    proc: subprocess.Popen[Any],
+    stage: str,
+    *,
+    timeout_seconds: float,
+    probe: Any = read_local_resource_snapshot,
+    rss_reader: Any = None,
+    poll_interval: float = LOCAL_QWEN_MONITOR_INTERVAL_SECONDS,
+) -> int:
+    started_at = time.monotonic()
+    try:
+        initial = probe()
+        assert_local_qwen_resources(initial, stage)
+        rss_limit = local_qwen_rss_limit(initial, stage)
+        while True:
+            returncode = proc.poll()
+            if returncode is not None:
+                proc.wait()
+                return int(returncode)
+            elapsed = time.monotonic() - started_at
+            if elapsed >= timeout_seconds:
+                raise LocalQwenSafetyError(f"本地 Qwen {stage.upper()} 子进程超时，已安全终止")
+            snapshot = probe()
+            assert_local_qwen_resources(snapshot, stage)
+            effective_rss_reader = rss_reader or read_process_group_rss_bytes
+            rss_target = getattr(proc, "_subfix_process_group_id", proc.pid)
+            rss_bytes = effective_rss_reader(rss_target)
+            if rss_bytes is None:
+                if proc.poll() is None:
+                    raise LocalQwenSafetyError(
+                        "本地 Qwen 安全检查失败：活跃子进程 RSS 不可读；请重新启动插件后重试"
+                    )
+                continue
+            if rss_bytes > rss_limit:
+                raise LocalQwenSafetyError(
+                    f"本地 Qwen {stage.upper()} 子进程 RSS 超限："
+                    f"{rss_bytes / GIB:.1f} GiB > {rss_limit / GIB:.1f} GiB；"
+                    "请缩小选区后重试或改用云端识别"
+                )
+            time.sleep(max(0.01, poll_interval))
+    except BaseException:
+        terminate_local_qwen_process(proc)
+        raise
+
+
+def run_guarded_local_qwen_command(
+    cmd: list[str],
+    stage: str,
+    *,
+    timeout_seconds: float,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> tuple[int, str]:
+    snapshot = read_local_resource_snapshot()
+    assert_local_qwen_resources(snapshot, stage)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"无法启动本地 Qwen {stage.upper()} 子进程: {exc}") from exc
+    setattr(proc, "_subfix_process_group_id", proc.pid)
+
+    log_tail = bytearray()
+    log_lock = threading.Lock()
+
+    def drain_bounded_log() -> None:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                return
+            with log_lock:
+                log_tail.extend(chunk)
+                overflow = len(log_tail) - LOCAL_QWEN_LOG_LIMIT_BYTES
+                if overflow > 0:
+                    del log_tail[:overflow]
+
+    log_thread = threading.Thread(target=drain_bounded_log, name="subfix-qwen-log", daemon=True)
+    log_thread.start()
+
+    previous_handlers: dict[int, Any] = {}
+
+    def stop_child_on_signal(signum: int, _frame: Any) -> None:
+        terminate_local_qwen_process(proc)
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous_handlers[signum] = signal.signal(signum, stop_child_on_signal)
+        except ValueError:  # not the main Python thread
+            previous_handlers.clear()
+            break
+    try:
+        returncode = monitor_local_qwen_process(
+            proc,
+            stage,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        terminate_local_qwen_process(proc)
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+        log_thread.join(timeout=3.0)
+        if log_thread.is_alive() and proc.stdout is not None:
+            proc.stdout.close()
+            log_thread.join(timeout=1.0)
+    with log_lock:
+        log_text = bytes(log_tail).decode("utf-8", errors="replace")
+    return returncode, log_text
 
 
 DEFAULT_MODEL = "small"
@@ -233,7 +600,6 @@ DEFAULT_FFMPEG_CANDIDATES = (
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
 )
-_QWEN3_ASR_MODEL_CACHE: dict[tuple[str, str, str | None], tuple[Any, str, str]] = {}
 _OPENAI_WHISPER_MODEL_CACHE: dict[str, Any] = {}
 HOTWORD_MAX_ENTRIES = 200
 HOTWORD_CHINESE_DIGITS = str.maketrans("0123456789", "零一二三四五六七八九")
@@ -3875,22 +4241,39 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
 
     init_kwargs: dict[str, Any] = {
         "device_map": device_map,
-        "max_inference_batch_size": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH") or "8"),
+        "max_inference_batch_size": 1,
         "max_new_tokens": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_NEW_TOKENS") or "512"),
     }
     if dtype is not None:
         init_kwargs["dtype"] = dtype
 
-    cache_key = (model_name, device_map, str(dtype))
     aligner_name = "qwen3_cpp"
     try:
-        cached_model = _QWEN3_ASR_MODEL_CACHE.get(cache_key)
-        if cached_model is None:
-            qwen_model = Qwen3ASRModel.from_pretrained(model_name, **init_kwargs)
-            _QWEN3_ASR_MODEL_CACHE[cache_key] = (qwen_model, "qwen3_cpp", device_map)
-        else:
-            qwen_model, aligner_name, device_map = cached_model
+        mps_module = getattr(torch, "mps", None)
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if (
+            mps_module is not None
+            and mps_backend is not None
+            and callable(getattr(mps_backend, "is_available", None))
+            and mps_backend.is_available()
+        ):
+            try:
+                rss_limit = int(os.getenv("_SUBFIX_QWEN_ASR_RSS_LIMIT_BYTES") or str(8 * GIB))
+                recommended = int(mps_module.recommended_max_memory())
+                if recommended <= 0:
+                    raise ValueError("recommended_max_memory 无效")
+                fraction = min(1.0, rss_limit / recommended)
+                if fraction <= 0:
+                    raise ValueError("MPS 内存比例无效")
+                mps_module.set_per_process_memory_fraction(fraction)
+            except Exception as exc:
+                raise LocalQwenSafetyError(f"无法启用 MPS 每进程内存上限，拒绝加载模型: {exc}") from exc
+        qwen_model = Qwen3ASRModel.from_pretrained(model_name, **init_kwargs)
+    except LocalQwenSafetyError:
+        raise
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
+        if is_local_qwen_memory_error(exc):
+            raise LocalQwenSafetyError(f"Qwen3-ASR 模型加载触发内存保护: {exc}") from exc
         raise RuntimeError(f"Qwen3-ASR 模型加载失败: {exc}") from exc
     return qwen_model, model_name, aligner_name, device_map
 
@@ -3974,19 +4357,103 @@ def _transcribe_qwen3_model(
         return qwen_model.transcribe(**kwargs), "unsupported"
 
 
+def qwen3_worker_result(result: Any, model_name: str, device_map: str, status: str) -> dict[str, Any]:
+    return {
+        "text": str(qwen3_timestamp_value(result, "text") or "").strip(),
+        "language": qwen3_timestamp_value(result, "language"),
+        "model": model_name,
+        "device_map": device_map,
+        "hotword_context_status": status,
+    }
+
+
+def run_qwen3_asr_worker_mode(request_path: Path, output_path: Path) -> None:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    if not isinstance(request, dict):
+        raise RuntimeError("Qwen3-ASR worker 请求必须是 JSON 对象")
+    qwen_model, model_name, _aligner_name, device_map = load_qwen3_asr_model(
+        str(request.get("model") or QWEN3_ASR_MODEL)
+    )
+    try:
+        results, status = _transcribe_qwen3_model(
+            qwen_model,
+            str(request.get("audio") or ""),
+            request.get("language"),
+            request.get("context"),
+        )
+    except LocalQwenSafetyError:
+        raise
+    except Exception as exc:
+        if is_local_qwen_memory_error(exc):
+            raise LocalQwenSafetyError(f"Qwen3-ASR 推理触发内存保护: {exc}") from exc
+        raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
+    first_result = results[0] if isinstance(results, list) and results else results
+    write_payload(output_path, {"ok": True, **qwen3_worker_result(first_result, model_name, device_map, status)})
+
+
+def run_qwen3_asr_worker(
+    audio_path: Path, model: str, language: str | None, context: str | None = None
+) -> dict[str, Any]:
+    snapshot = read_local_resource_snapshot()
+    assert_local_qwen_resources(snapshot, "asr")
+    with tempfile.TemporaryDirectory(prefix="subfix_qwen3_asr_worker_") as temporary_directory:
+        worker_dir = Path(temporary_directory)
+        request_path = worker_dir / "request.json"
+        output_path = worker_dir / "output.json"
+        write_payload(
+            request_path,
+            {"audio": str(audio_path), "model": model, "language": language, "context": context},
+        )
+        child_env = dict(os.environ)
+        child_env["SUBFIX_QWEN3_ASR_MAX_BATCH"] = "1"
+        child_env["SUBFIX_QWEN_GENERATE_BATCH_SIZE"] = "1"
+        child_env["_SUBFIX_QWEN_ASR_RSS_LIMIT_BYTES"] = str(local_qwen_rss_limit(snapshot, "asr"))
+        returncode, log_text = run_guarded_local_qwen_command(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--mode",
+                "qwen_asr_worker",
+                "--worker-request-json",
+                str(request_path),
+                "--output",
+                str(output_path),
+            ],
+            "asr",
+            timeout_seconds=LOCAL_QWEN_ASR_TIMEOUT_SECONDS,
+            env=child_env,
+        )
+        payload: dict[str, Any] = {}
+        if output_path.exists():
+            try:
+                loaded = json.loads(output_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+        if payload.get("error_type") == "LocalQwenSafetyError":
+            raise LocalQwenSafetyError(str(payload.get("error") or "Qwen3-ASR worker 触发资源保护"))
+        worker_detail = str(payload.get("error") or "")
+        raise_for_local_qwen_returncode(returncode, "asr", f"{worker_detail}\n{log_text}")
+        if returncode != 0 or payload.get("ok") is not True:
+            detail = str(payload.get("error") or log_text or returncode).strip()
+            raise RuntimeError(f"Qwen3-ASR worker 失败: {detail[-2000:]}")
+        return payload
+
+
 def transcribe_qwen3_asr(
     audio_path: Path, model: str, language: str | None, context: str | None = None
 ) -> dict[str, Any]:
-    qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
-    try:
-        results, hotword_context_status = _transcribe_qwen3_model(
-            qwen_model, str(audio_path), language, context
-        )
-    except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
-        raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
-    first_result = results[0] if isinstance(results, list) and results else results
+    worker_result = run_qwen3_asr_worker(audio_path, model, language, context)
     return qwen3_result_to_payload(
-        first_result, audio_path, model, model_name, aligner_name, device_map, language, hotword_context_status
+        worker_result,
+        audio_path,
+        model,
+        str(worker_result.get("model") or model),
+        "qwen3_cpp",
+        str(worker_result.get("device_map") or "unknown"),
+        language,
+        str(worker_result.get("hotword_context_status") or "not_requested"),
     )
 
 
@@ -3995,22 +4462,9 @@ def transcribe_qwen3_asr_batch(
 ) -> list[dict[str, Any]]:
     if not audio_paths:
         return []
-    qwen_model, model_name, aligner_name, device_map = load_qwen3_asr_model(model)
-    try:
-        results, hotword_context_status = _transcribe_qwen3_model(
-            qwen_model, [str(path) for path in audio_paths], language, context
-        )
-    except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
-        raise RuntimeError(f"Qwen3-ASR 批量转写失败: {exc}") from exc
-    if not isinstance(results, list):
-        results = [results]
-    if len(results) != len(audio_paths):
-        raise RuntimeError(f"Qwen3-ASR 批量结果数量不匹配: audio={len(audio_paths)} result={len(results)}")
     return [
-        qwen3_result_to_payload(
-            result, audio_path, model, model_name, aligner_name, device_map, language, hotword_context_status
-        )
-        for result, audio_path in zip(results, audio_paths)
+        transcribe_qwen3_asr(audio_path, model, language, context)
+        for audio_path in audio_paths
     ]
 
 
@@ -4531,6 +4985,8 @@ def transcribe_with_backend(
                 payload = transcribe_external_backend(audio_path, model, language, candidate)
             else:
                 raise RuntimeError(f"未知 ASR backend: {candidate}")
+        except LocalQwenSafetyError:
+            raise
         except Exception as exc:
             fallback_errors.append(f"{candidate}: {exc}")
             continue
@@ -4605,13 +5061,7 @@ def should_try_qwen_batch_backend(backend: str) -> bool:
 
 
 def qwen_generate_batch_size() -> int:
-    raw_value = os.getenv("SUBFIX_QWEN_GENERATE_BATCH_SIZE")
-    if raw_value:
-        try:
-            return max(1, int(raw_value))
-        except ValueError:
-            pass
-    return 8
+    return 1
 
 
 def recover_v4_asr_window(
@@ -4797,6 +5247,8 @@ def run_transcribe_windows(
                         },
                     }
                 )
+            except LocalQwenSafetyError:
+                raise
             except Exception as exc:
                 output_windows.append(
                     {
@@ -4944,6 +5396,8 @@ def run_generate_subtitles_batch_plan_v3(
                         "raw_payload": raw_payload,
                     }
                 )
+            except LocalQwenSafetyError:
+                raise
             except Exception as exc:
                 output_batches.append(
                     {
@@ -5013,6 +5467,8 @@ def run_generate_subtitles_batch_plan_v3(
                     for item, raw_payload in zip(chunk_items, qwen_payloads):
                         item["raw_payload"] = raw_payload
                     diagnostic["qwen_batch_used"] = True
+                except LocalQwenSafetyError:
+                    raise
                 except Exception as exc:
                     diagnostic["qwen_batch_failed_call_count"] = int(diagnostic.get("qwen_batch_failed_call_count") or 0) + 1
                     failed_errors = diagnostic.setdefault("qwen_batch_errors", [])
@@ -5135,6 +5591,8 @@ def run_generate_subtitles_batch_plan_v3(
                 }
                 output_batches.append(batch_output)
                 subtitle_rows.extend(rows)
+            except LocalQwenSafetyError:
+                raise
             except Exception as exc:
                 output_batches.append(
                     {
@@ -6545,10 +7003,22 @@ def qwen3_cpp_force_align_items(
         "-o",
         str(output_path),
     ]
-    result = subprocess.run(cmd, text=True, capture_output=True)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or result.returncode}")
+    try:
+        output_path.unlink(missing_ok=True)
+        returncode, log_text = run_guarded_local_qwen_command(
+            cmd,
+            "gguf",
+            timeout_seconds=LOCAL_QWEN_GGUF_TIMEOUT_SECONDS,
+            cwd=work_dir,
+        )
+    except LocalQwenSafetyError:
+        output_path.unlink(missing_ok=True)
+        raise
+    if returncode != 0:
+        output_path.unlink(missing_ok=True)
+        raise_for_local_qwen_returncode(returncode, "gguf", log_text)
+        detail = log_text.strip()
+        raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or returncode}")
     if not output_path.exists():
         raise RuntimeError(f"Qwen3 forced align 未生成输出 JSON: {output_path}")
 
@@ -6992,6 +7462,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--audio-channel-index", type=int)
     parser.add_argument("--rows-json")
     parser.add_argument("--batch-plan-json")
+    parser.add_argument("--worker-request-json")
     parser.add_argument("--windows-json")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--timeline-start-frame", type=int, default=0)
@@ -7022,6 +7493,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mode",
         choices=(
+            "qwen_asr_worker",
             "qwen_forced_align_text_batches",
             "transcribe",
             "generate_subtitles",
@@ -7048,6 +7520,11 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(args.output)
     progress_path = Path(args.progress_json) if args.progress_json else None
     try:
+        if args.mode == "qwen_asr_worker":
+            if not args.worker_request_json:
+                raise RuntimeError("缺少 --worker-request-json")
+            run_qwen3_asr_worker_mode(Path(args.worker_request_json), output_path)
+            return 0
         diagnostic: dict[str, Any] = {
             "requested_ffmpeg": args.ffmpeg,
             "requested_mode": args.mode,
@@ -7408,7 +7885,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception as exc:
         write_progress(progress_path, "failed", str(exc))
-        write_payload(output_path, {"ok": False, "error": str(exc), "segments": []})
+        write_payload(
+            output_path,
+            {
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "segments": [],
+            },
+        )
         if args.mode in {"generate_subtitles", "generate_subtitles_batch"} and args.diagnostic_output:
             failure_code = "generate_failed"
             if args.generate_engine in {"v4", "v5"} and isinstance(exc, generate_v4.V4AlignmentError):

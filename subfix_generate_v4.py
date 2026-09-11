@@ -902,6 +902,10 @@ def require_aligned_units(
         try:
             items = list(align_fn(Path(audio_path), text, language) or [])
         except Exception as exc:
+            # The helper is loaded dynamically; preserve its resource stop marker
+            # so context retries cannot turn a safety stop into a larger workload.
+            if getattr(exc, "subfix_resource_stop", False):
+                raise
             raise V4AlignmentError("v4 Forced Aligner 执行失败，已终止写回") from exc
     units = _expand_timestamp_items(items, fps, timeline_start_frame)
     actual = "".join(unit["text"] for unit in units)

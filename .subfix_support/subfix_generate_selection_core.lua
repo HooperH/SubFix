@@ -3171,6 +3171,19 @@ local function kill_background_process(pid_file)
     local pid_text = trim_text(read_text_file(pid_file) or "")
     local pid = tonumber(pid_text)
     if pid and pid > 0 then
+        local paths = resolve_asr_paths()
+        if file_exists(paths.runtime_python) and file_exists(paths.process_group) then
+            local stop_cmd = table.concat({
+                shell_quote(paths.runtime_python),
+                shell_quote(paths.process_group),
+                "--stop",
+                shell_quote(tostring(pid))
+            }, " ")
+            local stop_status = os.execute(stop_cmd)
+            if stop_status == true or stop_status == 0 then
+                return
+            end
+        end
         os.execute("kill -TERM -- -" .. tostring(pid) .. " 2>/dev/null || kill -TERM " .. tostring(pid) .. " 2>/dev/null || true")
         os.execute("sleep 0.2; kill -KILL -- -" .. tostring(pid) .. " 2>/dev/null || true")
     end

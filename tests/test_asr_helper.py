@@ -29,11 +29,10 @@ def test_qwen_asr_loader_does_not_initialize_python_forced_aligner(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(bfloat16="bfloat16"))
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
-    helper._QWEN3_ASR_MODEL_CACHE.clear()
-
     helper.load_qwen3_asr_model("Qwen/Qwen3-ASR-1.7B")
 
     assert len(calls) == 1
+    assert calls[0][1]["max_inference_batch_size"] == 1
     assert "forced_aligner" not in calls[0][1]
     assert "forced_aligner_kwargs" not in calls[0][1]
 
@@ -43,18 +42,19 @@ def test_qwen_asr_uses_local_alignment_when_native_word_timing_is_missing(monkey
     audio = tmp_path / "single.wav"
     audio.touch()
     aligned = []
-    transcribe_calls = []
-
-    class FakeModel:
-        def transcribe(self, **kwargs):
-            transcribe_calls.append(kwargs)
-            return [{"text": "本地对齐"}]
-
-    monkeypatch.setattr(helper, "load_qwen3_asr_model", lambda _model: (FakeModel(), "asr", "qwen3_cpp", "cpu"))
+    events = []
+    monkeypatch.setattr(
+        helper,
+        "run_qwen3_asr_worker",
+        lambda path, model, language, context=None: events.append("worker_exited") or {
+            "text": "本地对齐", "language": None, "model": "asr", "device_map": "cpu",
+            "hotword_context_status": "not_requested",
+        },
+    )
     monkeypatch.setattr(
         helper,
         "qwen3_force_align_items",
-        lambda path, text, language: aligned.append((path, text, language))
+        lambda path, text, language: events.append("gguf_started") or aligned.append((path, text, language))
         or [
             {"text": "本地", "start": 0.10, "end": 0.30},
             {"text": "对齐", "start": 0.35, "end": 0.60},
@@ -64,7 +64,7 @@ def test_qwen_asr_uses_local_alignment_when_native_word_timing_is_missing(monkey
     payload = helper.transcribe_qwen3_asr(audio, "Qwen/Qwen3-ASR-1.7B", "zh")
 
     assert aligned == [(audio, "本地对齐", "Chinese")]
-    assert transcribe_calls == [{"audio": str(audio), "language": "Chinese", "return_time_stamps": False}]
+    assert events == ["worker_exited", "gguf_started"]
     assert payload["segments"] == [
         {
             "start": 0.10,
@@ -85,11 +85,14 @@ def test_qwen_asr_uses_detected_language_for_local_alignment_in_auto_mode(monkey
     audio.touch()
     aligned = []
 
-    class FakeModel:
-        def transcribe(self, **kwargs):
-            return [{"text": "offline", "language": "English"}]
-
-    monkeypatch.setattr(helper, "load_qwen3_asr_model", lambda _model: (FakeModel(), "asr", "qwen3_cpp", "cpu"))
+    monkeypatch.setattr(
+        helper,
+        "run_qwen3_asr_worker",
+        lambda *_args, **_kwargs: {
+            "text": "offline", "language": "English", "model": "asr", "device_map": "cpu",
+            "hotword_context_status": "not_requested",
+        },
+    )
     monkeypatch.setattr(
         helper,
         "qwen3_force_align_items",
@@ -110,19 +113,23 @@ def test_qwen_asr_batch_uses_local_alignment_for_each_matching_audio(monkeypatch
     second_audio.touch()
     aligned = []
 
-    class FakeModel:
-        def transcribe(self, **kwargs):
-            return [{"text": "第一段"}, {"text": "第二段"}]
-
     def fake_align(path, text, language):
         aligned.append((path, text, language))
         return [{"text": text, "start": 0.20, "end": 0.80}]
 
-    monkeypatch.setattr(helper, "load_qwen3_asr_model", lambda _model: (FakeModel(), "asr", "qwen3_cpp", "cpu"))
+    calls = []
+    def fake_worker(path, model, language, context=None):
+        calls.append((path, model, language, context))
+        return {
+            "text": "第一段" if path == first_audio else "第二段",
+            "language": None, "model": "asr", "device_map": "cpu",
+            "hotword_context_status": "used" if context else "not_requested",
+        }
+    monkeypatch.setattr(helper, "run_qwen3_asr_worker", fake_worker)
     monkeypatch.setattr(helper, "qwen3_force_align_items", fake_align)
 
     payloads = helper.transcribe_qwen3_asr_batch(
-        [first_audio, second_audio], "Qwen/Qwen3-ASR-1.7B", "zh"
+        [first_audio, second_audio], "Qwen/Qwen3-ASR-1.7B", "zh", context="术语"
     )
 
     assert aligned == [
@@ -130,6 +137,30 @@ def test_qwen_asr_batch_uses_local_alignment_for_each_matching_audio(monkeypatch
         (second_audio, "第二段", "Chinese"),
     ]
     assert [payload["segments"][0]["words"][0]["word"] for payload in payloads] == ["第一段", "第二段"]
+    assert [call[3] for call in calls] == ["术语", "术语"]
+
+
+def test_qwen_empty_worker_result_does_not_start_gguf(monkeypatch, tmp_path):
+    helper = load_helper_module()
+    audio = tmp_path / "empty.wav"
+    audio.touch()
+    monkeypatch.setattr(
+        helper,
+        "run_qwen3_asr_worker",
+        lambda *_args, **_kwargs: {
+            "text": "", "language": "Chinese", "model": "asr", "device_map": "cpu",
+            "hotword_context_status": "not_requested",
+        },
+    )
+    monkeypatch.setattr(
+        helper, "qwen3_force_align_items",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("GGUF must not start")),
+    )
+
+    payload = helper.transcribe_qwen3_asr(audio, "model", "auto")
+
+    assert payload["text"] == ""
+    assert payload["segments"] == []
 
 
 def test_qwen_force_align_items_uses_the_bundled_gguf_helper(monkeypatch, tmp_path):
