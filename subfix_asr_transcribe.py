@@ -216,7 +216,6 @@ DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS = 60
 DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS = 0.5
 DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS = 2.0
 QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
-QWEN3_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN3_CPP_BIN_ENV = "SUBFIX_QWEN3_ASR_CPP_BIN"
 QWEN3_CPP_ALIGNER_GGUF_ENV = "SUBFIX_QWEN3_ALIGNER_GGUF"
 QWEN3_FORCED_ALIGNER_MODEL_NAMES = (
@@ -234,8 +233,7 @@ DEFAULT_FFMPEG_CANDIDATES = (
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
 )
-_QWEN3_ASR_MODEL_CACHE: dict[tuple[str, str, str, str | None], tuple[Any, str, str]] = {}
-_QWEN3_FORCED_ALIGNER_CACHE: dict[tuple[str, str, str], Any] = {}
+_QWEN3_ASR_MODEL_CACHE: dict[tuple[str, str, str | None], tuple[Any, str, str]] = {}
 _OPENAI_WHISPER_MODEL_CACHE: dict[str, Any] = {}
 HOTWORD_MAX_ENTRIES = 200
 HOTWORD_CHINESE_DIGITS = str.maketrans("0123456789", "零一二三四五六七八九")
@@ -3872,7 +3870,6 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
         raise RuntimeError("Qwen3-ASR 环境未安装，请安装 qwen-asr 或继续使用 Whisper fallback") from exc
 
     model_name = os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL
-    aligner_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL
     device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
     dtype = qwen3_torch_dtype(torch)
 
@@ -3880,19 +3877,17 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
         "device_map": device_map,
         "max_inference_batch_size": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_BATCH") or "8"),
         "max_new_tokens": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_NEW_TOKENS") or "512"),
-        "forced_aligner": aligner_name,
-        "forced_aligner_kwargs": {"device_map": device_map},
     }
     if dtype is not None:
         init_kwargs["dtype"] = dtype
-        init_kwargs["forced_aligner_kwargs"]["dtype"] = dtype
 
-    cache_key = (model_name, aligner_name, device_map, str(dtype))
+    cache_key = (model_name, device_map, str(dtype))
+    aligner_name = "qwen3_cpp"
     try:
         cached_model = _QWEN3_ASR_MODEL_CACHE.get(cache_key)
         if cached_model is None:
             qwen_model = Qwen3ASRModel.from_pretrained(model_name, **init_kwargs)
-            _QWEN3_ASR_MODEL_CACHE[cache_key] = (qwen_model, aligner_name, device_map)
+            _QWEN3_ASR_MODEL_CACHE[cache_key] = (qwen_model, "qwen3_cpp", device_map)
         else:
             qwen_model, aligner_name, device_map = cached_model
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
@@ -3900,47 +3895,12 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
     return qwen_model, model_name, aligner_name, device_map
 
 
-def load_qwen3_forced_aligner() -> Any:
-    try:
-        import torch  # type: ignore
-        from qwen_asr import Qwen3ForcedAligner  # type: ignore
-    except Exception as exc:  # pragma: no cover - optional local runtime
-        raise RuntimeError("Qwen3-ForcedAligner 环境未安装，请运行 setup_asr_env.sh") from exc
-
-    model_name = os.getenv("SUBFIX_QWEN3_ALIGNER_MODEL") or QWEN3_FORCED_ALIGNER_MODEL
-    device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
-    dtype = qwen3_torch_dtype(torch)
-    cache_key = (model_name, device_map, str(dtype))
-    cached = _QWEN3_FORCED_ALIGNER_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    kwargs: dict[str, Any] = {"device_map": device_map}
-    if dtype is not None:
-        kwargs["dtype"] = dtype
-    try:
-        aligner = Qwen3ForcedAligner.from_pretrained(model_name, **kwargs)
-    except Exception as exc:  # pragma: no cover - optional local runtime/model cache
-        raise RuntimeError(f"Qwen3-ForcedAligner 模型加载失败: {exc}") from exc
-    _QWEN3_FORCED_ALIGNER_CACHE[cache_key] = aligner
-    return aligner
-
-
 def qwen3_force_align_items(audio_path: Path, text: str, language: str) -> list[dict[str, Any]]:
-    aligner = load_qwen3_forced_aligner()
-    try:
-        results = aligner.align(audio=str(audio_path), text=str(text), language=str(language))
-    except Exception as exc:  # pragma: no cover - optional local runtime/model execution
-        raise RuntimeError(f"Qwen3-ForcedAligner 对齐失败: {exc}") from exc
-    first = results[0] if isinstance(results, list) and results else results
-    items = qwen3_timestamp_value(first, "items") or first or []
-    normalized: list[dict[str, Any]] = []
-    for item in items:
-        unit_text = str(qwen3_timestamp_value(item, "text", "word") or "")
-        start = qwen3_timestamp_value(item, "start_time", "start")
-        end = qwen3_timestamp_value(item, "end_time", "end")
-        if unit_text and start is not None and end is not None and float(end) > float(start):
-            normalized.append({"text": unit_text, "start": float(start), "end": float(end)})
-    return normalized
+    with tempfile.TemporaryDirectory(prefix="subfix_qwen3_align_") as temporary_directory:
+        return [
+            {"text": item["word"], "start": item["start"], "end": item["end"]}
+            for item in qwen3_cpp_force_align_items(audio_path, text, language, Path(temporary_directory))
+        ]
 
 
 def qwen3_result_to_payload(
@@ -3950,6 +3910,7 @@ def qwen3_result_to_payload(
     model_name: str,
     aligner_name: str,
     device_map: str,
+    requested_language: str | None,
     hotword_context_status: str = "not_requested",
 ) -> dict[str, Any]:
     text = str(qwen3_timestamp_value(result, "text") or "").strip()
@@ -3957,6 +3918,19 @@ def qwen3_result_to_payload(
     timestamp_payload = qwen3_timestamp_value(result, "time_stamps", "timestamps", "segments")
     words = qwen3_timestamp_words(timestamp_payload)
     segments = qwen3_timestamp_segments(timestamp_payload)
+    if text and not words:
+        alignment_language = qwen3_language_name(requested_language)
+        if alignment_language is None:
+            alignment_language = qwen3_language_name(str(language_name or "")) or "Chinese"
+        aligned_items = qwen3_force_align_items(
+            audio_path,
+            text,
+            alignment_language,
+        )
+        words = [
+            {"word": item["text"], "start": item["start"], "end": item["end"]}
+            for item in aligned_items
+        ]
     if text and words:
         segments = [{"start": words[0]["start"], "end": words[-1]["end"], "text": text, "words": words}]
     if not segments and text:
@@ -3986,7 +3960,7 @@ def _transcribe_qwen3_model(
     kwargs: dict[str, Any] = {
         "audio": audio,
         "language": qwen3_language_name(language),
-        "return_time_stamps": True,
+        "return_time_stamps": False,
     }
     if not context:
         return qwen_model.transcribe(**kwargs), "not_requested"
@@ -4012,7 +3986,7 @@ def transcribe_qwen3_asr(
         raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
     first_result = results[0] if isinstance(results, list) and results else results
     return qwen3_result_to_payload(
-        first_result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
+        first_result, audio_path, model, model_name, aligner_name, device_map, language, hotword_context_status
     )
 
 
@@ -4034,7 +4008,7 @@ def transcribe_qwen3_asr_batch(
         raise RuntimeError(f"Qwen3-ASR 批量结果数量不匹配: audio={len(audio_paths)} result={len(results)}")
     return [
         qwen3_result_to_payload(
-            result, audio_path, model, model_name, aligner_name, device_map, hotword_context_status
+            result, audio_path, model, model_name, aligner_name, device_map, language, hotword_context_status
         )
         for result, audio_path in zip(results, audio_paths)
     ]
@@ -6543,21 +6517,20 @@ def resolve_qwen3_cpp_paths() -> tuple[Path, Path]:
     return bin_path, model_path
 
 
-def qwen3_cpp_forced_align_text_rows(
+def qwen3_cpp_force_align_items(
     audio_path: Path,
-    rows: list[dict[str, Any]],
+    text: str,
     language: str | None,
-    fps: float,
-    timeline_start_frame: int,
     work_dir: Path,
-) -> dict[str, Any]:
-    alignment_text = build_alignment_text(rows)
+    output_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    alignment_text = str(text or "").strip()
     if not alignment_text:
         raise RuntimeError("Qwen3 forced align 文本为空")
 
     bin_path, model_path = resolve_qwen3_cpp_paths()
     work_dir.mkdir(parents=True, exist_ok=True)
-    output_path = work_dir / f"qwen_forced_align_{int(time.time() * 1000)}_{os.getpid()}.json"
+    output_path = output_path or work_dir / f"qwen_forced_align_{int(time.time() * 1000)}_{os.getpid()}.json"
     cmd = [
         str(bin_path),
         "-m",
@@ -6592,9 +6565,27 @@ def qwen3_cpp_forced_align_text_rows(
         for item in timestamp_items
     )
     if latest_timestamp <= 0.001:
-        raise RuntimeError(
-            "Qwen3 forced align 时间戳无效：所有词/字均停留在 0 秒"
-        )
+        raise RuntimeError("Qwen3 forced align 时间戳无效：所有词/字均停留在 0 秒")
+    return timestamp_items
+
+
+def qwen3_cpp_forced_align_text_rows(
+    audio_path: Path,
+    rows: list[dict[str, Any]],
+    language: str | None,
+    fps: float,
+    timeline_start_frame: int,
+    work_dir: Path,
+) -> dict[str, Any]:
+    alignment_text = build_alignment_text(rows)
+    if not alignment_text:
+        raise RuntimeError("Qwen3 forced align 文本为空")
+
+    bin_path, model_path = resolve_qwen3_cpp_paths()
+    output_path = work_dir / f"qwen_forced_align_{int(time.time() * 1000)}_{os.getpid()}.json"
+    timestamp_items = qwen3_cpp_force_align_items(
+        audio_path, alignment_text, language, work_dir, output_path
+    )
     row_segments = qwen3_remap_timestamp_items_to_rows(
         rows,
         timestamp_items,
