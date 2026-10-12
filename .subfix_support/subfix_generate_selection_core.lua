@@ -2744,6 +2744,7 @@ local function parse_progress_payload(progress_text)
         progress_index = number_field("progress_index"),
         progress_total = number_field("progress_total"),
         eta_seconds = number_field("eta_seconds"),
+        elapsed_seconds = number_field("elapsed_seconds"),
         indeterminate = text:match('"indeterminate"%s*:%s*true') ~= nil
     }
 end
@@ -3248,6 +3249,17 @@ local function run_background_command_with_progress(cmd, progress_path, progress
     local last_signature = nil
     local last_progress_changed_at = os.time()
     local stall_warning_logged = false
+    local started_at = os.time()
+    local last_process_check_at = started_at
+    local missing_process_checks = 0
+    local failed_at = nil
+    local terminal_error = nil
+
+    local function stop_polling()
+        pcall(function() poll_timer:Stop() end)
+        ui_timer_handlers[timer_id] = nil
+        pcall(function() dispatcher:ExitLoop() end)
+    end
 
     local timer_registered = register_ui_timer(poll_timer, function()
         local payload = parse_progress_payload(read_text_file(progress_path) or "")
@@ -3279,16 +3291,42 @@ local function run_background_command_with_progress(cmd, progress_path, progress
         if progress_state and progress_state.cancel_requested then
             cancelled = true
             kill_background_process(pid_file)
-            pcall(function() poll_timer:Stop() end)
-            ui_timer_handlers[timer_id] = nil
-            pcall(function() dispatcher:ExitLoop() end)
+            stop_polling()
             return
         end
 
-        if file_exists(done_file) then
-            pcall(function() poll_timer:Stop() end)
-            ui_timer_handlers[timer_id] = nil
-            pcall(function() dispatcher:ExitLoop() end)
+        if file_exists(done_file) or tonumber(trim_text(read_text_file(exit_file) or "")) then
+            stop_polling()
+            return
+        end
+        if payload and payload.stage == "failed" then
+            failed_at = failed_at or os.time()
+            -- Let the helper flush its error/output before stopping a stuck wrapper.
+            if os.time() - failed_at >= 2 then
+                terminal_error = tostring(payload.message or "ASR helper 执行失败")
+                kill_background_process(pid_file)
+                stop_polling()
+                return
+            end
+        end
+        if os.time() - last_process_check_at >= 2 then
+            last_process_check_at = os.time()
+            local pid = tonumber(trim_text(read_text_file(pid_file) or ""))
+            if pid and pid > 0 and pid == math.floor(pid) then
+                local alive = os.execute("kill -0 " .. tostring(pid) .. " 2>/dev/null")
+                if alive == true or alive == 0 then
+                    missing_process_checks = 0
+                else
+                    missing_process_checks = missing_process_checks + 1
+                    if missing_process_checks >= 2 then
+                        terminal_error = "ASR helper 已退出，但未返回完成状态；请查看诊断日志"
+                        stop_polling()
+                    end
+                end
+            elseif os.time() - started_at >= 10 then
+                terminal_error = "ASR helper 启动失败：未取得进程编号；请查看诊断日志"
+                stop_polling()
+            end
         end
     end)
     if not timer_registered then
@@ -3309,12 +3347,20 @@ local function run_background_command_with_progress(cmd, progress_path, progress
 
     output = read_text_file(stdout_file) or ""
     local exit_code = tonumber(trim_text(read_text_file(exit_file) or "")) or 1
-    os.execute(string.format("rm -f %s %s %s %s 2>/dev/null", shell_quote(stdout_file), shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
+    local succeeded = exit_code == 0 and not terminal_error
+    os.execute(string.format("rm -f %s %s %s 2>/dev/null", shell_quote(pid_file), shell_quote(done_file), shell_quote(exit_file)))
+    if succeeded or cancelled then
+        os.execute("rm -f " .. shell_quote(stdout_file) .. " 2>/dev/null")
+    else
+        if terminal_error then output = terminal_error .. "\n" .. output end
+        if trim_text(output) == "" then output = "ASR helper 异常退出 (" .. tostring(exit_code) .. ")" end
+        output = output .. "\n诊断日志: " .. stdout_file
+    end
 
     if cancelled then
         return false, "已取消", "cancelled"
     end
-    return exit_code == 0, output, nil
+    return succeeded, output, nil
 end
 
 local function run_asr_helper_with_progress(audio_source, srt_path, json_path, timeline_start_frame, fps, progress_state, source_index, source_count)

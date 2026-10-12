@@ -117,6 +117,7 @@ LOCAL_QWEN_ASR_TIMEOUT_SECONDS = 15 * 60.0
 LOCAL_QWEN_GGUF_TIMEOUT_SECONDS = 10 * 60.0
 LOCAL_QWEN_MONITOR_INTERVAL_SECONDS = 0.5
 LOCAL_QWEN_LOG_LIMIT_BYTES = 256 * 1024
+_LOCAL_QWEN_PROGRESS_CONTEXT: tuple[Path, dict[str, Any]] | None = None
 
 
 class LocalQwenSafetyError(RuntimeError):
@@ -151,9 +152,15 @@ def raise_for_local_qwen_returncode(returncode: int, stage: str, log_text: str) 
     if returncode == 0:
         return
     if returncode < 0 or returncode in {134, 137} or is_local_qwen_resource_error(log_text):
+        reason = "因信号、OOM 或资源压力异常终止"
+        advice = "请缩小选区后重试或改用云端识别"
+        if returncode in {-signal.SIGABRT, 134} and not is_local_qwen_resource_error(log_text):
+            reason = "异常终止（SIGABRT，程序主动中止；不能仅凭退出码判断内存不足）"
+            advice = "请提供底层日志以定位崩溃原因"
+        detail = log_text.strip()[-2000:]
         raise LocalQwenSafetyError(
-            f"本地 Qwen {stage.upper()} 子进程因信号、OOM 或资源压力异常终止 ({returncode})；"
-            "请缩小选区后重试或改用云端识别"
+            f"本地 Qwen {stage.upper()} 子进程{reason} ({returncode})；{advice}"
+            + (f"\n底层日志（末尾）：\n{detail}" if detail else "\n子进程未返回底层日志")
         )
 
 
@@ -360,6 +367,7 @@ def monitor_local_qwen_process(
     probe: Any = read_local_resource_snapshot,
     rss_reader: Any = None,
     poll_interval: float = LOCAL_QWEN_MONITOR_INTERVAL_SECONDS,
+    progress_callback: Any = None,
 ) -> int:
     started_at = time.monotonic()
     try:
@@ -372,6 +380,8 @@ def monitor_local_qwen_process(
                 proc.wait()
                 return int(returncode)
             elapsed = time.monotonic() - started_at
+            if progress_callback is not None:
+                progress_callback(elapsed)
             if elapsed >= timeout_seconds:
                 raise LocalQwenSafetyError(f"本地 Qwen {stage.upper()} 子进程超时，已安全终止")
             snapshot = probe()
@@ -404,7 +414,9 @@ def run_guarded_local_qwen_command(
     timeout_seconds: float,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    worker_progress_path: Path | None = None,
 ) -> tuple[int, str]:
+    progress_context = _LOCAL_QWEN_PROGRESS_CONTEXT
     snapshot = read_local_resource_snapshot()
     assert_local_qwen_resources(snapshot, stage)
     try:
@@ -427,7 +439,7 @@ def run_guarded_local_qwen_command(
     def drain_bounded_log() -> None:
         assert proc.stdout is not None
         while True:
-            chunk = proc.stdout.read(8192)
+            chunk = proc.stdout.read1(8192)  # Short phase messages must be visible before process exit.
             if not chunk:
                 return
             with log_lock:
@@ -438,6 +450,38 @@ def run_guarded_local_qwen_command(
 
     log_thread = threading.Thread(target=drain_bounded_log, name="subfix-qwen-log", daemon=True)
     log_thread.start()
+
+    phase = "load_qwen_model" if stage == "asr" else "load_qwen_aligner"
+    last_progress_second = -1
+
+    def report_progress(elapsed: float) -> None:
+        nonlocal phase, last_progress_second
+        if progress_context is None or int(elapsed) == last_progress_second:
+            return
+        last_progress_second = int(elapsed)
+        if worker_progress_path is not None:
+            try:
+                worker_payload = json.loads(worker_progress_path.read_text(encoding="utf-8"))
+                if isinstance(worker_payload, dict) and worker_payload.get("stage") in {"load_qwen_model", "run_qwen_asr"}:
+                    phase = worker_payload["stage"]
+            except (OSError, ValueError):
+                pass
+        elif stage == "gguf":
+            with log_lock:
+                if b"Model loaded. Running alignment..." in log_tail:
+                    phase = "qwen_align"
+        labels = {
+            "load_qwen_model": "正在加载语音模型",
+            "run_qwen_asr": "正在识别语音",
+            "load_qwen_aligner": "正在加载字幕对齐模型",
+            "qwen_align": "正在对齐字幕时间",
+        }
+        path, context = progress_context
+        extra = {key: context[key] for key in ("batch_index", "total_batches", "progress_index", "progress_total") if key in context}
+        write_progress(path, phase, f"{context.get('message', '')} · {labels[phase]}",
+                       elapsed_seconds=int(elapsed), local_qwen_stage=True, **extra)
+
+    report_progress(0)
 
     previous_handlers: dict[int, Any] = {}
 
@@ -451,12 +495,17 @@ def run_guarded_local_qwen_command(
         except ValueError:  # not the main Python thread
             previous_handlers.clear()
             break
+    failure = None
     try:
         returncode = monitor_local_qwen_process(
             proc,
             stage,
             timeout_seconds=timeout_seconds,
+            probe=read_local_resource_snapshot,
+            progress_callback=report_progress,
         )
+    except LocalQwenSafetyError as exc:
+        failure = exc
     finally:
         terminate_local_qwen_process(proc)
         for signum, previous in previous_handlers.items():
@@ -467,6 +516,21 @@ def run_guarded_local_qwen_command(
             log_thread.join(timeout=1.0)
     with log_lock:
         log_text = bytes(log_tail).decode("utf-8", errors="replace")
+    if failure is not None or returncode != 0:
+        if progress_context is not None:
+            path = progress_context[0]
+            log_path = path.with_name(path.name + f".qwen-{stage}.log")
+            try:
+                log_path.write_text(
+                    f"Qwen stage: {stage}\n{failure or ('exit code: ' + str(returncode))}\n{log_text}",
+                    encoding="utf-8",
+                )
+                log_text += f"\n诊断日志: {log_path}"
+            except OSError:
+                pass  # The error still carries the bounded log tail when disk writes fail.
+        if failure is not None:
+            detail = log_text.strip()[-2000:]
+            raise LocalQwenSafetyError(str(failure) + (f"\n底层日志（末尾）：\n{detail}" if detail else "")) from failure
     return returncode, log_text
 
 
@@ -939,6 +1003,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
 
 
 def write_progress(path: Path | None, stage: str, message: str, **extra: Any) -> None:
+    global _LOCAL_QWEN_PROGRESS_CONTEXT
     if not path:
         return
     payload = {
@@ -948,11 +1013,18 @@ def write_progress(path: Path | None, stage: str, message: str, **extra: Any) ->
         "helper_version": HELPER_VERSION,
     }
     payload.update(extra)
+    if not extra.get("local_qwen_stage"):
+        _LOCAL_QWEN_PROGRESS_CONTEXT = (path, payload)
+    temporary_path = path.with_name(path.name + f".{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary_path.replace(path)
     except OSError:
-        pass
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def generate_batch_progress_total(total_batches: int) -> int:
@@ -4371,10 +4443,13 @@ def run_qwen3_asr_worker_mode(request_path: Path, output_path: Path) -> None:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     if not isinstance(request, dict):
         raise RuntimeError("Qwen3-ASR worker 请求必须是 JSON 对象")
+    progress_path = Path(request["progress_json"]) if request.get("progress_json") else None
+    write_progress(progress_path, "load_qwen_model", "正在加载语音模型")
     qwen_model, model_name, _aligner_name, device_map = load_qwen3_asr_model(
         str(request.get("model") or QWEN3_ASR_MODEL)
     )
     try:
+        write_progress(progress_path, "run_qwen_asr", "正在识别语音")
         results, status = _transcribe_qwen3_model(
             qwen_model,
             str(request.get("audio") or ""),
@@ -4400,9 +4475,11 @@ def run_qwen3_asr_worker(
         worker_dir = Path(temporary_directory)
         request_path = worker_dir / "request.json"
         output_path = worker_dir / "output.json"
+        worker_progress_path = worker_dir / "progress.json"
         write_payload(
             request_path,
-            {"audio": str(audio_path), "model": model, "language": language, "context": context},
+            {"audio": str(audio_path), "model": model, "language": language, "context": context,
+             "progress_json": str(worker_progress_path)},
         )
         child_env = dict(os.environ)
         child_env["SUBFIX_QWEN3_ASR_MAX_BATCH"] = "1"
@@ -4422,6 +4499,7 @@ def run_qwen3_asr_worker(
             "asr",
             timeout_seconds=LOCAL_QWEN_ASR_TIMEOUT_SECONDS,
             env=child_env,
+            worker_progress_path=worker_progress_path,
         )
         payload: dict[str, Any] = {}
         if output_path.exists():
@@ -4432,7 +4510,11 @@ def run_qwen3_asr_worker(
             except (OSError, json.JSONDecodeError):
                 payload = {}
         if payload.get("error_type") == "LocalQwenSafetyError":
-            raise LocalQwenSafetyError(str(payload.get("error") or "Qwen3-ASR worker 触发资源保护"))
+            detail = log_text.strip()[-2000:]
+            raise LocalQwenSafetyError(
+                str(payload.get("error") or "Qwen3-ASR worker 触发资源保护")
+                + (f"\n底层日志（末尾）：\n{detail}" if detail else "")
+            )
         worker_detail = str(payload.get("error") or "")
         raise_for_local_qwen_returncode(returncode, "asr", f"{worker_detail}\n{log_text}")
         if returncode != 0 or payload.get("ok") is not True:
@@ -7451,6 +7533,8 @@ def run_qwen_forced_align_batch_plan(
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _LOCAL_QWEN_PROGRESS_CONTEXT
+    _LOCAL_QWEN_PROGRESS_CONTEXT = None
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio")
     parser.add_argument("--output", required=True)

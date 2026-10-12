@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.3.2"
+SUBFIX_VERSION = "3.3.3"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -12608,6 +12608,127 @@ function SUBFIX_AUDIO_ALIGN.run(target_window)
 end
 
 -- ========== 刷新字幕列表 ==========
+-- SRT 不保存 Resolve 21 的片段淡入淡出；重建前另存，重建后恢复。
+SUBFIX_SUBTITLE_FADES = {}
+
+function SUBFIX_SUBTITLE_FADES.item_id(item)
+    local ok, id = pcall(function() return item:GetUniqueId() end)
+    return ok and type(id) == "string" and id ~= "" and id or nil
+end
+
+function SUBFIX_SUBTITLE_FADES.read(item)
+    local ok, fades = pcall(function() return item:GetFades() end)
+    if not ok or type(fades) ~= "table" then return nil end
+    local result = {}
+    for _, key in ipairs({"FadeIn", "FadeOut"}) do
+        local value = tonumber(fades[key])
+        if not value or value ~= value or value < 0 or value == math.huge then return nil end
+        result[key] = math.floor(value + 0.5)
+    end
+    return result
+end
+
+function SUBFIX_SUBTITLE_FADES.prepare(items, rows, required)
+    local plan, claimed = {}, {}
+    for _, item in ipairs(items or {}) do
+        local fades = SUBFIX_SUBTITLE_FADES.read(item)
+        if not fades and required then
+            return nil, "无法读取字幕淡入淡出，已停止更新；请确认 Resolve 支持 GetFades 后重试"
+        end
+        if fades and (fades.FadeIn > 0 or fades.FadeOut > 0) then
+            local id = SUBFIX_SUBTITLE_FADES.item_id(item)
+            local match, count = nil, 0
+            for index, row in ipairs(rows) do
+                if id and row.source_subtitle_id == id then match, count = index, count + 1 end
+            end
+            if count == 0 then
+                local start_frame, end_frame = item:GetStart(), item:GetEnd()
+                for index, row in ipairs(rows) do
+                    if tonumber(row.start_frame) == start_frame and tonumber(row.end_frame) == end_frame then
+                        match, count = index, count + 1
+                    end
+                end
+            end
+            if count ~= 1 or claimed[match] then
+                return nil, "无法唯一匹配带淡入淡出的原字幕，已停止更新；请刷新字幕后重试"
+            end
+            claimed[match] = true
+            plan[#plan + 1] = {
+                row_index = match, source_subtitle_id = id,
+                start_frame = rows[match].start_frame, end_frame = rows[match].end_frame,
+                FadeIn = fades.FadeIn, FadeOut = fades.FadeOut
+            }
+        end
+    end
+    return plan
+end
+
+function SUBFIX_SUBTITLE_FADES.save(path, plan)
+    if #plan == 0 then return true end
+    local file, err = io.open(path, "w")
+    if not file then return false, tostring(err) end
+    local ok, written = pcall(function() return file:write(json_encode_value(plan)) end)
+    local closed = file:close()
+    if not ok or not written or not closed then return false, "无法保存字幕淡入淡出恢复数据" end
+    return true
+end
+
+function SUBFIX_SUBTITLE_FADES.restore(plan, rows, items)
+    if #(items or {}) ~= #rows then return false, 0, "导入字幕数量不一致，请检查时间线" end
+    local matched, used = {}, {}
+    local imported = {}
+    for _, item in ipairs(items or {}) do
+        local ok, info = pcall(function()
+            return {item = item, start_frame = item:GetStart(), end_frame = item:GetEnd(),
+                text = tostring(item:GetName() or ""):gsub("\r\n", "\n")}
+        end)
+        if not ok or type(info.start_frame) ~= "number" or type(info.end_frame) ~= "number" then
+            return false, 0, "无法读取导入字幕属性，请检查时间线"
+        end
+        imported[#imported + 1] = info
+    end
+    -- 先完成整批匹配再写属性，避免漏导/错轨时把效果写到其他字幕。
+    for index, row in ipairs(rows) do
+        local expected_end = math.max(tonumber(row.end_frame) or 0, (tonumber(row.start_frame) or 0) + 1)
+        local next_start = rows[index + 1] and tonumber(rows[index + 1].start_frame)
+        if next_start and next_start > row.start_frame then expected_end = math.min(expected_end, next_start) end
+        local count, candidate = 0, nil
+        local row_text = tostring(row.text or ""):gsub("\r\n", "\n")
+        for _, info in ipairs(imported) do
+            if math.abs(info.start_frame - row.start_frame) <= 1
+                and math.abs(info.end_frame - expected_end) <= 1 and info.text == row_text then
+                count, candidate = count + 1, info.item
+            end
+        end
+        if count ~= 1 or used[candidate] then
+            return false, 0, "导入字幕与更新数据不匹配，请检查落轨和字幕数量"
+        end
+        matched[index], used[candidate] = candidate, true
+    end
+    local restored = 0
+    for _, entry in ipairs(plan) do
+        local item = matched[entry.row_index]
+        -- Resolve 两端淡入淡出合计必须留出至少 1 帧；缩短字幕时按比例收缩。
+        local budget = math.max(0, math.floor(item:GetEnd() - item:GetStart()) - 1)
+        local total = entry.FadeIn + entry.FadeOut
+        local fades = {FadeIn = entry.FadeIn, FadeOut = entry.FadeOut}
+        if total > budget then
+            fades.FadeIn = math.floor(budget * entry.FadeIn / total + 0.5)
+            fades.FadeOut = budget - fades.FadeIn
+        end
+        local ok, result = pcall(function() return item:SetFades(fades) end)
+        local actual = ok and result == true and SUBFIX_SUBTITLE_FADES.read(item) or nil
+        if not actual or actual.FadeIn ~= fades.FadeIn or actual.FadeOut ~= fades.FadeOut then
+            return false, restored, "第 " .. tostring(entry.row_index) .. " 条字幕淡入淡出恢复失败，请使用恢复数据核对"
+        end
+        restored = restored + 1
+    end
+    for index, row in ipairs(rows) do
+        row.source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(matched[index])
+    end
+    return true, restored
+end
+
 local function refresh_subtitles(target_window, options)
     local window = resolve_window(target_window)
     options = options or {}
@@ -12741,6 +12862,7 @@ local function refresh_subtitles(target_window, options)
             -- 存储数据
             local row_data = {
                 id = build_row_id(current_track, i, start_frame, end_frame),
+                source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item),
                 index = i,
                 target_abs_frame = target_abs_frame,
                 fps = current_fps,
@@ -13713,6 +13835,7 @@ function build_selection_composite_rows(timeline, track_index, scope, selection_
         if ok_start and ok_end and start_frame ~= nil and end_frame ~= nil then
             full_rows[#full_rows + 1] = {
                 index = item_index,
+                source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item),
                 start_frame = tonumber(start_frame) or 0,
                 end_frame = tonumber(end_frame) or 0,
                 text = ok_name and tostring(name or "") or "",
@@ -13748,6 +13871,7 @@ function build_selection_composite_rows(timeline, track_index, scope, selection_
                 return nil, "选区内字幕数量与时间线目标轨不一致"
             end
             local row = clone_table(replacement)
+            row.source_subtitle_id = full_row.source_subtitle_id
             row.index = #composite_rows + 1
             row.fps = fps or row.fps or current_fps
             composite_rows[#composite_rows + 1] = row
@@ -14165,6 +14289,20 @@ update_timeline = function()
 
     LogMsg("已确认目标字幕轨存在: 轨道 " .. tostring(current_subtitle_target_track) .. "，当前 " .. tostring(#ensured_items) .. " 条字幕")
 
+    local version_ok, version = pcall(function() return resolve:GetVersion() end)
+    local fades_required = not version_ok or type(version) ~= "table" or (tonumber(version[1]) or 21) >= 21
+    local fade_plan, fade_err = SUBFIX_SUBTITLE_FADES.prepare(ensured_items, export_list, fades_required)
+    local fade_backup_path = srt_path .. ".fades.json"
+    if fade_plan then
+        local saved, save_err = SUBFIX_SUBTITLE_FADES.save(fade_backup_path, fade_plan)
+        if not saved then fade_plan, fade_err = nil, "无法保存淡入淡出恢复数据：" .. tostring(save_err) end
+    end
+    if not fade_plan then
+        LogMsg(tostring(fade_err))
+        if status then status:Set("Text", tostring(fade_err)) end
+        return finish_timeline_update(false)
+    end
+
     local original_track_state_snapshot = select(1, get_subtitle_track_state_snapshot(timeline))
     if original_track_state_snapshot then
         local before_state_msg = "导入前字幕轨状态: " .. format_subtitle_track_state_snapshot(original_track_state_snapshot)
@@ -14295,6 +14433,25 @@ update_timeline = function()
             print("[Hooper AI 2.0] 解除锁轨兜底失败: " .. tostring(unlock_err_after))
             LogMsg("解除锁轨兜底失败: " .. tostring(unlock_err_after))
         end
+    end
+
+    -- 只在已确认的空轨上恢复，避免 Resolve 意外落到已有字幕的轨道时误写。
+    local imported_track = final_delta.detected_track
+    if imported_track and (before_snapshot.tracks[imported_track] or 0) == 0 then
+        local imported_items = select(1, get_subtitle_track_items(imported_track, timeline)) or {}
+        local restored, count, restore_err = SUBFIX_SUBTITLE_FADES.restore(fade_plan, export_list, imported_items)
+        if not restored and #fade_plan > 0 then
+            local message = "字幕已导入，但" .. tostring(restore_err) .. "；恢复数据：" .. fade_backup_path
+            LogMsg(message)
+            if status then status:Set("Text", message) end
+            return finish_timeline_update(false)
+        end
+        if restored and count > 0 then LogMsg("已恢复字幕淡入淡出 " .. tostring(count) .. " 条；恢复数据：" .. fade_backup_path) end
+    elseif #fade_plan > 0 then
+        local message = "字幕已导入，但落轨不明确，未恢复淡入淡出；请核对时间线。恢复数据：" .. fade_backup_path
+        LogMsg(message)
+        if status then status:Set("Text", message) end
+        return finish_timeline_update(false)
     end
 
     return finish_timeline_update()
@@ -19547,7 +19704,7 @@ end
 PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND = 11
 PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS = 6
 PRE_DELIVERY_MAX_SUBTITLE_CHARS = 24
-PRE_DELIVERY_SUBTITLE_GAP_WARNING_FRAMES = 3
+PRE_DELIVERY_SUBTITLE_SHORT_GAP_MAX_SECONDS = 0.5
 PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES = 6
 PRE_DELIVERY_SPEECH_CONSISTENCY_ENABLED = true
 PRE_DELIVERY_SPEECH_CONSISTENCY_MIN_SCORE = 0.72
@@ -19821,9 +19978,8 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     local fast_reading_cps = tonumber(PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND) or 11
     local max_subtitle_duration_seconds = tonumber(PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS) or 6
     local max_subtitle_chars = tonumber(PRE_DELIVERY_MAX_SUBTITLE_CHARS) or 24
-    local subtitle_gap_warning_frames = tonumber(PRE_DELIVERY_SUBTITLE_GAP_WARNING_FRAMES) or 3
-    -- 与消除空隙保持相同范围；更长的停顿不能仅凭字幕间隔判定异常。
-    local subtitle_gap_max_frames = math.max(1, math.floor(rate * 2 + 0.5))
+    -- 终检只提示疑似闪断的短缝；填补空隙的 2 秒范围包含正常停顿，不能用于报警。
+    local subtitle_gap_max_frames = math.floor(rate * (tonumber(PRE_DELIVERY_SUBTITLE_SHORT_GAP_MAX_SECONDS) or 0.5))
     local cut_tolerance_frames = tonumber(PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES) or 6
     local cut_frames = collect_visible_timeline_cut_frames(timeline)
     local transition_alignment_cuts = collect_timeline_transition_alignment_cuts(timeline)
@@ -19897,13 +20053,13 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             end
             if previous_row and previous_end then
                 local gap_frames = row_start - previous_end
-                if gap_frames > subtitle_gap_warning_frames and gap_frames <= subtitle_gap_max_frames then
+                if gap_frames > 0 and gap_frames <= subtitle_gap_max_frames then
                     local gap_marker_frame = math.floor(((previous_end + row_start) / 2) + 0.5)
                     add_issue(
                         row,
                         i,
-                        "字幕间隔过长",
-                        string.format("距离上一条字幕 %d 帧", gap_frames),
+                        "字幕间异常短缝",
+                        string.format("两条字幕间留空 %d 帧（%.3f 秒），疑似意外断开，请检查是否应连续", gap_frames, gap_frames / rate),
                         nil,
                         gap_marker_frame
                     )
@@ -21366,7 +21522,7 @@ function pre_delivery_issue_summary_text(issues, marker_count)
         counts[kind] = (counts[kind] or 0) + 1
     end
     return string.format(
-        "发现问题：%d\n已打 marker：%d\n空字幕：%d\n阅读速度过快：%d\n字幕显示过久：%d\n单条字幕过长：%d\n字幕尾部空格：%d\n字幕间隔过长：%d\n相邻重复字幕：%d\n字幕边界未贴剪辑点：%d",
+        "发现问题：%d\n已打 marker：%d\n空字幕：%d\n阅读速度过快：%d\n字幕显示过久：%d\n单条字幕过长：%d\n字幕尾部空格：%d\n字幕间异常短缝：%d\n相邻重复字幕：%d\n字幕边界未贴剪辑点：%d",
         #(issues or {}),
         tonumber(marker_count) or 0,
         counts["空字幕"] or 0,
@@ -21374,7 +21530,7 @@ function pre_delivery_issue_summary_text(issues, marker_count)
         counts["字幕显示过久"] or 0,
         counts["单条字幕过长"] or 0,
         counts["字幕尾部空格"] or 0,
-        counts["字幕间隔过长"] or 0,
+        counts["字幕间异常短缝"] or 0,
         counts["相邻重复字幕"] or 0,
         counts["字幕边界未贴剪辑点"] or 0
     )
@@ -21471,7 +21627,7 @@ function add_pre_delivery_check_marker(timeline, issue, timeline_start_frame)
     if trim_text(issue.note or "") ~= "" then
         note = tostring(issue.note or "")
     end
-    local color = (issue.kind == "阅读速度过快" or issue.kind == "字幕显示过久" or issue.kind == "单条字幕过长" or issue.kind == "字幕边界未贴剪辑点" or issue.kind == "字幕间隔过长" or issue.kind == "口播字幕小差异" or issue.kind == "口播字幕疑似字词替换") and "Yellow" or "Red"
+    local color = (issue.kind == "阅读速度过快" or issue.kind == "字幕显示过久" or issue.kind == "单条字幕过长" or issue.kind == "字幕边界未贴剪辑点" or issue.kind == "字幕间异常短缝" or issue.kind == "口播字幕小差异" or issue.kind == "口播字幕疑似字词替换") and "Yellow" or "Red"
 
     local ok, ret = pcall(function()
         return timeline:AddMarker(frame, color, name, note, duration, custom_data)

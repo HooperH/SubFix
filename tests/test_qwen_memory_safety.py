@@ -125,6 +125,37 @@ def test_abnormal_memory_kill_is_a_safety_error(returncode):
         helper.raise_for_local_qwen_returncode(returncode, "asr", "")
 
 
+@pytest.mark.parametrize("returncode", (-signal.SIGABRT, 134))
+def test_abort_reports_crash_and_preserves_underlying_diagnostic(returncode):
+    helper = load_helper_module()
+    diagnostic = "GGML_ASSERT(buffer != nullptr) failed"
+    with pytest.raises(helper.LocalQwenSafetyError) as error:
+        helper.raise_for_local_qwen_returncode(returncode, "gguf", diagnostic)
+    message = str(error.value)
+    assert "SIGABRT" in message
+    assert "不能仅凭退出码判断内存不足" in message
+    assert diagnostic in message
+    assert "请缩小选区" not in message
+    assert error.value.subfix_resource_stop is True
+
+
+def test_abort_with_explicit_memory_failure_keeps_resource_guidance():
+    helper = load_helper_module()
+    with pytest.raises(helper.LocalQwenSafetyError) as error:
+        helper.raise_for_local_qwen_returncode(-signal.SIGABRT, "gguf", "std::bad_alloc")
+    assert "资源压力" in str(error.value)
+    assert "std::bad_alloc" in str(error.value)
+
+
+def test_abnormal_exit_diagnostic_tail_is_bounded():
+    helper = load_helper_module()
+    with pytest.raises(helper.LocalQwenSafetyError) as error:
+        helper.raise_for_local_qwen_returncode(-signal.SIGABRT, "gguf", "x" * 4000 + "END")
+    message = str(error.value)
+    assert message.endswith("END")
+    assert "x" * 2001 not in message
+
+
 @pytest.mark.parametrize(
     "message", ("MPS backend out of memory", "can't allocate memory", "std::bad_alloc")
 )
