@@ -151,10 +151,14 @@ def is_local_qwen_resource_error(exc: BaseException | str) -> bool:
 def raise_for_local_qwen_returncode(returncode: int, stage: str, log_text: str) -> None:
     if returncode == 0:
         return
-    if returncode < 0 or returncode in {134, 137} or is_local_qwen_resource_error(log_text):
+    loader_failure = "dyld" in log_text.lower() and "library not loaded:" in log_text.lower()
+    if loader_failure or returncode < 0 or returncode in {134, 137} or is_local_qwen_resource_error(log_text):
         reason = "因信号、OOM 或资源压力异常终止"
         advice = "请缩小选区后重试或改用云端识别"
-        if returncode in {-signal.SIGABRT, 134} and not is_local_qwen_resource_error(log_text):
+        if loader_failure:
+            reason = "无法加载运行库（dyld）"
+            advice = "请安装最新版完整安装包以修复本地运行库，再重新启动插件"
+        elif returncode in {-signal.SIGABRT, 134} and not is_local_qwen_resource_error(log_text):
             reason = "异常终止（SIGABRT，程序主动中止；不能仅凭退出码判断内存不足）"
             advice = "请提供底层日志以定位崩溃原因"
         detail = log_text.strip()[-2000:]
@@ -7057,6 +7061,14 @@ def resolve_qwen3_cpp_paths() -> tuple[Path, Path]:
     return bin_path, model_path
 
 
+def qwen3_cpp_runtime_env(bin_path: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        # Older installations retain build-machine RPATHs; load their bundled libraries locally.
+        env["DYLD_LIBRARY_PATH"] = str(bin_path.resolve().parent)
+    return env
+
+
 def qwen3_cpp_force_align_items(
     audio_path: Path,
     text: str,
@@ -7092,6 +7104,7 @@ def qwen3_cpp_force_align_items(
             "gguf",
             timeout_seconds=LOCAL_QWEN_GGUF_TIMEOUT_SECONDS,
             cwd=work_dir,
+            env=qwen3_cpp_runtime_env(bin_path),
         )
     except LocalQwenSafetyError:
         output_path.unlink(missing_ok=True)
