@@ -516,19 +516,39 @@ local function write_generate_preferences(data)
     data = type(data) == "table" and data or {}
     local last_engine_backend = trim_text(tostring(data.last_engine_backend or ""))
     local doubao_backend = normalize_doubao_backend(data.doubao_backend)
+    local selected_audio_tracks = {}
+    for _, track_index in ipairs(type(data.selected_audio_tracks) == "table" and data.selected_audio_tracks or {}) do
+        if type(track_index) == "number" and track_index > 0 and track_index % 1 == 0 then
+            selected_audio_tracks[#selected_audio_tracks + 1] = tostring(track_index)
+        end
+    end
+    local audio_track_count = tonumber(data.audio_track_count)
+    if not audio_track_count or audio_track_count < 1 or audio_track_count % 1 ~= 0 then
+        audio_track_count = nil
+    end
     local content = string.format(
-        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s"\n}\n',
+        '{\n  "last_engine_backend": "%s",\n  "doubao_backend": "%s",\n  "max_chars": %d,\n  "hotwords_enabled": %s,\n  "audio_track_count": %s,\n  "selected_audio_tracks": [%s]\n}\n',
         json_escape(last_engine_backend),
-        json_escape(doubao_backend)
+        json_escape(doubao_backend),
+        tonumber(data.max_chars) == 10 and 10 or 25,
+        type(data.hotwords_enabled) == "boolean" and tostring(data.hotwords_enabled) or "null",
+        audio_track_count and tostring(audio_track_count) or "null",
+        table.concat(selected_audio_tracks, ",")
     )
     return write_text_file(generate_prefs_file_path(), content)
 end
 
--- 记住本次选择的识别模型 backend，同时固化旧偏好中的豆包版本。
-local function save_last_engine_backend(backend)
+-- 生成时一并保存长度/热词/轨道选择；仅切换模型时保留已有选择。
+local function save_last_engine_backend(backend, max_chars, hotwords_enabled, audio_track_count, selected_audio_tracks)
     local data = read_generate_preferences()
     data.doubao_backend = read_doubao_backend_preference()
     data.last_engine_backend = backend
+    if max_chars ~= nil then data.max_chars = max_chars end
+    if type(hotwords_enabled) == "boolean" then data.hotwords_enabled = hotwords_enabled end
+    if audio_track_count ~= nil and type(selected_audio_tracks) == "table" then
+        data.audio_track_count = audio_track_count
+        data.selected_audio_tracks = selected_audio_tracks
+    end
     return write_generate_preferences(data)
 end
 
@@ -1073,17 +1093,20 @@ local function read_generation_scope(timeline, fps)
     return nil, (scope_err or "请先用 I/O 设置 In/Out 选区") .. "；灰色时间线选择或鼠标选中片段 Resolve 脚本 API 读不到"
 end
 
-local function get_audio_item_source_offset_frames(item)
+local function get_audio_item_source_offset_frames(item, timeline_fps)
     local ok_source_start, source_start_frames = pcall(function() return item:GetSourceStartFrame() end)
     local offset = ok_source_start and tonumber(source_start_frames) or nil
-    if offset and offset >= 0 then return offset end
+    local ok_source_fps, source_fps = pcall(function() return item:GetMediaPoolItem():GetClipProperty("FPS") end)
+    source_fps = ok_source_fps and tonumber(source_fps) or nil
+    -- Source start uses media frames; GetLeftOffset uses timeline frames.
+    if offset and offset >= 0 and source_fps and source_fps > 0 then return offset, source_fps end
     local ok_left_offset, left_offset_frames = pcall(function() return item:GetLeftOffset(false) end)
     if not ok_left_offset then
         ok_left_offset, left_offset_frames = pcall(function() return item:GetLeftOffset() end)
     end
     offset = ok_left_offset and tonumber(left_offset_frames) or 0
-    if not offset or offset < 0 then return 0 end
-    return offset
+    if not offset or offset < 0 then offset = 0 end
+    return offset, timeline_fps
 end
 
 local function get_audio_item_file_path(item)
@@ -1286,12 +1309,12 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
                 if overlap_frames > 0 then
                     local file_path = get_audio_item_file_path(item)
                     if file_path then
-                        local source_offset_frames = get_audio_item_source_offset_frames(item)
+                        local source_offset_frames, source_offset_fps = get_audio_item_source_offset_frames(item, effective_fps)
                         local ok_media, media_item = pcall(function() return item:GetMediaPoolItem() end)
                         media_item = ok_media and media_item or nil
-                        local mapped_audio = parse_source_audio_channel_mapping(item, media_item, effective_fps, source_offset_frames, file_path)
+                        local mapped_audio = parse_source_audio_channel_mapping(item, media_item, source_offset_fps, source_offset_frames, file_path)
                         file_path = mapped_audio.file_path or file_path
-                        local item_source_start_seconds = tonumber(mapped_audio.source_start_seconds) or (source_offset_frames / effective_fps)
+                        local item_source_start_seconds = tonumber(mapped_audio.source_start_seconds) or (source_offset_frames / source_offset_fps)
                         local source_start_seconds = item_source_start_seconds + ((overlap_start - item_start) / effective_fps)
                         local source_end_seconds = source_start_seconds + (overlap_frames / effective_fps)
                         local candidate = {
@@ -1948,7 +1971,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_LENGTH_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
     local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
-    local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[1].max_chars
+    local generate_preferences = read_generate_preferences()
+    for index, option in ipairs(SUBTITLE_LENGTH_OPTIONS) do
+        if option.max_chars == tonumber(generate_preferences.max_chars) then
+            selected_length_index = index
+            break
+        end
+    end
+    local selected_max_chars = SUBTITLE_LENGTH_OPTIONS[selected_length_index].max_chars
     -- 识别模型：主面板只保留 Qwen（本地）与豆包（云端）两个入口；豆包具体版本
     -- 在配置窗口内选择，并通过 selected_doubao_backend 映射到实际 helper backend。
     -- 仅决定把哪个 --backend 传给 ASR helper，不改断句/回声/对齐算法本体。默认
@@ -1977,6 +2007,9 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local selected_backend = SUBTITLE_ENGINE_OPTIONS[selected_engine_index].backend
     local hotword_entries = load_generate_hotword_entries()
     local hotwords_enabled = #hotword_entries > 0
+    if type(generate_preferences.hotwords_enabled) == "boolean" then
+        hotwords_enabled = hotwords_enabled and generate_preferences.hotwords_enabled
+    end
     local selected_hotwords_json = nil
     local dialog_cancelled = false
     local qwen_install_requested = false
@@ -2572,11 +2605,26 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local last_qwen_click_time = nil
     local doubao_reminder_shown = false
 
+    -- 轨道数量一致时按轨道编号恢复，避免将勾选套到不同的列表行。
+    local restored_tracks, has_restored_track = {}, false
+    if generate_preferences.audio_track_count == #audio_sources
+        and type(generate_preferences.selected_audio_tracks) == "table" then
+        for _, track_index in ipairs(generate_preferences.selected_audio_tracks) do
+            if type(track_index) == "number" and track_index > 0 and track_index % 1 == 0 then
+                restored_tracks[track_index] = true
+            end
+        end
+        for _, source in ipairs(audio_sources) do
+            if restored_tracks[source.track_index] then has_restored_track = true end
+        end
+    end
+
     local item_map = {}
     for index, source in ipairs(audio_sources) do
         local ok_item, item = pcall(function() return track_tree:NewItem() end)
         if ok_item and item then
             local checked = index == 1
+            if has_restored_track then checked = restored_tracks[source.track_index] == true end
             track_rows[index] = {source = source, checked = checked, item = item}
             set_tree_item_text(item, 0, checked and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK)
             set_tree_item_text(item, 1, format_audio_source_label(source, fps))
@@ -2670,8 +2718,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
                 return
             end
         end
-        -- 记住本次识别模型，下次对话框默认选它。
-        save_last_engine_backend(selected_backend)
+        -- 记住本次生成选项，下次打开对话框时恢复。
+        local selected_audio_tracks = {}
+        for _, source in ipairs(selected_audio_sources) do
+            selected_audio_tracks[#selected_audio_tracks + 1] = source.track_index
+        end
+        save_last_engine_backend(selected_backend, selected_max_chars, hotwords_enabled, #audio_sources, selected_audio_tracks)
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end
