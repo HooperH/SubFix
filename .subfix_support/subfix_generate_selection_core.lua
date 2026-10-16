@@ -375,8 +375,14 @@ local function resolve_asr_paths()
         python = helper_dir .. "/.subfix_asr_env/bin/python",
         runtime_python = helper_dir .. "/runtime/python/bin/python3",
         diagnostic = user_support_dir .. "/last_generate_diagnostic.json",
+        generation_history = user_support_dir .. "/generation_history",
+        plugin_source = root .. "/SubFix.lua",
+        generation_core_source = script_dir() .. "/subfix_generate_selection_core.lua",
         hotwords = user_support_dir .. "/hotwords.json"
     }
+    if not file_exists(paths.plugin_source) and file_exists(root .. "/SubFix/SubFix.lua") then
+        paths.plugin_source = root .. "/SubFix/SubFix.lua"
+    end
     if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
         paths.helper = root .. "/subfix_asr_transcribe.py"
         paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
@@ -1802,7 +1808,7 @@ local function parse_generated_json_subtitle_rows(json_path)
         end
     end
     if #rows == 0 then return nil, "生成 JSON 没有可写回字幕" end
-    return rows
+    return rows, nil, payload.generation_trace
 end
 
 local function subtract_existing_ranges(row, accepted_ranges)
@@ -3201,6 +3207,8 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
         "--language", shell_quote(DEFAULT_ASR_LANGUAGE),
         "--subtitle-mode", shell_quote(subtitle_mode),
         "--diagnostic-output", shell_quote(paths.diagnostic),
+        "--plugin-source", shell_quote(paths.plugin_source),
+        "--generation-core-source", shell_quote(paths.generation_core_source),
         "--progress-json", shell_quote(progress_path)
     }
     for _, value in ipairs(helper_args) do command_args[#command_args + 1] = value end
@@ -4017,7 +4025,7 @@ local function generate_selection_subtitles()
     cancel_postprocess_if_requested(update_generate_postprocess_stage(
         progress_state, "解析结果", "正在解析生成结果", 96
     ))
-    local raw_generated_rows, raw_generated_err = parse_generated_json_subtitle_rows(json_path)
+    local raw_generated_rows, raw_generated_err, generation_trace = parse_generated_json_subtitle_rows(json_path)
     if not raw_generated_rows then
         finish_generate_progress_window(progress_state, "失败", raw_generated_err)
         error(raw_generated_err)
@@ -4088,7 +4096,17 @@ local function generate_selection_subtitles()
         finish_generate_progress_window(progress_state, "失败", import_err)
         error(import_err)
     end
-    finish_generate_progress_window(progress_state, "完成", "选区字幕已生成并写回时间线")
+    local completion_message = "选区字幕已生成并写回时间线"
+    if type(generation_trace) == "table" and generation_trace.run_id then
+        local run_id = tostring(generation_trace.run_id)
+        completion_message = completion_message .. "｜版本记录 " .. run_id:sub(1, 8)
+        if generation_trace.history_status == "saved" then
+            print("[SubFix Generate] 版本记录 " .. run_id .. ": " .. resolve_asr_paths().generation_history .. "/" .. run_id .. ".json")
+        else
+            print("[SubFix Generate] 版本历史未保存 (" .. tostring(generation_trace.history_error_type or "unknown") .. ")，本次记录仍在生成 JSON 中: " .. json_path)
+        end
+    end
+    finish_generate_progress_window(progress_state, "完成", completion_message)
     pcall(function() progress_state.window:Hide() end)
     print("[SubFix Generate] 生成选区字幕完成，诊断: " .. audio_diag_path)
     return true

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from test_generate_progress_lifecycle import run_lua
+from test_normalize_length_options import run_lua
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / "SubFix.lua").read_text(encoding="utf-8")

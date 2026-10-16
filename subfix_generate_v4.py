@@ -2268,6 +2268,93 @@ def _segmentation_length_parameters(
     return minimum, median, preferred_maximum, maximum
 
 
+def _editorial_pause_boundary(units: list[dict[str, Any]], fps: float) -> int | None:
+    """Give long clauses a readable break before text-model scoring."""
+    lengths = [len(normalize_text(unit.get("text"))) for unit in units]
+    total = sum(lengths)
+    if total < 18 or len(units) < 2:
+        return None
+    gaps = [
+        max(0, int(right.get("start_frame") or 0) - int(left.get("end_frame") or 0))
+        for left, right in zip(units, units[1:])
+    ]
+    # Ignore uniform alignment spacing; a short pause needs local prominence.
+    minimum_gap = max(math.ceil(0.08 * fps), statistics.median(gaps) + math.ceil(0.06 * fps))
+    word_bounds = _unit_word_boundary_positions(units)
+    candidates: list[tuple[float, int, int, int]] = []
+    offset = 0
+    for position, gap in enumerate(gaps, start=1):
+        offset += lengths[position - 1]
+        if offset < 4 or total - offset < 4 or offset not in word_bounds:
+            continue
+        punctuation = float(units[position - 1].get("asr_punctuation_strength") or 0.0)
+        if punctuation <= 0.0 and gap < minimum_gap:
+            continue
+        # Micro-pauses help long rows; do not recursively fragment a readable
+        # remainder after its stronger clause boundary has already been used.
+        if punctuation <= 0.0 and total <= 20 and gap < math.ceil(0.25 * fps):
+            continue
+        candidates.append((punctuation, gap, -abs(total - 2 * offset), position))
+    return max(candidates)[-1] if candidates else None
+
+
+def _leading_temporal_clause_boundary(units: list[dict[str, Any]]) -> int | None:
+    """Recognize a bounded temporal introduction followed by a new subject."""
+    text = "".join(normalize_text(unit.get("text")) for unit in units)
+    if len(text) < 18:
+        return None
+    match = re.match(
+        r"^(?:在|到了?|直到|从)[\u4e00-\u9fff0-9]{0,12}?"
+        r"(?:第[一二三四五六七八九十百两0-9]+(?:天|周|个月|年)|[之以][前后]|的时候)",
+        text,
+    )
+    if match is None or match.end() < 4:
+        return None
+    remainder = text[match.end():]
+    # Do not detach a time expression from its modifiers or a date range.
+    if len(remainder) < 6 or remainder.startswith((
+        "的", "里", "内", "外", "前", "后", "到", "至", "早上", "上午",
+        "中午", "下午", "晚上", "凌晨", "结束", "开始", "期间",
+    )):
+        return None
+    if not re.match(r"^[\u4e00-\u9fff]{2,6}?(?:就|便|已经|开始|正在)", remainder):
+        return None
+    offset = 0
+    for position, unit in enumerate(units, start=1):
+        offset += len(normalize_text(unit.get("text")))
+        if offset == match.end():
+            return position
+        if offset > match.end():
+            return None
+    return None
+
+
+def _copular_clause_boundary(units: list[dict[str, Any]]) -> int | None:
+    """Keep a long subject separate from its complete explanatory predicate."""
+    text = "".join(normalize_text(unit.get("text")) for unit in units)
+    if len(text) < 18 or text.startswith((
+        "如果", "只要", "只有", "即使", "就算", "哪怕", "无论", "不管",
+    )):
+        return None
+    offsets: dict[int, int] = {}
+    offset = 0
+    for position, unit in enumerate(units, start=1):
+        offset += len(normalize_text(unit.get("text")))
+        offsets[offset] = position
+    for match in re.finditer(r"也?(?:就是|正是|才是|便是)", text):
+        subject = text[:match.start()]
+        predicate = text[match.start():]
+        # Avoid short fragments, unfinished modifiers and negated/embedded
+        # copulas. An indivisible aligned unit never gets a fabricated time.
+        if (len(subject) < 6 or len(predicate) < 6
+                or subject.endswith(("的", "地", "得", "不", "也", "把", "被", "让", "给", "跟", "和", "与", "或"))):
+            continue
+        position = offsets.get(match.start())
+        if position is not None:
+            return position
+    return None
+
+
 def segment_canonical_units(
     units: list[dict[str, Any]],
     mode: str,
@@ -2295,6 +2382,16 @@ def segment_canonical_units(
             or float(ordered[position - 1].get("asr_punctuation_strength") or 0.0) >= 1.0
         )
     ]
+    # Editorial clause boundaries must survive the below-cap fast path and
+    # short-row penalties, using the same real unit times as acoustic breaks.
+    first_region = ordered[:hard_positions[0]] if hard_positions else ordered
+    editorial_boundary = _leading_temporal_clause_boundary(first_region)
+    if editorial_boundary is None:
+        editorial_boundary = _copular_clause_boundary(first_region)
+    if editorial_boundary is None:
+        editorial_boundary = _editorial_pause_boundary(first_region, fps)
+    if editorial_boundary is not None:
+        hard_positions = sorted({*hard_positions, editorial_boundary})
     if hard_positions:
         rows: list[dict[str, Any]] = []
         start = 0
@@ -2350,10 +2447,21 @@ def segment_canonical_units(
         max_chars=max_chars,
     )
     count = len(ordered)
-    if count <= hard_max and not any(
+    # After separating the subject, a compact explanation should not be
+    # fragmented again by alignment gaps. Hard breaks were handled above;
+    # punctuation and a new clause still permit further segmentation.
+    compact_predicate = (
+        len(expected_text) <= min(16, hard_max)
+        and re.match(r"^也?(?:就是|正是|才是|便是)", expected_text) is not None
+        and not any(float(unit.get("asr_punctuation_strength") or 0.0) > 0.0
+                    or _is_break_punctuation(str(unit.get("text") or ""))
+                    for unit in ordered[:-1])
+        and not any(starter in expected_text[2:] for starter in CLAUSE_STARTERS)
+    )
+    if count <= hard_max and (compact_predicate or not any(
         _has_non_model_boundary_evidence(ordered, position, fps, mode_profile)
         for position in range(1, count)
-    ):
+    )):
         row = {
             "index": 1,
             "text": "".join(str(unit.get("text") or "") for unit in ordered),
@@ -2392,9 +2500,11 @@ def segment_canonical_units(
                 end_strength = boundary_score if end < count else 3.0
                 if len(normalized) < 3 or min(start_strength, end_strength) < 3.0:
                     continue
-                if start > 0 and not _has_non_model_boundary_evidence(ordered, start, fps, mode_profile):
+                # A model prediction alone cannot justify a short fragment;
+                # require independent evidence at its internal boundaries.
+                if start > 0 and not _has_non_model_boundary_evidence(ordered, start, fps):
                     continue
-                if end < count and not _has_non_model_boundary_evidence(ordered, end, fps, mode_profile):
+                if end < count and not _has_non_model_boundary_evidence(ordered, end, fps):
                     continue
                 strong_short_clause = True
             length_score = -abs(length - preferred_center) * 0.25

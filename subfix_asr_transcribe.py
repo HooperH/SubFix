@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import hashlib
 import importlib.util
 import json
 import math
@@ -28,6 +29,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wave
+from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -783,12 +785,160 @@ def write_payload(path: Path, payload: dict[str, Any]) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def generation_file_fingerprint(path: str | Path | None) -> dict[str, Any]:
+    if not path:
+        return {"status": "not_configured"}
+    try:
+        content = Path(path).expanduser().read_bytes()
+        return {"status": "available", "sha256": hashlib.sha256(content).hexdigest()}
+    except (OSError, ValueError) as exc:
+        return {"status": "unavailable", "error_type": type(exc).__name__}
+
+
+def generation_profile_path(path: str | Path | None, engine: str) -> Path:
+    raw_path = path or os.getenv(SEGMENTATION_PROFILE_ENV)
+    names = {"v3": "segmentation_profile.json", "v4": "segmentation_profile_v3.json", "v5": "segmentation_profile_v4.json"}
+    return Path(raw_path).expanduser() if raw_path else Path(__file__).resolve().with_name(names[engine])
+
+
+def load_generation_profile(args: argparse.Namespace, engine: str) -> tuple[dict[str, Any] | None, str]:
+    path = getattr(args, "segmentation_profile", None)
+    if engine == "v5":
+        profile, status = load_segmentation_profile_v5(path)
+    else:
+        loader = load_segmentation_profile if engine == "v3" else load_segmentation_profile_v4
+        profile = loader(path)
+        status = "loaded" if profile is not None else "not_loaded"
+    trace = getattr(args, "generation_trace", None)
+    if isinstance(trace, dict):
+        actual_path = (profile or {}).get("_path") or generation_profile_path(path, engine)
+        fingerprint = generation_file_fingerprint(actual_path)
+        trace.setdefault("profile_loads", []).append({
+            "engine": engine,
+            "source": "argument" if path else "environment" if os.getenv(SEGMENTATION_PROFILE_ENV) else "default",
+            "load_status": status,
+            "schema_version": str((profile or {}).get("schema_version") or ""),
+            "fingerprint": fingerprint,
+        })
+        trace["profile_fingerprint"] = fingerprint
+        trace["profile_load_status"] = status
+    return profile, status
+
+
+def start_generation_trace(args: argparse.Namespace) -> dict[str, Any]:
+    helper_root = Path(__file__).resolve().parent
+    plugin_source = getattr(args, "plugin_source", None)
+    plugin_version = "unknown"
+    if plugin_source:
+        try:
+            match = re.search(r'\bSUBFIX_VERSION\s*=\s*[\"\']([0-9A-Za-z.+_-]+)[\"\']', Path(plugin_source).read_text(encoding="utf-8"))
+            if match:
+                plugin_version = match.group(1)
+        except (OSError, UnicodeError, ValueError):
+            pass
+    sources = {
+        "helper": Path(__file__),
+        "plugin": plugin_source,
+        "generation_core": getattr(args, "generation_core_source", None),
+        "generate_v4": helper_root / "subfix_generate_v4.py",
+        "generate_v5": helper_root / "subfix_generate_v5.py",
+        "textnorm": helper_root / "subfix_generate_textnorm.py",
+    }
+    return {
+        "schema_version": "subfix_generation_trace_v1",
+        "run_id": str(uuid.uuid4()),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "helper_version": HELPER_VERSION,
+        "plugin_version": plugin_version,
+        "code_fingerprints": {key: generation_file_fingerprint(path) for key, path in sources.items()},
+        "profile_fingerprint": generation_file_fingerprint(generation_profile_path(getattr(args, "segmentation_profile", None), args.generate_engine)),
+        "hotwords_fingerprint": generation_file_fingerprint(getattr(args, "hotwords_json", None)),
+        "parameters": {
+            "requested_backend": args.backend,
+            "requested_model": Path(str(args.model)).name,
+            "requested_generate_engine": args.generate_engine,
+            "mode": args.mode,
+            "subtitle_mode": args.subtitle_mode,
+            "language": args.language,
+            "fps": args.fps,
+            "max_chars": getattr(args, "max_chars", None),
+            "v5_writeback_mode": v5_writeback_mode(),
+            "batch_max_seconds": generate_subtitles_batch_max_seconds(),
+        },
+        "asr_sources": [],
+    }
+
+
+def record_generation_asr(args: argparse.Namespace, payload: dict[str, Any], role: str = "primary") -> None:
+    trace = getattr(args, "generation_trace", None)
+    if not isinstance(trace, dict):
+        return
+    backend = str(payload.get("backend") or ("fixture" if getattr(args, "fixture_json", None) else "unknown"))
+    source: dict[str, Any] = {"backend": backend, "role": role}
+    if backend in {"doubao_asr", "doubao_asr_v2"}:
+        # The adapters receive a Whisper-compatible CLI model argument, but the
+        # cloud request uses bigmodel; the service does not expose its revision.
+        source.update(model="bigmodel", model_revision=None, model_identity_source="service_request")
+        resource_id = str((payload.get("diagnostic") or {}).get("resource_id") or "")
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,100}", resource_id):
+            source["resource_id"] = resource_id
+    else:
+        source.update(model=Path(str(payload.get("model") or "unknown")).name, model_identity_source="backend_result")
+    if source not in trace["asr_sources"]:
+        trace["asr_sources"].append(source)
+
+
+def finish_generation_trace(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    trace = getattr(args, "generation_trace", None)
+    if not isinstance(trace, dict):
+        return
+    diagnostic = payload.get("diagnostic") or {}
+    rows = payload.get("subtitle_rows") or []
+    result_rows = [{key: row.get(key) for key in ("start_frame", "end_frame", "text")} for row in rows]
+    trace.update(
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        ok=payload.get("ok") is True,
+        generate_engine=diagnostic.get("generate_engine") or args.generate_engine,
+        profile_load_status=trace.get("profile_load_status", diagnostic.get("profile_load_status", "not_reported")),
+        subtitle_count=len(rows),
+        subtitle_result_sha256=hashlib.sha256(json.dumps(result_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+    )
+    if rows:
+        trace["result_frame_range"] = {
+            "start_frame": min(int(row.get("start_frame") or 0) for row in rows),
+            "end_frame": max(int(row.get("end_frame") or 0) for row in rows),
+        }
+    history_root = Path(args.diagnostic_output or args.output).expanduser().parent / "generation_history"
+    trace["history_status"] = "saved"
+    try:
+        write_payload(history_root / (trace["run_id"] + ".json"), dict(trace))
+    except (OSError, ValueError, TypeError) as exc:
+        trace["history_status"] = "failed"
+        trace["history_error_type"] = type(exc).__name__
+    payload["generation_trace"] = trace
+
+
+def write_generation_diagnostic(args: argparse.Namespace, payload: dict[str, Any]) -> None:
+    if not args.diagnostic_output:
+        return
+    try:
+        write_payload(Path(args.diagnostic_output).expanduser(), sanitize_generate_diagnostic_payload(payload))
+    except OSError as exc:
+        trace = payload.get("generation_trace")
+        if isinstance(trace, dict):
+            trace["diagnostic_status"] = "failed"
+            trace["diagnostic_error_type"] = type(exc).__name__
+        print(f"[subfix] 生成诊断未保存: {type(exc).__name__}", file=sys.stderr)
+
+
 def build_generate_writeback_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    trace = {"generation_trace": payload["generation_trace"]} if "generation_trace" in payload else {}
     if payload.get("ok") is False:
-        return {"ok": False, "error": str(payload.get("error") or "ASR helper 执行失败")}
+        return {"ok": False, "error": str(payload.get("error") or "ASR helper 执行失败"), **trace}
     return {
         "ok": True,
         "subtitle_rows": list(payload.get("subtitle_rows") or []),
+        **trace,
     }
 
 
@@ -1003,6 +1153,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "diagnostic": diagnostic,
         "batches": batch_summaries,
         "subtitle_rows": subtitle_rows,
+        **({"generation_trace": payload["generation_trace"]} if "generation_trace" in payload else {}),
     }
 
 
@@ -1821,8 +1972,7 @@ def segmentation_profile_for_mode(
 
 
 def load_segmentation_profile(path: str | Path | None = None) -> dict[str, Any] | None:
-    raw_path = path or os.getenv(SEGMENTATION_PROFILE_ENV)
-    profile_path = Path(raw_path).expanduser() if raw_path else Path(__file__).resolve().with_name("segmentation_profile.json")
+    profile_path = generation_profile_path(path, "v3")
     if not profile_path.is_file():
         return None
     try:
@@ -1838,8 +1988,7 @@ def load_segmentation_profile(path: str | Path | None = None) -> dict[str, Any] 
 
 
 def load_segmentation_profile_v4(path: str | Path | None = None) -> dict[str, Any] | None:
-    raw_path = path or os.getenv(SEGMENTATION_PROFILE_ENV)
-    profile_path = Path(raw_path).expanduser() if raw_path else Path(__file__).resolve().with_name("segmentation_profile_v3.json")
+    profile_path = generation_profile_path(path, "v4")
     if not profile_path.is_file():
         return None
     try:
@@ -1853,8 +2002,7 @@ def load_segmentation_profile_v4(path: str | Path | None = None) -> dict[str, An
 
 
 def load_segmentation_profile_v5(path: str | Path | None = None) -> tuple[dict[str, Any] | None, str]:
-    raw_path = path or os.getenv(SEGMENTATION_PROFILE_ENV)
-    profile_path = Path(raw_path).expanduser() if raw_path else Path(__file__).resolve().with_name("segmentation_profile_v4.json")
+    profile_path = generation_profile_path(path, "v5")
     if not profile_path.is_file():
         return None, "missing"
     try:
@@ -5382,7 +5530,7 @@ def run_generate_subtitles_batch_plan_v3(
     hotword_context = build_hotword_context(hotword_entries)
     args.hotword_context = hotword_context
     ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
-    segmentation_profile = load_segmentation_profile(getattr(args, "segmentation_profile", None))
+    segmentation_profile, _profile_status = load_generation_profile(args, "v3")
     active_segmentation_profile = segmentation_profile_for_mode(segmentation_profile, subtitle_mode)
     total_batches = len(batches)
     progress_total = generate_batch_progress_total(total_batches)
@@ -5590,6 +5738,7 @@ def run_generate_subtitles_batch_plan_v3(
                         else transcribe_with_backend(item["cut_path"], args.model, args.language, args.backend)
                     )
 
+                record_generation_asr(args, raw_payload)
                 segments = normalize_segments(raw_payload)
                 live_fallback = False
                 rejected_word_count = 0
@@ -5932,9 +6081,7 @@ def run_generate_subtitles_batch_plan_v4(
     active_mode_profile: dict[str, Any] | None = None
     v5_writeback = v5_writeback_mode() if v5_mode else "shadow"
     if v5_mode:
-        profile, profile_status = load_segmentation_profile_v5(
-            getattr(args, "segmentation_profile", None)
-        )
+        profile, profile_status = load_generation_profile(args, "v5")
         diagnostic["profile_load_status"] = profile_status
         if profile_status != "loaded":
             raise RuntimeError(f"v5 分句配置不可用（{profile_status}），请重新安装最新版 SubFix")
@@ -6018,6 +6165,8 @@ def run_generate_subtitles_batch_plan_v4(
                 args,
             )
             raw_payloads.extend(chunk_payloads)
+            for source_payload in chunk_payloads:
+                record_generation_asr(args, source_payload)
             diagnostic["asr_backend_used"] = chunk_asr_diagnostic.get(
                 "asr_backend_used", diagnostic["asr_backend_used"]
             )
@@ -6091,6 +6240,8 @@ def run_generate_subtitles_batch_plan_v4(
                 recovery_diagnostic.get("asr_subwindow_retry_count") or 0
             )
             recovered_payloads.append(recovered_payload)
+            if recovery not in {"not_needed", "accepted_silence"}:
+                record_generation_asr(args, recovered_payload, "recovery")
             recovery_diagnostics.append(recovery_diagnostic)
         raw_payloads = recovered_payloads
         retry_regions: list[dict[str, Any]] = []
@@ -6127,6 +6278,7 @@ def run_generate_subtitles_batch_plan_v4(
                     float(track["fps"]),
                 )
                 retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
+                record_generation_asr(args, retry_payload, "retry_candidate")
                 diagnostic["local_retry_elapsed_seconds"] += time.monotonic() - local_retry_started_at
                 write_progress(
                     progress_path,
@@ -6418,6 +6570,7 @@ def run_generate_subtitles_batch_plan_v4(
                 )
                 try:
                     retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
+                    record_generation_asr(args, retry_payload, "retry_candidate")
                     retry_units, retry_align_diagnostic = generate_v4.require_aligned_units(
                         retry_path,
                         retry_payload,
@@ -6612,7 +6765,7 @@ def run_generate_subtitles_batch_plan_v4(
             progress_total=100,
         )
         if not v5_mode:
-            profile = load_segmentation_profile_v4(getattr(args, "segmentation_profile", None))
+            profile, _profile_status = load_generation_profile(args, "v4")
         diagnostic["stages"]["source_selection"] = [
             {
                 "track_index": int(unit.get("track_index") or 0),
@@ -7603,6 +7756,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fixture-json")
     parser.add_argument("--progress-json")
     parser.add_argument("--diagnostic-output")
+    parser.add_argument("--plugin-source", help="Running SubFix.lua for local version fingerprinting")
+    parser.add_argument("--generation-core-source", help="Running generation module for local fingerprinting")
     parser.add_argument(
         "--max-chars",
         type=int,
@@ -7613,6 +7768,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.mode in {"generate_subtitles", "generate_subtitles_batch"}:
+        args.generation_trace = start_generation_trace(args)
 
     output_path = Path(args.output)
     progress_path = Path(args.progress_json) if args.progress_json else None
@@ -7683,12 +7840,9 @@ def main(argv: list[str] | None = None) -> int:
                     args.fps,
                     srt_base_frame,
                 )
+            finish_generation_trace(args, payload)
+            write_generation_diagnostic(args, payload)
             write_payload(output_path, build_generate_writeback_payload(payload))
-            if args.diagnostic_output:
-                write_payload(
-                    Path(args.diagnostic_output).expanduser(),
-                    sanitize_generate_diagnostic_payload(payload),
-                )
             completion_index, completion_total = generate_helper_completion_progress(
                 payload.get("diagnostic", {})
             )
@@ -7773,7 +7927,7 @@ def main(argv: list[str] | None = None) -> int:
                     segments,
                     args.fps,
                     args.timeline_start_frame,
-                    segmentation_profile=load_segmentation_profile(args.segmentation_profile),
+                    segmentation_profile=load_generation_profile(args, "v3")[0],
                     speech_regions=speech_regions,
                     subtitle_mode=args.subtitle_mode,
                 )
@@ -7938,7 +8092,7 @@ def main(argv: list[str] | None = None) -> int:
                             segments,
                             args.fps,
                             args.timeline_start_frame,
-                            segmentation_profile=load_segmentation_profile(args.segmentation_profile),
+                            segmentation_profile=load_generation_profile(args, "v3")[0],
                             speech_regions=speech_regions,
                             subtitle_mode=args.subtitle_mode,
                         )
@@ -7961,54 +8115,50 @@ def main(argv: list[str] | None = None) -> int:
                 srt_base_frame,
             )
         write_progress(progress_path, "write_output", "正在写入对齐结果")
-        write_payload(
-            output_path,
-            {
-                "ok": True,
-                "model": str(raw_payload.get("model") or args.model),
-                "backend": raw_payload.get("backend") or diagnostic.get("backend"),
-                "audio": audio_used,
-                "segments": segments,
-                "aligned_rows": raw_payload.get("aligned_rows") or [],
-                "subtitle_rows": raw_payload.get("subtitle_rows") or [],
-                "speech_onsets": speech_onsets,
-                "speech_regions": speech_regions,
-                "text": str(raw_payload.get("text") or "").strip(),
-                "windows": raw_payload.get("windows") or [],
-                "diagnostic": diagnostic,
-            },
-        )
+        output_payload = {
+            "ok": True,
+            "model": str(raw_payload.get("model") or args.model),
+            "backend": raw_payload.get("backend") or diagnostic.get("backend"),
+            "audio": audio_used,
+            "segments": segments,
+            "aligned_rows": raw_payload.get("aligned_rows") or [],
+            "subtitle_rows": raw_payload.get("subtitle_rows") or [],
+            "speech_onsets": speech_onsets,
+            "speech_regions": speech_regions,
+            "text": str(raw_payload.get("text") or "").strip(),
+            "windows": raw_payload.get("windows") or [],
+            "diagnostic": diagnostic,
+        }
+        if args.mode == "generate_subtitles":
+            diagnostic["generate_engine"] = "v3"
+            record_generation_asr(args, raw_payload)
+            finish_generation_trace(args, output_payload)
+            write_generation_diagnostic(args, output_payload)
+        write_payload(output_path, output_payload)
         write_progress(progress_path, "done", "对齐 helper 已完成")
         return 0
     except Exception as exc:
         write_progress(progress_path, "failed", str(exc))
-        write_payload(
-            output_path,
-            {
-                "ok": False,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-                "segments": [],
-            },
-        )
+        failure_payload = {"ok": False, "error": str(exc), "error_type": type(exc).__name__, "segments": []}
+        finish_generation_trace(args, failure_payload)
         if args.mode in {"generate_subtitles", "generate_subtitles_batch"} and args.diagnostic_output:
             failure_code = "generate_failed"
             if args.generate_engine in {"v4", "v5"} and isinstance(exc, generate_v4.V4AlignmentError):
                 failure_code = f"{args.generate_engine}_alignment_failed"
-            write_payload(
-                Path(args.diagnostic_output).expanduser(),
-                sanitize_generate_diagnostic_payload(
-                    {
-                        "ok": False,
-                        "diagnostic": {
-                            "subtitle_mode": args.subtitle_mode,
-                            "generate_engine": args.generate_engine,
-                            "failure_code": failure_code,
-                        },
-                        "subtitle_rows": [],
-                    }
-                ),
+            write_generation_diagnostic(
+                args,
+                {
+                    "ok": False,
+                    **({"generation_trace": failure_payload["generation_trace"]} if "generation_trace" in failure_payload else {}),
+                    "diagnostic": {
+                        "subtitle_mode": args.subtitle_mode,
+                        "generate_engine": args.generate_engine,
+                        "failure_code": failure_code,
+                    },
+                    "subtitle_rows": [],
+                },
             )
+        write_payload(output_path, failure_payload)
         print(str(exc), file=sys.stderr)
         return 1
 
