@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.3.6"
+SUBFIX_VERSION = "3.3.7"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -22673,7 +22673,10 @@ function force_quit_subfix()
     end
 
     -- 关闭所有可能存在的弹出/报告窗口
-    close_pre_delivery_review_window()
+    -- 仅打开迷你版时，完整版的复查窗口清理函数尚未初始化。
+    if type(close_pre_delivery_review_window) == "function" then
+        close_pre_delivery_review_window()
+    end
     if pending_report_window then
         pcall(function() pending_report_window:Hide() end)
         pending_report_window = nil
