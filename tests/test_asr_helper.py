@@ -4,9 +4,16 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "subfix_asr_transcribe.py"
+
+
+@pytest.fixture(autouse=True)
+def isolate_doubao_checkpoint_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("SUBFIX_DOUBAO_CACHE_DIR", str(tmp_path / "doubao-cache"))
 
 
 def load_helper_module():

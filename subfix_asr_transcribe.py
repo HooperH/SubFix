@@ -650,6 +650,7 @@ DOUBAO_ASR_V2_NON_ERROR_STATUS_CODES = frozenset(
     {DOUBAO_ASR_SUCCESS_STATUS_CODE, "20000001", "20000002", DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE}
 )
 DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS = 60
+DOUBAO_ASR_V2_MAX_TRANSIENT_ERRORS = 5
 DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS = 0.5
 DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS = 2.0
 QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
@@ -4921,6 +4922,72 @@ def _doubao_asr_v2_response_fields(response_payload: dict[str, Any], status_code
     return status_code, body
 
 
+class _DoubaoTransientError(RuntimeError):
+    """The response is inconclusive; query the same task instead of resubmitting."""
+
+def _doubao_checkpoint_path(
+    audio_bytes: bytes, body: dict[str, Any], api_key: str, model: str, language: str | None,
+) -> Path:
+    cache_root = os.getenv("SUBFIX_DOUBAO_CACHE_DIR")
+    default_root = Path.home() / ("Library/Caches" if sys.platform == "darwin" else ".cache")
+    root = Path(cache_root).expanduser() if cache_root else default_root / "SubFix" / "doubao_asr_v2"
+    identity = {
+        "schema": 1,
+        "audio_sha256": hashlib.sha256(audio_bytes).hexdigest(),
+        "audio_options": {key: value for key, value in body["audio"].items() if key != "data"},
+        "request": body["request"],
+        "resource": DOUBAO_ASR_V2_RESOURCE_ID,
+        "endpoint": DOUBAO_ASR_V2_SUBMIT_ENDPOINT,
+        "query_endpoint": DOUBAO_ASR_V2_QUERY_ENDPOINT,
+        "model": model,
+        "language": language,
+        "credential_sha256": hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+    return root / f"{digest}.json"
+
+def _read_doubao_checkpoint(path: Path) -> dict[str, Any]:
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        raise RuntimeError(f"豆包断点缓存格式损坏：{path}；请保留该文件用于排查，移出缓存目录后重试") from exc
+    except OSError as exc:
+        raise RuntimeError(f"无法读取豆包断点缓存：{path}；请检查文件和目录权限后重试") from exc
+    if isinstance(checkpoint, dict) and checkpoint.get("state") in ("pending", "rejected", "complete"):
+        if checkpoint["state"] == "rejected":
+            return {}
+        if checkpoint["state"] == "pending" and isinstance(checkpoint.get("task_id"), str) and checkpoint["task_id"]:
+            return checkpoint
+        payload = checkpoint.get("payload")
+        if (
+            checkpoint["state"] == "complete" and isinstance(payload, dict)
+            and payload.get("backend") == "doubao_asr_v2"
+            and isinstance(payload.get("segments"), list) and isinstance(payload.get("words"), list)
+            and isinstance(payload.get("text"), str) and isinstance(payload.get("diagnostic"), dict)
+        ):
+            return checkpoint
+    raise RuntimeError(f"豆包断点缓存格式损坏：{path}；请保留该文件用于排查，移出缓存目录后重试")
+
+def _write_doubao_checkpoint(path: Path, checkpoint: dict[str, Any]) -> None:
+    temporary_path = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # NamedTemporaryFile is private (0600); replace keeps readers from seeing partial JSON.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(checkpoint, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except OSError as exc:
+        raise RuntimeError(f"无法保存豆包断点缓存：{path}；请检查磁盘空间和目录权限后重试") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _doubao_asr_v2_post(
     endpoint: str,
     headers: dict[str, str],
@@ -4951,16 +5018,21 @@ def _doubao_asr_v2_post(
                 f"录音文件识别模型 2.0（{DOUBAO_ASR_V2_RESOURCE_ID}）。"
                 f"请在同一项目开通服务，并重新复制该项目的 API Key{request_hint}"
             ) from exc
-        raise RuntimeError(f"豆包标准版{stage} HTTP {exc.code}: {exc.reason}; {error_body[:500]}") from exc
+        error_type = _DoubaoTransientError if exc.code in {408, 429, 500, 502, 503, 504} else RuntimeError
+        # Gateway HTML and echoed request bodies do not belong in the UI or checkpoint.
+        raise error_type(f"豆包标准版{stage} HTTP {exc.code}: {exc.reason}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(f"豆包标准版{stage}失败（网络/超时）: {exc}") from exc
+        raise _DoubaoTransientError(f"豆包标准版{stage}失败（网络/超时）") from exc
     try:
         response_payload = json.loads(response_text) if response_text else {}
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"豆包标准版{stage}响应不是合法 JSON: {exc}") from exc
+        raise _DoubaoTransientError(f"豆包标准版{stage}响应不是合法 JSON") from exc
     if not isinstance(response_payload, dict):
-        raise RuntimeError(f"豆包标准版{stage}响应 JSON 必须是对象")
-    return (*_doubao_asr_v2_response_fields(response_payload, status_code), log_id)
+        raise _DoubaoTransientError(f"豆包标准版{stage}响应 JSON 必须是对象")
+    status_code, response_payload = _doubao_asr_v2_response_fields(response_payload, status_code)
+    if status_code.startswith("550"):
+        raise _DoubaoTransientError(f"豆包标准版{stage}服务暂时异常（{status_code}）")
+    return status_code, response_payload, log_id
 
 
 def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
@@ -4997,19 +5069,40 @@ def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None)
             "enable_channel_split": False,
         },
     }
-    submit_status, submit_payload, submit_log_id = _doubao_asr_v2_post(
-        DOUBAO_ASR_V2_SUBMIT_ENDPOINT,
-        submit_headers,
-        submit_body,
-        "任务提交",
-    )
-    if submit_status and submit_status != DOUBAO_ASR_SUCCESS_STATUS_CODE:
-        message = str(submit_payload.get("X-Api-Message") or submit_payload.get("message") or "")
-        raise RuntimeError(f"豆包标准版任务提交返回错误状态 {submit_status}: {message[:300]}")
-    task_id = str(submit_payload.get("task_id") or submit_request_id).strip()
-    if not task_id:
-        raise RuntimeError("豆包标准版任务提交未返回 task_id")
+    checkpoint_path = _doubao_checkpoint_path(audio_bytes, submit_body, api_key, model, language)
+    checkpoint = _read_doubao_checkpoint(checkpoint_path)
+    if checkpoint.get("state") == "complete":
+        payload = checkpoint["payload"]
+        payload["diagnostic"]["cache_hit"] = True
+        return payload
 
+    submit_status, submit_log_id = "", ""
+    task_id = checkpoint.get("task_id") or submit_request_id
+    if not checkpoint:
+        # Persist BEFORE sending: a timeout or process exit does not prove submission failed.
+        checkpoint = {"state": "pending", "task_id": task_id}
+        _write_doubao_checkpoint(checkpoint_path, checkpoint)
+        try:
+            submit_status, submit_payload, submit_log_id = _doubao_asr_v2_post(
+                DOUBAO_ASR_V2_SUBMIT_ENDPOINT, submit_headers, submit_body, "任务提交",
+            )
+        except _DoubaoTransientError:
+            pass  # The client-generated request ID is also the query ID.
+        except RuntimeError:
+            _write_doubao_checkpoint(checkpoint_path, {"state": "rejected"})
+            raise
+        else:
+            if submit_status and submit_status != DOUBAO_ASR_SUCCESS_STATUS_CODE:
+                _write_doubao_checkpoint(checkpoint_path, {"state": "rejected"})
+                raise RuntimeError(f"豆包标准版任务提交返回错误状态 {submit_status}")
+            task_id = str(submit_payload.get("task_id") or "").strip() or submit_request_id
+            checkpoint["task_id"] = task_id
+            _write_doubao_checkpoint(checkpoint_path, checkpoint)
+
+    recovery_hint = (
+        "已完成窗口已缓存；请稍后重试，将复用已完成结果并查询原任务。"
+        f"请求 ID：{task_id}；缓存目录：{checkpoint_path.parent}"
+    )
     query_headers = {
         "Content-Type": "application/json",
         "X-Api-Key": api_key,
@@ -5018,30 +5111,34 @@ def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None)
     }
     query_log_ids: list[str] = []
     query_status_codes: list[str] = []
+    transient_errors = 0
     for attempt in range(1, DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS + 1):
-        query_status, query_payload, query_log_id = _doubao_asr_v2_post(
-            DOUBAO_ASR_V2_QUERY_ENDPOINT,
-            query_headers,
-            {},
-            "结果查询",
-        )
+        if attempt > 1:
+            time.sleep(min(DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS, DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS * (attempt - 1)))
+        try:
+            query_status, query_payload, query_log_id = _doubao_asr_v2_post(
+                DOUBAO_ASR_V2_QUERY_ENDPOINT, query_headers, {}, "结果查询",
+            )
+        except _DoubaoTransientError as exc:
+            transient_errors += 1
+            if transient_errors >= DOUBAO_ASR_V2_MAX_TRANSIENT_ERRORS or attempt == DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS:
+                raise RuntimeError(f"{exc}；恢复重试已达上限。{recovery_hint}") from exc
+            continue
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc}；{recovery_hint}") from exc
+        transient_errors = 0
         if query_log_id:
             query_log_ids.append(query_log_id)
         if query_status:
             query_status_codes.append(query_status)
         if query_status and query_status not in DOUBAO_ASR_V2_NON_ERROR_STATUS_CODES:
-            message = str(query_payload.get("X-Api-Message") or query_payload.get("message") or "")
-            raise RuntimeError(f"豆包标准版结果查询返回错误状态 {query_status}: {message[:300]}")
+            raise RuntimeError(f"豆包标准版结果查询返回错误状态 {query_status}；{recovery_hint}")
         result = query_payload.get("result")
         if query_status == DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE and not isinstance(result, dict):
             result = {}
-        # Processing/queued responses may include an empty result object; only terminal states may consume it.
-        if query_status in {
-            DOUBAO_ASR_SUCCESS_STATUS_CODE,
-            DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE,
-        } and isinstance(result, dict):
+        if isinstance(result, dict) and query_status in {DOUBAO_ASR_SUCCESS_STATUS_CODE, DOUBAO_ASR_SILENT_AUDIO_STATUS_CODE}:
             segments, words = _doubao_asr_timestamp_payload(result)
-            return {
+            payload = {
                 "backend": "doubao_asr_v2",
                 "model": model,
                 "language": language,
@@ -5061,14 +5158,9 @@ def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None)
                     "attempt": attempt,
                 },
             }
-        if attempt < DOUBAO_ASR_V2_MAX_QUERY_ATTEMPTS:
-            time.sleep(
-                min(
-                    DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS,
-                    DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS * attempt,
-                )
-            )
-    raise RuntimeError(f"豆包标准版等待结果超时（task_id={task_id}）")
+            _write_doubao_checkpoint(checkpoint_path, {"state": "complete", "payload": payload})
+            return payload
+    raise RuntimeError(f"豆包标准版等待结果超时（task_id={task_id}）；{recovery_hint}")
 
 
 def transcribe_v4_window_batch(
