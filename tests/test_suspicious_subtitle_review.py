@@ -9,6 +9,7 @@ from test_normalize_length_options import run_lua
 
 SOURCE = (Path(__file__).resolve().parents[1] / "SubFix.lua").read_text(encoding="utf-8")
 COLLECTOR = SOURCE[SOURCE.index("function collect_pre_delivery_final_check_issues("):SOURCE.index("function collect_rows_overlapping_asr_segment(")]
+TEXT_HELPERS = SOURCE[SOURCE.index("function is_effective_subtitle_char("):SOURCE.index("function subtitle_has_trailing_space(")]
 WINDOW = SOURCE[SOURCE.index("function close_pre_delivery_review_window("):SOURCE.index("function timeline_has_pre_delivery_marker(")]
 SETUP = '''
     collect_visible_timeline_cut_frames = function() return {} end
@@ -29,7 +30,7 @@ def test_short_duration_and_overlap_boundaries(run_lua, fps):
     run_lua(f"fps = {fps}")
     run_lua(SETUP + COLLECTOR + '''
         for _, duration in ipairs({0, math.ceil(fps * 0.5) - 1, math.ceil(fps * 0.5), fps}) do
-            local row = {text = "ok", start_frame = 100, end_frame = 100 + duration}
+            local row = {text = "longer", start_frame = 100, end_frame = 100 + duration}
             local issues = collect_pre_delivery_final_check_issues({row}, nil, fps)
             assert((find_issue(issues, "字幕显示过短") ~= nil) == (duration / fps < 0.5))
             assert(row.start_frame == 100 and row.end_frame == 100 + duration)
@@ -43,6 +44,49 @@ def test_short_duration_and_overlap_boundaries(run_lua, fps):
         end
         assert(not find_issue(collect_pre_delivery_final_check_issues({
             {text = "", start_frame = 0, end_frame = 0}}, nil, fps), "字幕显示过短"))
+    ''')
+
+
+@pytest.mark.parametrize("fps", [23.976, 24, 25, 29.97, 30, 60])
+def test_short_utterances_follow_text_length_without_changing_timing(run_lua, fps):
+    run_lua(f"fps = {fps}")
+    run_lua(SETUP + TEXT_HELPERS + COLLECTOR + '''
+        for _, text in ipairs({"啊", "啊哟", "哎呀！", "嗯。", "好", "哦？", "OK", "对对对"}) do
+            local duration = math.ceil(fps / 3)
+            local row = {text = text, start_frame = 100, end_frame = 100 + duration}
+            local issues = collect_pre_delivery_final_check_issues({row}, nil, fps)
+            assert(not find_issue(issues, "字幕显示过短"), text .. " falsely flagged as too short")
+            assert(not find_issue(issues, "阅读速度过快"), text .. " falsely flagged as too fast")
+            assert(row.text == text and row.start_frame == 100 and row.end_frame == 100 + duration)
+        end
+        for _, text in ipairs({"啊", "啊哟", "你能听见了吗"}) do
+            for _, frames in ipairs({0, 1}) do
+                local issues = collect_pre_delivery_final_check_issues({
+                    {text = text, start_frame = 100, end_frame = 100 + frames}}, nil, fps)
+                assert(find_issue(issues, "字幕显示过短"), "zero duration or flash must still be flagged")
+            end
+        end
+        local issues = collect_pre_delivery_final_check_issues({
+            {text = "你能听见了吗", start_frame = 0, end_frame = math.floor(fps / 3)}}, nil, fps)
+        assert(find_issue(issues, "字幕显示过短"), "long text must retain the half-second check")
+        assert(find_issue(issues, "阅读速度过快"), "reading speed check must remain active")
+    ''')
+
+
+@pytest.mark.parametrize("text,threshold", [("啊！", 0.12), ("啊哟", 2 / 11), ("对对对", 3 / 11)])
+@pytest.mark.parametrize("fps", [24, 29.97, 60])
+def test_text_aware_short_duration_boundary(run_lua, text, threshold, fps):
+    import json
+
+    run_lua(f"text={json.dumps(text, ensure_ascii=False)}; threshold={threshold}; fps={fps}")
+    run_lua(SETUP + TEXT_HELPERS + COLLECTOR + '''
+        for _, duration in ipairs({math.ceil(threshold * fps) - 1, math.ceil(threshold * fps)}) do
+            local issues = collect_pre_delivery_final_check_issues({
+                {text = text, start_frame = 0, end_frame = duration}}, nil, fps)
+            local issue = find_issue(issues, "字幕显示过短")
+            assert((issue ~= nil) == (duration / fps < threshold))
+            if issue then assert(not issue.reason:find("不足 0.5 秒", 1, true)) end
+        end
     ''')
 
 

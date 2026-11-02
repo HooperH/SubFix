@@ -553,6 +553,18 @@ def _lowest_energy_frame(
     return best_frame
 
 
+def _original_overlap_error(left: dict[str, Any], right: dict[str, Any], stage: str) -> ValueError:
+    left_start, left_end = int(left["original_start_frame"]), int(left["original_end_frame"])
+    right_start, right_end = int(right["original_start_frame"]), int(right["original_end_frame"])
+    overlap = min(left_end, right_end) - max(left_start, right_start)
+    return ValueError(
+        "字幕原始对齐范围重叠，无法安全修正边界"
+        f"（阶段={stage}；左：轨道={left.get('speaker_track_index', '未知')}，帧={left_start}-{left_end}；"
+        f"右：轨道={right.get('speaker_track_index', '未知')}，帧={right_start}-{right_end}；重叠={overlap} 帧）。"
+        "请保留此错误中的帧范围和诊断日志以定位冲突。"
+    )
+
+
 def refine_subtitle_boundaries(
     rows: list[dict[str, Any]],
     audio_path: str | Path,
@@ -591,7 +603,7 @@ def refine_subtitle_boundaries(
         right_start = int(right["original_start_frame"])
         gap = right_start - left_end
         if gap < 0:
-            raise ValueError("字幕原始对齐范围重叠，无法安全修正边界")
+            raise _original_overlap_error(left, right, "音轨边界修正")
         if gap == 0:
             boundary = right_start
             left["end_frame"] = boundary
@@ -642,7 +654,7 @@ def preserve_refined_row_order(
     conflicts = 0
     for left, right in zip(output, output[1:]):
         if int(left["original_end_frame"]) > int(right["original_start_frame"]):
-            raise ValueError("字幕原始对齐范围重叠，无法安全修正边界")
+            raise _original_overlap_error(left, right, "跨轨顺序校验")
         different_track = left.get("speaker_track_index") != right.get("speaker_track_index")
         if different_track or left["end_frame"] > right["start_frame"]:
             had_overlap = left["end_frame"] > right["start_frame"]

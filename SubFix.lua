@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.3.8"
+SUBFIX_VERSION = "3.3.9"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -20193,7 +20193,7 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
     local fast_reading_cps = tonumber(PRE_DELIVERY_FAST_READING_CHARS_PER_SECOND) or 11
     local max_subtitle_duration_seconds = tonumber(PRE_DELIVERY_MAX_SUBTITLE_DURATION_SECONDS) or 6
     local max_subtitle_chars = tonumber(PRE_DELIVERY_MAX_SUBTITLE_CHARS) or 24
-    local min_subtitle_duration_seconds = 0.5
+    local min_flash_duration_seconds = 0.12
     -- 终检只提示疑似闪断的短缝；填补空隙的 2 秒范围包含正常停顿，不能用于报警。
     local subtitle_gap_max_frames = math.floor(rate * (tonumber(PRE_DELIVERY_SUBTITLE_SHORT_GAP_MAX_SECONDS) or 0.5))
     local cut_tolerance_frames = tonumber(PRE_DELIVERY_CUT_ALIGNMENT_TOLERANCE_FRAMES) or 6
@@ -20262,6 +20262,8 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
             local duration_seconds = duration / rate
             local row_text = tostring(row.text or "")
             local effective_chars = count_effective_subtitle_chars(row_text)
+            -- 短语气词按文字量判断，避免统一 0.5 秒阈值误报；仍保留疑似闪现下限。
+            local min_subtitle_duration_seconds = math.min(0.5, math.max(min_flash_duration_seconds, effective_chars / fast_reading_cps))
             if row.audio_alignment_warning then
                 add_issue(row, i, "音频对齐待复查", tostring(row.audio_alignment_warning))
             end
@@ -20275,7 +20277,7 @@ function collect_pre_delivery_final_check_issues(rows, timeline, fps)
                 add_issue(row, i, "字幕显示过久", string.format("字幕持续 %.1f 秒，超过 %d 秒", duration_seconds, max_subtitle_duration_seconds))
             end
             if duration_seconds < min_subtitle_duration_seconds and effective_chars > 0 then
-                add_issue(row, i, "字幕显示过短", string.format("字幕持续 %.3f 秒，不足 0.5 秒，请检查是否闪现", duration_seconds))
+                add_issue(row, i, "字幕显示过短", string.format("字幕持续 %.3f 秒，低于按 %d 字计算的复查阈值 %.3f 秒，请结合语音检查是否闪现", duration_seconds, effective_chars, min_subtitle_duration_seconds))
             end
             if effective_chars > max_subtitle_chars then
                 add_issue(row, i, "单条字幕过长", string.format("有效字数 %d，超过 %d", effective_chars, max_subtitle_chars))
