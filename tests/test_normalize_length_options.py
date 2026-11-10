@@ -110,6 +110,7 @@ def test_normalize_dialog_options_and_validation(run_lua):
         end}
         SUBFIX_WINDOW_GEOMETRY = {centered_geometry = function(value) return value end}
         SUBFIX_AUDIO_ALIGN = {parse_normalize_length_bias_input = function() return "auto", 0 end}
+        ensure_subfix_alignment_model = function() return true end
         resolve_window = function(value) return value end
         update_shared_status = function() end
         restart_ui_timer = function() return false end

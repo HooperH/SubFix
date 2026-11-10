@@ -78,7 +78,8 @@ def test_test_package_builder_is_self_contained_and_arm64_only():
         "arm64",
         "fetch_python_runtime.sh",
         "stage_qwen3_cpp_runtime.sh",
-        "qwen3-forced-aligner-0.6b-f16.gguf",
+        "subfix_model_manager.py",
+        "subfix_model_center.lua",
         "subfix_generate_textnorm.py",
         '"$SUPPORT_PAYLOAD/runtime/python"',
         "build_uninstaller.sh",
@@ -87,6 +88,8 @@ def test_test_package_builder_is_self_contained_and_arm64_only():
     ):
         assert marker in source
     assert "/Users/" not in source
+    assert "$SUPPORT_PAYLOAD/models" not in source
+    assert ".gguf" not in source
 
 
 def test_test_package_uses_an_ascii_pkg_filename_for_pkgbuild_compatibility():
@@ -131,10 +134,10 @@ def test_generate_core_uses_a_dedicated_process_group_for_cancellation():
     assert 'kill -KILL -- -" .. tostring(pid)' in body
 
 
-def test_legacy_update_inline_runner_creates_a_dedicated_process_group():
+def test_fallback_inline_runner_creates_a_dedicated_process_group():
     source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text(encoding="utf-8")
-    inline = re.search(r"local inline_group_code = '([^'\n]+)'", source)
-    assert inline, "legacy update payload needs a runner without adding a new file"
+    inline = re.search(r"local process_group_code = \[\[(.*?)\]\]", source)
+    assert inline, "missing process-group helper still needs an isolated fallback"
     probe = "import json,os; print(json.dumps([os.getpid(),os.getpgrp(),os.getsid(0)]))"
     command = shlex.join([sys.executable, "-c", probe])
     worker = subprocess.Popen([sys.executable, "-c", inline.group(1), command], stdout=subprocess.PIPE, text=True)
@@ -192,20 +195,23 @@ def test_qwen_runtime_stage_repairs_absolute_rpaths_and_launches(tmp_path):
 @pytest.mark.parametrize("backend", ["doubao_asr", "doubao_asr_v2", "auto"])
 @pytest.mark.parametrize("qwen_ready", [False, True])
 @pytest.mark.parametrize("runtime_present", [False, True])
-def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_present):
+@pytest.mark.parametrize("aligner_present", [False, True])
+def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_present, aligner_present):
     source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text(encoding="utf-8")
     start = source.index("local function build_asr_helper_batch_command(")
     end = source.index("local function kill_background_process(", start)
     run_lua("backend=" + json.dumps(backend) + "; qwen_ready=" + str(qwen_ready).lower()
-            + "; runtime_present=" + str(runtime_present).lower())
+            + "; runtime_present=" + str(runtime_present).lower()
+            + "; aligner_present=" + str(aligner_present).lower())
     run_lua(r'''
         local paths = {helper="/helper.py", python="/obsolete/python", runtime_python="/bundled/python", diagnostic="/diagnostic.json"}
         local function resolve_asr_paths() return paths end
         local function file_exists(path)
             if path == "/bundled/python" then return runtime_present end
+            if path == "/aligner.gguf" then return aligner_present end
             return path == "/helper.py" or (path == "/qwen/python" and qwen_ready)
         end
-        local function inspect_local_qwen() return {ready=qwen_ready, python="/qwen/python", model="/model"} end
+        local function inspect_local_qwen() return {ready=qwen_ready, python="/qwen/python", model="/model", aligner="/aligner.gguf"} end
         local function resolve_generate_engine() return "v5" end
         local function resolve_segmentation_profile_path() return nil end
         local function shell_quote(value) return "'" .. tostring(value) .. "'" end
@@ -214,12 +220,14 @@ def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_
         local DEFAULT_ASR_LANGUAGE="zh"
     ''' + source[start:end] + r'''
         local command, err = build_asr_helper_batch_command("/batch", "/srt", "/json", 108000, 30, "/progress", "narration", 25, backend, nil)
-        if qwen_ready then
+        if not aligner_present then
+            assert(not command and err:find("缺少对齐模型", 1, true))
+        elseif qwen_ready then
             assert(command and not err)
             assert(command:find("'/qwen/python'", 1, true))
             assert(command:find("env -u PYTHONHOME -u PYTHONPATH", 1, true))
         elseif backend == "auto" then
-            assert(not command and err:find("本地 Qwen 尚未安装", 1, true))
+            assert(not command and err:find("所选本地模型尚未就绪", 1, true))
         elseif runtime_present then
             assert(command and not err)
             assert(command:find("'/bundled/python'", 1, true))
@@ -227,7 +235,9 @@ def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_
             assert(not command and err:find("内置 Python 缺失", 1, true))
         end
         if command then
-            assert(command:find("--backend '" .. backend .. "'", 1, true))
+            local expected_backend = backend == "auto" and "qwen3_asr" or backend
+            assert(command:find("--backend '" .. expected_backend .. "'", 1, true))
+            assert(command:find("SUBFIX_QWEN3_ALIGNER_GGUF='/aligner.gguf'", 1, true))
             assert(not command:find("/obsolete/python", 1, true))
         end
     ''')
@@ -235,8 +245,9 @@ def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_
 
 def test_qwen_install_failure_dialog_has_room_for_the_real_error_and_log_path():
     manager_source = (ROOT / ".subfix_support/subfix_qwen_local_manager.py").read_text(encoding="utf-8")
-    core_source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text(encoding="utf-8")
+    center_source = (ROOT / ".subfix_support/subfix_model_center.lua").read_text(encoding="utf-8")
 
     assert 'qwen-local-install.log' in manager_source
     assert '完整日志：' in manager_source
-    assert 'Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 560, 240})' in core_source
+    assert 'ui:TextEdit{ID = "ModelDetails", ReadOnly = true, Weight = 1' in center_source
+    assert 'detail[#detail + 1] = "\\n最近一次操作：\\n" .. last_operation_error' in center_source

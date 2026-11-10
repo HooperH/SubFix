@@ -78,6 +78,9 @@ for support_file in \
   subfix_generate_selection_core.lua \
   subfix_update.py \
   subfix_qwen_local_manager.py \
+  subfix_model_manager.py \
+  subfix_model_center.lua \
+  model-downloads.json \
   subfix_process_group.py \
   subfix_asr_transcribe.py \
   subfix_generate_v4.py \
@@ -86,8 +89,7 @@ for support_file in \
   setup_asr_env.sh \
   segmentation_profile.json \
   segmentation_profile_v3.json \
-  segmentation_profile_v4.json \
-  models/qwen3-forced-aligner-0.6b-f16.gguf; do
+  segmentation_profile_v4.json; do
   [[ -e "$USER_SUPPORT/$support_file" ]] && chown "$CONSOLE_USER":staff "$USER_SUPPORT/$support_file"
 done
 

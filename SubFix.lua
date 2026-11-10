@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.3.9"
+SUBFIX_VERSION = "3.4.0"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -9081,7 +9081,6 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     local helper = helper_dir .. "/subfix_asr_transcribe.py"
     local setup = helper_dir .. "/setup_asr_env.sh"
     local python = helper_dir .. "/.subfix_asr_env/bin/python"
-    local runtime_python = helper_dir .. "/runtime/python/bin/python3"
     local visible_helper_dir = script_dir .. "/SubFix"
     local visible_helper = visible_helper_dir .. "/subfix_asr_transcribe.py"
     local visible_setup = visible_helper_dir .. "/setup_asr_env.sh"
@@ -9107,8 +9106,15 @@ function SUBFIX_AUDIO_ALIGN.get_asr_paths()
     if not SUBFIX_AUDIO_ALIGN.file_exists(python) and SUBFIX_AUDIO_ALIGN.file_exists(user_python) then
         python = user_python
     end
-    if not SUBFIX_AUDIO_ALIGN.file_exists(python) and SUBFIX_AUDIO_ALIGN.file_exists(runtime_python) then
-        python = runtime_python
+    -- GGUF alignment uses the base runtime; it does not require the optional ASR environment.
+    if not SUBFIX_AUDIO_ALIGN.file_exists(python) then
+        local runtime_python = helper:gsub("/[^/]+$", "") .. "/runtime/python/bin/python3"
+        local user_runtime_python = home_dir .. "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/.subfix_support/runtime/python/bin/python3"
+        if SUBFIX_AUDIO_ALIGN.file_exists(runtime_python) then
+            python = runtime_python
+        elseif SUBFIX_AUDIO_ALIGN.file_exists(user_runtime_python) then
+            python = user_runtime_python
+        end
     end
 
     return {
@@ -9122,6 +9128,7 @@ end
 
 function SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths)
     paths = type(paths) == "table" and paths or SUBFIX_AUDIO_ALIGN.get_asr_paths()
+    paths.aligner_model = nil
     local helper_dir = tostring(paths.helper_dir or "")
     if helper_dir == "" then
         return false
@@ -9131,15 +9138,35 @@ function SUBFIX_AUDIO_ALIGN.qwen3_cpp_available(paths)
     if not SUBFIX_AUDIO_ALIGN.file_exists(legacy_cli) and not SUBFIX_AUDIO_ALIGN.file_exists(packaged_cli) then
         return false
     end
+    local home_dir = os.getenv("HOME") or ""
+    local function expand_user_path(value)
+        if value == "~" then return home_dir end
+        if value:sub(1, 2) == "~/" then return home_dir .. value:sub(2) end
+        return value
+    end
+    local configured_model = tostring(os.getenv("SUBFIX_QWEN3_ALIGNER_GGUF") or ""):match("^%s*(.-)%s*$")
+    if configured_model ~= "" then
+        configured_model = expand_user_path(configured_model)
+        if not SUBFIX_AUDIO_ALIGN.file_exists(configured_model) then return false end
+        paths.aligner_model = configured_model
+        return true
+    end
+    local data_root = tostring(os.getenv("SUBFIX_DATA_ROOT") or ""):match("^%s*(.-)%s*$")
+    if data_root == "" then data_root = home_dir .. "/Library/Application Support/SubFix" end
+    data_root = expand_user_path(data_root):gsub("/+$", "")
     local model_names = {
         "qwen3-forced-aligner-0.6b-f16.gguf",
         "qwen3-forced-aligner-0.6b-q8_0.gguf",
         "qwen3-forced-aligner-0.6b-q5_0.gguf",
         "qwen3-forced-aligner-0.6b-q4_k.gguf"
     }
-    for _, model_name in ipairs(model_names) do
-        if SUBFIX_AUDIO_ALIGN.file_exists(helper_dir .. "/models/" .. model_name) then
-            return true
+    for _, model_root in ipairs({data_root, helper_dir}) do
+        for _, model_name in ipairs(model_names) do
+            local candidate = model_root .. "/models/" .. model_name
+            if SUBFIX_AUDIO_ALIGN.file_exists(candidate) then
+                paths.aligner_model = candidate
+                return true
+            end
         end
     end
     return false
@@ -11008,6 +11035,7 @@ function SUBFIX_AUDIO_ALIGN.run_qwen_forced_alignment_batches(batch_plan, fps, b
         })
     end
     local cmd_parts = {
+        "SUBFIX_QWEN3_ALIGNER_GGUF=" .. shell_quote(paths.aligner_model),
         shell_quote(paths.python),
         shell_quote(paths.helper),
         "--mode", helper_mode,
@@ -13175,6 +13203,28 @@ function run_generate_selection_subtitles_from_subfix(target_window)
     return true
 end
 
+function open_subfix_model_center(target_window)
+    local core, err, script_root = load_generate_selection_core_for_subfix()
+    if not core or type(core.open_model_center) ~= "function" then
+        update_shared_status(target_window, err or "模型中心组件缺失，请安装最新完整 SubFix 安装包")
+        return false
+    end
+    local ok, center_err = core.open_model_center({script_root = script_root})
+    if not ok then update_shared_status(target_window, center_err or "无法打开模型中心") end
+    return ok
+end
+
+function ensure_subfix_alignment_model(target_window)
+    local core, err, script_root = load_generate_selection_core_for_subfix()
+    if not core or type(core.ensure_alignment_model) ~= "function" then
+        update_shared_status(target_window, err or "模型中心组件缺失，请安装最新完整 SubFix 安装包")
+        return false
+    end
+    local ok, model_err = core.ensure_alignment_model({script_root = script_root})
+    if not ok then update_shared_status(target_window, model_err or "请先准备对齐模型") end
+    return ok
+end
+
 -- ========== 全局刷新函数 (供弹窗事件调用) ==========
 function RefreshSubtitleTree(target_window)
     local window = resolve_window(target_window)
@@ -14354,7 +14404,12 @@ update_timeline = function()
     end
 
     local original_playhead_timecode = capture_timeline_playhead_timecode(timeline)
+    local pending_imported_item
     local function finish_timeline_update(result)
+        if pending_imported_item then
+            cleanup_imported_subtitle_media_item(mediaPool, pending_imported_item, "更新时间线退出")
+            pending_imported_item = nil
+        end
         restore_timeline_playhead_timecode(timeline, original_playhead_timecode, "更新时间线")
         return result
     end
@@ -14462,24 +14517,6 @@ update_timeline = function()
     LogMsg("已生成新的 SRT 临时文件，共 " .. tostring(index - 1) .. " 条")
     
     -- ========== 导入字幕到时间线（保留目标轨样式，仅清空轨内片段）==========
-    local rootFolder = mediaPool:GetRootFolder()
-    mediaPool:SetCurrentFolder(rootFolder)
-
-    local srtFileName = srt_path:match("([^/\\]+)$")
-    print("[Hooper AI 2.0] 检查媒体池: " .. srtFileName)
-
-    -- 清理媒体池中的旧 SRT 文件
-    local existingItems = rootFolder:GetClipList()
-    if existingItems then
-        for _, item in ipairs(existingItems) do
-            if item:GetName() == srtFileName then
-                print("[Hooper AI 2.0] 删除旧字幕: " .. srtFileName)
-                mediaPool:DeleteClips({item})
-                break
-            end
-        end
-    end
-
     local ensured_items, ensure_err = ensure_subtitle_track_exists(current_subtitle_target_track, timeline)
     if not ensured_items then
         print("[Hooper AI 2.0] " .. tostring(ensure_err))
@@ -14503,6 +14540,27 @@ update_timeline = function()
         if status then status:Set("Text", tostring(fade_err)) end
         return finish_timeline_update(false)
     end
+
+    -- 协作项目的主媒体夹可能被他人锁定；只使用用户选中的媒体夹。
+    -- 先确认媒体池接收 SRT，再改动原字幕，避免导入失败后留下空轨。
+    local import_ok, mediaPoolItems, import_err = pcall(function()
+        local folder = mediaPool:GetCurrentFolder()
+        if not folder then return nil, "没有选中的媒体夹" end
+        if mediaPool:SetCurrentFolder(folder) ~= true then
+            return nil, "无法切换到选中的媒体夹"
+        end
+        return mediaPool:ImportMedia({srt_path})
+    end)
+    if not import_ok or type(mediaPoolItems) ~= "table" or not mediaPoolItems[1] then
+        local detail = not import_ok and tostring(mediaPoolItems) or (import_err or "Resolve 返回空媒体项")
+        LogMsg("导入字幕到媒体池失败: " .. detail .. "；请检查媒体夹是否被其他协作者占用，切换到可写媒体夹后重试。SRT: " .. srt_path)
+        if status then status:Set("Text", "导入失败，原字幕保留；请切换可写媒体夹后重试") end
+        return finish_timeline_update(false)
+    end
+    local mediaPoolItem = mediaPoolItems[1]
+    pending_imported_item = mediaPoolItem
+    print("[Hooper AI 2.0] 字幕已导入当前媒体夹")
+    LogMsg("已导入新字幕到媒体池，共 " .. tostring(index - 1) .. " 条")
 
     local original_track_state_snapshot = select(1, get_subtitle_track_state_snapshot(timeline))
     if original_track_state_snapshot then
@@ -14558,21 +14616,6 @@ update_timeline = function()
         return finish_timeline_update()
     end
 
-    -- 导入 SRT 到媒体池
-    local mediaPoolItems = mediaPool:ImportMedia({srt_path})
-    if not mediaPoolItems or #mediaPoolItems == 0 then
-        print("[Hooper AI 2.0] 导入字幕到媒体池失败")
-        LogMsg("导入字幕到媒体池失败")
-        if status then status:Set("Text", "导入字幕到媒体池失败") end
-        if fallback_locked then
-            unlock_all_subtitle_tracks(timeline)
-        end
-        return finish_timeline_update()
-    end
-    local mediaPoolItem = mediaPoolItems[1]
-    print("[Hooper AI 2.0] 字幕已导入媒体池")
-    LogMsg("已导入新字幕到媒体池，共 " .. tostring(index - 1) .. " 条")
-
     LogMsg("使用稳定模式追加字幕到时间线，Resolve 将自行决定落轨")
     local append_ok, append_result = pcall(function() return mediaPool:AppendToTimeline({mediaPoolItem}) end)
     if not append_ok or append_result == false or append_result == nil then
@@ -14586,6 +14629,7 @@ update_timeline = function()
     end
 
     cleanup_imported_subtitle_media_item(mediaPool, mediaPoolItem, "更新时间线")
+    pending_imported_item = nil
 
     local final_after_snapshot, after_err = snapshot_subtitle_tracks(timeline)
     if not final_after_snapshot then
@@ -17414,7 +17458,7 @@ local function do_ai_fix()
 
     local ai_content = nil
     local finish_reason = nil
-    
+
     if not is_correction_task then
         update_ai_progress(ai_progress, {
             stage = "自动检测方向",
@@ -18179,7 +18223,7 @@ return ui:VGroup({
         ui:HGroup({
             ID = "TopBar",
             Weight = 0,
-            Spacing = 10,
+            Spacing = 6,
             ui:Label({ID = "TrackLabel", Text = "字幕轨", Weight = 0}),
             ui:HGroup({
                 ID = "TrackSpinWrap",
@@ -18204,6 +18248,7 @@ return ui:VGroup({
             }),
             ui:Button({ID = "RefreshBtn", Text = "刷新字幕", Weight = 0}),
             ui:Button({ID = "CheckUpdateBtn", Text = "检查更新", Weight = 0}),
+            ui:Button({ID = "ModelCenterBtn", Text = "模型中心", Weight = 0}),
             -- 加载状态标签已删除（底部「已加载 N 条」更准确）。HGap 保留右侧空间。
             ui:HGap(0, 1.0),
             ui:Button({
@@ -18568,6 +18613,10 @@ function show_normalize_length_config_dialog(target_window)
             local align_audio, fill_gaps = refresh_options()
             if not align_audio and not fill_gaps then return end
             local target = pending_normalize_length_config_window or active_window or win
+            if align_audio then
+                NormalizeLengthConfigWin:Hide()
+                if not ensure_subfix_alignment_model(target) then return end
+            end
             pending_normalize_length_window = target
             pending_normalize_length_options = {
                 align_audio = align_audio, fill_gaps = fill_gaps,
@@ -22500,18 +22549,37 @@ function subfix_update_python_path(helper)
     return ok_python and python ~= "" and python or nil
 end
 
-function show_subfix_update_confirm(payload)
+function open_subfix_update_website()
+    local url = "https://subfix-by-hooper.ysjf.chatgpt.site/"
+    local ok, result = pcall(os.execute, "/usr/bin/open " .. shell_quote(url) .. " >/dev/null 2>&1")
+    if not ok or (result ~= true and result ~= 0) then
+        return false, "无法打开浏览器，请手动访问：\n" .. url
+    end
+    return true
+end
+
+function show_subfix_update_confirm(payload, failure_message)
+    payload = type(payload) == "table" and payload or {}
     local dialog = dispatcher:AddWindow({ID = "SubFixUpdateConfirm", WindowTitle = "SubFix 更新", Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({480, 300, 460, 220})},
         ui:VGroup{ContentsMargins = 18, Spacing = 8,
-            ui:Label{Text = "发现新版本 v" .. tostring(payload.version or "?"), Weight = 0},
-            ui:TextEdit{ID = "SubFixUpdateNotes", Text = tostring(payload.notes or ""), ReadOnly = true, Weight = 1},
+            ui:Label{Text = failure_message and "更新暂未完成" or ("发现新版本 v" .. tostring(payload.version or "?")), Weight = 0},
+            ui:TextEdit{ID = "SubFixUpdateNotes", PlainText = tostring(failure_message or payload.notes or ""), ReadOnly = true, Weight = 1},
             ui:HGroup{Weight = 0, Spacing = 8,
-                ui:Button{ID = "SubFixUpdateInstall", Text = "下载并安装", Weight = 1},
-                ui:Button{ID = "SubFixUpdateCancel", Text = "取消", Weight = 1}
+                ui:Button{ID = "SubFixUpdateInstall", Text = "下载并安装", Hidden = failure_message ~= nil, Weight = 1},
+                ui:Button{ID = "SubFixUpdateWebsite", Text = "官网下载", Weight = 1},
+                ui:Button{ID = "SubFixUpdateCancel", Text = failure_message and "关闭" or "取消", Weight = 1}
             }
         })
     local action = "cancel"
     function dialog.On.SubFixUpdateInstall.Clicked(ev) action = "install"; dialog:Hide(); dispatcher:ExitLoop() end
+    function dialog.On.SubFixUpdateWebsite.Clicked(ev)
+        local opened, message = open_subfix_update_website()
+        if opened then
+            action = "website"; dialog:Hide(); dispatcher:ExitLoop()
+        else
+            dialog:GetItems().SubFixUpdateNotes.PlainText = message
+        end
+    end
     function dialog.On.SubFixUpdateCancel.Clicked(ev) dialog:Hide(); dispatcher:ExitLoop() end
     function dialog.On.SubFixUpdateConfirm.Close(ev) dialog:Hide(); dispatcher:ExitLoop() end
     dialog:Show(); dispatcher:RunLoop(); pcall(function() dialog:Hide() end)
@@ -22536,16 +22604,16 @@ function run_subfix_update_with_progress(cmd, output_path, task_name, cancellabl
     local result = decode_json_text(read_text_file(output_path) or "")
     os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
     if progress_path then os.remove(progress_path) end
-    if status == "cancelled" then
+    if status == "cancelled" or (cancellable and progress_state.cancel_requested) then
         message = "已取消" .. task_name
         finish_long_task_progress_window(progress_state, "cancelled", message)
-        return false, message
+        return false, message, "cancelled", progress_state
     end
     if not call_ok or not ok or type(result) ~= "table" or result.ok ~= true then
         message = trim_text(tostring((not call_ok and ok) or (type(result) == "table" and result.error) or output or ""))
         if message == "" then message = task_name .. "失败，请重试" end
         finish_long_task_progress_window(progress_state, "failed", message)
-        return false, message
+        return false, message, "failed", progress_state
     end
     finish_long_task_progress_window(progress_state, "done", task_name .. "完成")
     return true, result
@@ -22562,7 +22630,8 @@ function run_subfix_update_check(cmd, output_path)
     os.remove(output_path)
     if not call_ok or not ok or type(result) ~= "table" or result.ok ~= true then
         local message = trim_text(tostring((not call_ok and ok) or (type(result) == "table" and result.error) or output or ""))
-        return false, message ~= "" and message or "检查更新失败，请重试"
+        local status = type(result) == "table" and result.update_available == false and "no_update" or "failed"
+        return false, message ~= "" and message or "检查更新失败，请重试", status
     end
     return true, result
 end
@@ -22572,19 +22641,65 @@ function run_subfix_update(payload)
     if not helper then return false, "缺少更新器，请先安装包含更新功能的 SubFix 版本" end
     local python = subfix_update_python_path(helper)
     if not python then return false, "未找到 Python 3，无法安装更新" end
-    local output_path = "/tmp/subfix_update_install_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
+    local path_prefix = "/tmp/subfix_update_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+    local output_path = path_prefix .. ".download.json"
     local progress_path = output_path .. ".progress.json"
-    local cmd = table.concat({
+    local arguments = {
         shell_quote(python), shell_quote(helper),
-        "install", "--zip-url", shell_quote(tostring(payload.zip_url or "")),
-        "--sha256-url", shell_quote(tostring(payload.sha256_url or "")),
+        "download", "--zip-url", shell_quote(tostring(payload.zip_url or "")),
         "--version", shell_quote(tostring(payload.version or "")),
         "--output", shell_quote(output_path), "--progress", shell_quote(progress_path)
+    }
+    if type(payload.sha256) == "string" and payload.sha256 ~= "" then
+        arguments[#arguments + 1] = "--sha256"
+        arguments[#arguments + 1] = shell_quote(payload.sha256)
+    else
+        arguments[#arguments + 1] = "--sha256-url"
+        arguments[#arguments + 1] = shell_quote(tostring(payload.sha256_url or ""))
+    end
+    if tonumber(payload.size_bytes) and tonumber(payload.size_bytes) > 0 then
+        arguments[#arguments + 1] = "--size-bytes"
+        arguments[#arguments + 1] = shell_quote(tostring(math.floor(tonumber(payload.size_bytes))))
+    end
+    if type(payload.fallback_urls) == "table" then
+        for _, url in ipairs(payload.fallback_urls) do
+            if type(url) == "string" and url ~= "" then
+                arguments[#arguments + 1] = "--fallback-url"
+                arguments[#arguments + 1] = shell_quote(url)
+            end
+        end
+    end
+    local cmd = table.concat(arguments, " ")
+    local ok, result, status, progress_state = run_subfix_update_with_progress(cmd, output_path, "下载更新包", true, progress_path)
+    if not ok then
+        if progress_state and progress_state.window then pcall(function() progress_state.window:Hide() end) end
+        if status == "cancelled" then return false, "已取消下载；再次更新时会继续下载。", status end
+        return false, result, status
+    end
+    if type(result.archive_path) ~= "string" or result.archive_path == ""
+        or type(result.sha256) ~= "string" or #result.sha256 ~= 64 or result.sha256:find("[^%x]")
+        or result.version ~= payload.version then
+        return false, "下载结果无效，请重试或前往官网下载。", "failed"
+    end
+    output_path = path_prefix .. ".install.json"
+    progress_path = output_path .. ".progress.json"
+    cmd = table.concat({
+        shell_quote(python), shell_quote(helper),
+        "install-local", "--archive", shell_quote(result.archive_path),
+        "--sha256", shell_quote(result.sha256), "--version", shell_quote(tostring(payload.version or "")),
+        "--output", shell_quote(output_path), "--progress", shell_quote(progress_path)
     }, " ")
-    -- 安装器会替换多个文件，不能在写入途中终止。
-    local ok, result = run_subfix_update_with_progress(cmd, output_path, "下载并安装更新", false, progress_path)
-    if not ok then return false, result end
+    -- 下载可取消且保留缓存；只有校验后的文件替换阶段禁止中断。
+    ok, result, status, progress_state = run_subfix_update_with_progress(cmd, output_path, "安装更新", false, progress_path)
+    if not ok then
+        if progress_state and progress_state.window then pcall(function() progress_state.window:Hide() end) end
+        return false, result, status
+    end
     return true, "更新已安装。请完全退出并重新启动 DaVinci Resolve 后使用 v" .. tostring(payload.version)
+end
+
+function win.On.ModelCenterBtn.Clicked(ev)
+    open_subfix_model_center(win)
 end
 
 function win.On.CheckUpdateBtn.Clicked(ev)
@@ -22593,17 +22708,31 @@ function win.On.CheckUpdateBtn.Clicked(ev)
     pcall(function() win:GetItems().CheckUpdateBtn.Enabled = false end)
     local succeeded, failure = pcall(function()
         local helper = subfix_update_helper_path()
-        if not helper then update_shared_status(win, "缺少更新器；请先安装含更新功能的版本"); return end
+        if not helper then
+            local message = "缺少更新器，请从官网下载完整安装包。"
+            update_shared_status(win, message); show_subfix_update_confirm(nil, message); return
+        end
         local python = subfix_update_python_path(helper)
-        if not python then update_shared_status(win, "未找到 Python 3，无法检查更新"); return end
-        local output_path = "/tmp/subfix_update_check_" .. tostring(os.time()) .. ".json"
+        if not python then
+            local message = "未找到 Python 3，请从官网下载完整安装包。"
+            update_shared_status(win, message); show_subfix_update_confirm(nil, message); return
+        end
+        local output_path = "/tmp/subfix_update_check_" .. tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999)) .. ".json"
         local cmd = table.concat({shell_quote(python), shell_quote(helper), "check", "--current-version", shell_quote(SUBFIX_VERSION), "--output", shell_quote(output_path)}, " ")
         update_shared_status(win, "正在检查 SubFix 更新...")
-        local ok, payload = run_subfix_update_check(cmd, output_path)
-        if not ok then update_shared_status(win, payload); return end
-        if show_subfix_update_confirm(payload) == "install" then
-            local installed, message = run_subfix_update(payload)
+        local ok, payload, status = run_subfix_update_check(cmd, output_path)
+        if not ok then
+            update_shared_status(win, payload)
+            if status ~= "no_update" then show_subfix_update_confirm(nil, payload) end
+            return
+        end
+        local action = show_subfix_update_confirm(payload)
+        if action == "install" then
+            local installed, message, install_status = run_subfix_update(payload)
             update_shared_status(win, message)
+            if not installed and install_status ~= "cancelled" then show_subfix_update_confirm(nil, message) end
+        elseif action == "website" then
+            update_shared_status(win, "已打开官网下载页面")
         else
             update_shared_status(win, "已取消更新")
         end
@@ -22611,7 +22740,9 @@ function win.On.CheckUpdateBtn.Clicked(ev)
     SUBFIX_UPDATE_RUNNING = false
     pcall(function() win:GetItems().CheckUpdateBtn.Enabled = true end)
     if not succeeded then
-        update_shared_status(win, "更新流程失败，请重试：" .. tostring(failure))
+        local message = "更新流程失败，请重试或前往官网下载：" .. tostring(failure)
+        update_shared_status(win, message)
+        show_subfix_update_confirm(nil, message)
     end
 end
 

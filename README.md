@@ -1,18 +1,22 @@
-# SubFix v3.3.9
+# SubFix v3.4.0
 
 DaVinci Resolve 字幕插件。口播、现场、单段和批量字幕生成统一使用 v5。
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/HooperH/SubFix/releases/latest) 下载完整安装 ZIP，解压并打开 pkg。支持 Apple Silicon Mac，沿用未签名安装方式。首次使用本地 Qwen 识别仍需联网安装识别依赖和模型。
+从 [SubFix 官网](https://subfix-by-hooper.ysjf.chatgpt.site/) 下载 `SubFix-v3.4.0-macOS.pkg`，退出 Resolve 后覆盖安装，再重新打开插件。支持 Apple Silicon Mac，安装包未签名。
+
+**3.3.9 及更早版本升级到 3.4.0 必须安装完整 PKG。** 旧更新器不能接收新增模型中心文件，本次不提供插件内更新 ZIP。无需先卸载，已有配置和模型保留。
+
+基础安装包不包含模型权重。完整版的“模型中心”集中管理 Qwen 0.6B / 1.7B 与共享对齐模型，支持按需下载和离线导入；简洁版保持字幕查找功能。
 
 ## 源码与构建
 
 本快照包含插件运行代码和安装包构建脚本。私人字幕、项目样本、开发记录和依赖这些样本的内部测试不在公开快照中。旧副本和平台缓存需要单独处理，不能保证已下载的资料被收回。
 
-完整构建使用 `build_subfix_test_package.sh`，需要设置 `ALIGNER_MODEL` 为 Qwen 强制对齐 GGUF 模型路径，`QWEN_BUILD` 为编译好的 qwen3-asr.cpp 运行时目录，并设置 `VERSION=3.3.9`。脚本内置 Python 与 FFmpeg 下载、校验和打包流程。 `build_pkg.sh` 仅生成轻量包。
+完整构建使用 `build_subfix_test_package.sh`，需要 `.subfix_support/qwen3-asr.cpp/build` 中已编译的 Qwen 运行时，并设置 `VERSION=3.4.0`。不需要把模型权重放入安装载荷。脚本内置 Python 与 FFmpeg 下载、校验和打包流程。 `build_pkg.sh` 仅生成轻量包。
 
-v5 复用了 `subfix_generate_v4.py` 中的基础算法；文件名不代表仍可选择旧引擎。公开配置不包含原始训练字幕，保留运行所需的模型权重。
+v5 复用了 `subfix_generate_v4.py` 中的基础算法；文件名不代表仍可选择旧引擎。公开配置不包含原始训练字幕，保留已公开的运行配置。模型权重独立分发。
 
 ## AI 工作台
 

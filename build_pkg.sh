@@ -13,6 +13,9 @@ IDENTIFIER="${IDENTIFIER:-com.mediastorm.subfix}"
 SOURCE_FILE="${SOURCE_FILE:-${SCRIPT_DIR}/SubFix.lua}"
 GENERATOR_FILE="${GENERATOR_FILE:-${SCRIPT_DIR}/生成选区字幕.lua}"
 GENERATE_CORE_FILE="${GENERATE_CORE_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_generate_selection_core.lua}"
+MODEL_MANAGER_FILE="${MODEL_MANAGER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_model_manager.py}"
+MODEL_CENTER_FILE="${MODEL_CENTER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_model_center.lua}"
+MODEL_DOWNLOADS_FILE="${MODEL_DOWNLOADS_FILE:-${SCRIPT_DIR}/.subfix_support/model-downloads.json}"
 PROCESS_GROUP_FILE="${PROCESS_GROUP_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_process_group.py}"
 UPDATE_HELPER_FILE="${UPDATE_HELPER_FILE:-${SCRIPT_DIR}/.subfix_support/subfix_update.py}"
 ASR_HELPER_FILE="${ASR_HELPER_FILE:-${SCRIPT_DIR}/subfix_asr_transcribe.py}"
@@ -48,7 +51,7 @@ OUTPUT_ZIP_PATH="${RELEASE_ROOT}/${OUTPUT_ZIP_NAME}"
 
 echo "📦 开始构建 ${PKG_NAME} v${VERSION} 安装包..."
 
-for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$GENERATE_TEXTNORM_FILE" "$QWEN_LOCAL_MANAGER_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
+for required in "$SOURCE_FILE" "$GENERATOR_FILE" "$GENERATE_CORE_FILE" "$MODEL_MANAGER_FILE" "$MODEL_CENTER_FILE" "$PROCESS_GROUP_FILE" "$UPDATE_HELPER_FILE" "$ASR_HELPER_FILE" "$GENERATE_V4_FILE" "$GENERATE_V5_FILE" "$GENERATE_TEXTNORM_FILE" "$QWEN_LOCAL_MANAGER_FILE" "$ASR_SETUP_FILE" "$SEGMENTATION_PROFILE_FILE" "$SEGMENTATION_PROFILE_V3_FILE" "$SEGMENTATION_PROFILE_V4_FILE"; do
     if [ ! -f "$required" ]; then
         echo "❌ 错误：源文件不存在：$required"
         exit 1
@@ -64,6 +67,11 @@ echo "📄 拷贝源文件到安装载荷目录..."
 cp "$SOURCE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/SubFix.lua"
 cp "$GENERATOR_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/SubFix/生成选区字幕.lua"
 cp "$GENERATE_CORE_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_generate_selection_core.lua"
+cp "$MODEL_MANAGER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_model_manager.py"
+cp "$MODEL_CENTER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_model_center.lua"
+if [[ -f "$MODEL_DOWNLOADS_FILE" ]]; then
+    cp "$MODEL_DOWNLOADS_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/model-downloads.json"
+fi
 cp "$PROCESS_GROUP_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_process_group.py"
 cp "$UPDATE_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_update.py"
 cp "$ASR_HELPER_FILE" "$PAYLOAD_DIR/${INSTALL_PATH}/.subfix_support/subfix_asr_transcribe.py"
@@ -142,6 +150,11 @@ echo "📦 整理分发目录..."
 cp "$SOURCE_FILE" "${RELEASE_DIR}/SubFix/SubFix.lua"
 cp "$GENERATOR_FILE" "${RELEASE_DIR}/SubFix/生成选区字幕.lua"
 cp "$GENERATE_CORE_FILE" "${RELEASE_DIR}/.subfix_support/subfix_generate_selection_core.lua"
+cp "$MODEL_MANAGER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_model_manager.py"
+cp "$MODEL_CENTER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_model_center.lua"
+if [[ -f "$MODEL_DOWNLOADS_FILE" ]]; then
+    cp "$MODEL_DOWNLOADS_FILE" "${RELEASE_DIR}/.subfix_support/model-downloads.json"
+fi
 cp "$PROCESS_GROUP_FILE" "${RELEASE_DIR}/.subfix_support/subfix_process_group.py"
 cp "$UPDATE_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_update.py"
 cp "$ASR_HELPER_FILE" "${RELEASE_DIR}/.subfix_support/subfix_asr_transcribe.py"

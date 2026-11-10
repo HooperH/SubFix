@@ -1540,11 +1540,9 @@ def test_track_switch_keeps_timeline_update_target_in_sync():
 def test_update_timeline_allows_explicit_different_target_track():
     update_body = body_between(
         "update_timeline = function()",
-        "local rootFolder = mediaPool:GetRootFolder()",
+        "local unique_id",
     )
-    srt_pos = update_body.index("local unique_id")
-
-    assert "current_track ~= current_subtitle_target_track" not in update_body[:srt_pos]
+    assert "current_track ~= current_subtitle_target_track" not in update_body
     assert "ensure_subtitle_track_exists(current_subtitle_target_track" in SOURCE
     assert "isolate_subtitle_target_track(current_subtitle_target_track" in SOURCE
     assert "detect_subtitle_track_delta(before_snapshot, final_after_snapshot)" in SOURCE

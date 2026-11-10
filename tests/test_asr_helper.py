@@ -25,7 +25,7 @@ def load_helper_module():
     return module
 
 
-def test_qwen_asr_loader_does_not_initialize_python_forced_aligner(monkeypatch):
+def test_qwen_asr_loader_does_not_initialize_python_forced_aligner(monkeypatch, tmp_path):
     helper = load_helper_module()
     calls = []
 
@@ -37,9 +37,14 @@ def test_qwen_asr_loader_does_not_initialize_python_forced_aligner(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(bfloat16="bfloat16"))
     monkeypatch.setitem(sys.modules, "qwen_asr", types.SimpleNamespace(Qwen3ASRModel=FakeQwen3ASRModel))
+    local_model = tmp_path / "asr-model"
+    monkeypatch.setattr(helper, "resolve_local_qwen3_asr_model", lambda _model: local_model)
+    monkeypatch.setattr(helper, "resolve_qwen3_cpp_paths", lambda: (tmp_path / "aligner", tmp_path / "aligner.gguf"))
     helper.load_qwen3_asr_model("Qwen/Qwen3-ASR-1.7B")
 
     assert len(calls) == 1
+    assert calls[0][0] == str(local_model)
+    assert calls[0][1]["local_files_only"] is True
     assert calls[0][1]["max_inference_batch_size"] == 1
     assert "forced_aligner" not in calls[0][1]
     assert "forced_aligner_kwargs" not in calls[0][1]
@@ -171,7 +176,7 @@ def test_qwen_empty_worker_result_does_not_start_gguf(monkeypatch, tmp_path):
     assert payload["segments"] == []
 
 
-def test_qwen_force_align_items_uses_the_bundled_gguf_helper(monkeypatch, tmp_path):
+def test_qwen_force_align_items_uses_the_local_gguf_helper(monkeypatch, tmp_path):
     helper = load_helper_module()
     audio = tmp_path / "alignment.wav"
     audio.touch()
@@ -179,9 +184,9 @@ def test_qwen_force_align_items_uses_the_bundled_gguf_helper(monkeypatch, tmp_pa
 
     def fake_cpp_align(path, text, language, work_dir):
         calls.append((path, text, language, work_dir))
-        return [{"word": "离线", "start": 0.10, "end": 0.40}]
+        return [{"word": "离线", "start": 0.10, "end": 0.40}], {}
 
-    monkeypatch.setattr(helper, "qwen3_cpp_force_align_items", fake_cpp_align)
+    monkeypatch.setattr(helper, "run_qwen3_cpp_alignment", fake_cpp_align)
 
     assert helper.qwen3_force_align_items(audio, "离线", "Chinese") == [
         {"text": "离线", "start": 0.10, "end": 0.40}
@@ -195,8 +200,8 @@ def test_v4_alignment_fallback_expands_real_gguf_parser_shape(monkeypatch, tmp_p
     audio.touch()
     monkeypatch.setattr(
         helper,
-        "qwen3_cpp_force_align_items",
-        lambda *_args: [{"word": "离线", "start": 0.10, "end": 0.40}],
+        "run_qwen3_cpp_alignment",
+        lambda *_args: ([{"word": "离线", "start": 0.10, "end": 0.40}], {}),
     )
 
     units, diagnostic = helper.generate_v4.require_aligned_units(

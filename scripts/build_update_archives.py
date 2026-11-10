@@ -29,6 +29,8 @@ LEGACY_FILE_PATHS = frozenset({
 })
 FULL_ONLY_FILE_PATHS = frozenset({
     ".subfix_support/subfix_process_group.py",
+    ".subfix_support/subfix_model_manager.py", ".subfix_support/subfix_model_center.lua",
+    ".subfix_support/model-downloads.json",
     ".subfix_support/bin/ffmpeg", ".subfix_support/licenses/FFmpeg-LGPL-2.1.txt",
 })
 

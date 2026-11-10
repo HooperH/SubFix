@@ -40,7 +40,7 @@ class EnvironmentLocationTests(unittest.TestCase):
 
     def test_lua_manager_launches_suppress_runtime_bytecode_writes(self):
         source = (ROOT / ".subfix_support/subfix_generate_selection_core.lua").read_text()
-        for name in ["build_qwen_status_command", "build_qwen_install_command"]:
+        for name in ["build_qwen_status_command", "perform_model_center_action"]:
             body = source.split("local function " + name, 1)[1].split("\nend", 1)[0]
             self.assertIn('"PYTHONDONTWRITEBYTECODE=1"', body)
             self.assertIn('"-B"', body)

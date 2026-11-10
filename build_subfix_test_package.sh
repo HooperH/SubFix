@@ -21,7 +21,6 @@ SUPPORT_PAYLOAD="$PAYLOAD_DIR/$INSTALL_PATH/.subfix_support"
 
 PYTHON_RUNTIME_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260718/cpython-3.12.13%2B20260718-aarch64-apple-darwin-install_only.tar.gz"
 PYTHON_RUNTIME_SHA256="62aeee6161d57303a71a138b75fd5cc6fb8c89c4b1d9c7f0a052d89fa0b6652b"
-ALIGNER_MODEL="${ALIGNER_MODEL:-$SCRIPT_DIR/.subfix_support/models/qwen3-forced-aligner-0.6b-f16.gguf}"
 QWEN_BUILD="${QWEN_BUILD:-$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp/build}"
 USER_INSTALL_SCRIPT="$SCRIPT_DIR/scripts/install_subfix_for_user.sh"
 FFMPEG_BUILD_SCRIPT="$SCRIPT_DIR/scripts/build_bundled_ffmpeg.sh"
@@ -37,6 +36,8 @@ for required in \
   "$SCRIPT_DIR/.subfix_support/subfix_generate_selection_core.lua" \
   "$SCRIPT_DIR/.subfix_support/subfix_update.py" \
   "$SCRIPT_DIR/.subfix_support/subfix_qwen_local_manager.py" \
+  "$SCRIPT_DIR/.subfix_support/subfix_model_manager.py" \
+  "$SCRIPT_DIR/.subfix_support/subfix_model_center.lua" \
   "$SCRIPT_DIR/.subfix_support/subfix_process_group.py" \
   "$SCRIPT_DIR/subfix_asr_transcribe.py" \
   "$SCRIPT_DIR/subfix_generate_v4.py" \
@@ -45,7 +46,6 @@ for required in \
   "$SCRIPT_DIR/setup_asr_env.sh" \
   "$USER_INSTALL_SCRIPT" \
   "$FFMPEG_BUILD_SCRIPT" \
-  "$ALIGNER_MODEL" \
   "$QWEN_BUILD/qwen3-asr-cli"; do
   [[ -f "$required" ]] || { echo "❌ 缺少发行文件：$required" >&2; exit 1; }
 done
@@ -70,19 +70,18 @@ mkdir -p "$SUPPORT_PAYLOAD" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix" "$PKG_SCRIPTS_DI
 
 cp "$SCRIPT_DIR/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua"
 cp "$SCRIPT_DIR/生成选区字幕.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua"
-for helper in subfix_generate_selection_core.lua subfix_update.py subfix_qwen_local_manager.py subfix_process_group.py segmentation_profile.json segmentation_profile_v3.json segmentation_profile_v4.json; do
+for helper in subfix_generate_selection_core.lua subfix_update.py subfix_qwen_local_manager.py subfix_model_manager.py subfix_model_center.lua subfix_process_group.py segmentation_profile.json segmentation_profile_v3.json segmentation_profile_v4.json; do
   cp "$SCRIPT_DIR/.subfix_support/$helper" "$SUPPORT_PAYLOAD/$helper"
 done
+if [[ -f "$SCRIPT_DIR/.subfix_support/model-downloads.json" ]]; then
+  cp "$SCRIPT_DIR/.subfix_support/model-downloads.json" "$SUPPORT_PAYLOAD/model-downloads.json"
+fi
 for helper in subfix_asr_transcribe.py subfix_generate_v4.py subfix_generate_v5.py subfix_generate_textnorm.py setup_asr_env.sh; do
   cp "$SCRIPT_DIR/$helper" "$SUPPORT_PAYLOAD/$helper"
 done
 mkdir -p "$SUPPORT_PAYLOAD/runtime"
 cp -R "$RUNTIME_DIR" "$SUPPORT_PAYLOAD/runtime/python"
-# Bytecode may embed the build machine's absolute paths; ship Python sources.
-find "$SUPPORT_PAYLOAD/runtime/python" -type f -name '*.pyc' -delete
 cp -R "$QWEN_BIN_DIR" "$SUPPORT_PAYLOAD/bin"
-mkdir -p "$SUPPORT_PAYLOAD/models"
-cp "$ALIGNER_MODEL" "$SUPPORT_PAYLOAD/models/qwen3-forced-aligner-0.6b-f16.gguf"
 mkdir -p "$SUPPORT_PAYLOAD/licenses" "$RELEASE_DIR/第三方许可"
 cp "$FFMPEG_STAGE_DIR/ffmpeg" "$SUPPORT_PAYLOAD/bin/ffmpeg"
 cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$SUPPORT_PAYLOAD/licenses/FFmpeg-LGPL-2.1.txt"
@@ -90,7 +89,7 @@ cp "$FFMPEG_STAGE_DIR/FFmpeg-LGPL-2.1.txt" "$RELEASE_DIR/第三方许可/FFmpeg-
 cp "$FFMPEG_STAGE_DIR/FFmpeg-BUILD-INFO.txt" "$RELEASE_DIR/第三方许可/FFmpeg-BUILD-INFO.txt"
 cp "$FFMPEG_STAGE_DIR/ffmpeg-9.0.tar.xz" "$RELEASE_DIR/第三方许可/ffmpeg-9.0.tar.xz"
 chmod 755 "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/SubFix.lua" "$PAYLOAD_DIR/$INSTALL_PATH/SubFix/生成选区字幕.lua" \
-  "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/subfix_process_group.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli" "$SUPPORT_PAYLOAD/bin/ffmpeg"
+  "$SUPPORT_PAYLOAD/setup_asr_env.sh" "$SUPPORT_PAYLOAD/subfix_asr_transcribe.py" "$SUPPORT_PAYLOAD/subfix_qwen_local_manager.py" "$SUPPORT_PAYLOAD/subfix_model_manager.py" "$SUPPORT_PAYLOAD/subfix_process_group.py" "$SUPPORT_PAYLOAD/bin/qwen3-asr-cli" "$SUPPORT_PAYLOAD/bin/ffmpeg"
 
 cat > "$PKG_SCRIPTS_DIR/preinstall" <<'EOF'
 #!/bin/bash
@@ -104,6 +103,7 @@ chmod 755 "$PKG_SCRIPTS_DIR/preinstall"
 cp "$USER_INSTALL_SCRIPT" "$PKG_SCRIPTS_DIR/postinstall"
 chmod 755 "$PKG_SCRIPTS_DIR/postinstall"
 
+find "$SUPPORT_PAYLOAD/runtime" -name "*.pyc" -delete
 PYTHONDONTWRITEBYTECODE=1 "$RUNTIME_DIR/bin/python3" "$SCRIPT_DIR/scripts/check_release_privacy.py" "$PAYLOAD_DIR"
 pkgbuild --root "$PAYLOAD_DIR" --scripts "$PKG_SCRIPTS_DIR" --identifier com.mediastorm.subfix.beta \
   --version "$VERSION" --install-location / --quiet "$PKG_PATH"

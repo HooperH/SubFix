@@ -42,12 +42,14 @@ def dialog(run_lua, tmp_path):
     """
     support += section("local function normalize_doubao_backend(", "local function load_generate_hotword_entries(")
     run_lua(support + """
+        local runtime_options = {}
         save_engine = save_last_engine_backend
         save_doubao = save_doubao_backend_preference
         local TRACK_CHECKED_MARK, TRACK_UNCHECKED_MARK = 'yes', 'no'
         local function resolve_asr_paths() return {hotwords = 'hotwords.json'} end
         local function load_generate_hotword_entries() return entries or {{term = 'SubFix'}} end
-        local function inspect_local_qwen() return {ready = true} end
+        local function inspect_local_qwen() return {ready = true, aligner = "/test/aligner.gguf"} end
+        local function file_exists(path) return path == "/test/aligner.gguf" end
         local function format_audio_source_label() return 'A1' end
         local function set_tree_item_text(item, column, text)
             item.Text = item.Text or {}; item.Text[column] = text

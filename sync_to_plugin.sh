@@ -10,6 +10,9 @@ SOURCE_LUA="$SCRIPT_DIR/SubFix.lua"
 SOURCE_GENERATOR_LUA="$SCRIPT_DIR/生成选区字幕.lua"
 SOURCE_GENERATE_CORE="$SCRIPT_DIR/.subfix_support/subfix_generate_selection_core.lua"
 SOURCE_QWEN_LOCAL_MANAGER="$SCRIPT_DIR/.subfix_support/subfix_qwen_local_manager.py"
+SOURCE_MODEL_MANAGER="$SCRIPT_DIR/.subfix_support/subfix_model_manager.py"
+SOURCE_MODEL_CENTER="$SCRIPT_DIR/.subfix_support/subfix_model_center.lua"
+SOURCE_MODEL_DOWNLOADS="$SCRIPT_DIR/.subfix_support/model-downloads.json"
 SOURCE_PROCESS_GROUP="$SCRIPT_DIR/.subfix_support/subfix_process_group.py"
 SOURCE_UPDATE_HELPER="$SCRIPT_DIR/.subfix_support/subfix_update.py"
 SOURCE_ASR_HELPER="$SCRIPT_DIR/subfix_asr_transcribe.py"
@@ -21,7 +24,6 @@ SOURCE_SEGMENTATION_PROFILE="$SCRIPT_DIR/.subfix_support/segmentation_profile.js
 SOURCE_SEGMENTATION_PROFILE_V3="$SCRIPT_DIR/.subfix_support/segmentation_profile_v3.json"
 SOURCE_SEGMENTATION_PROFILE_V4="$SCRIPT_DIR/.subfix_support/segmentation_profile_v4.json"
 SOURCE_QWEN_CPP_DIR="$SCRIPT_DIR/.subfix_support/qwen3-asr.cpp"
-SOURCE_QWEN_MODELS_DIR="$SCRIPT_DIR/.subfix_support/models"
 # 豆包云端 ASR 真实 API Key（可选，未纳入 git；仅单字段格式才复制到插件目录）。
 SOURCE_DOUBAO_CREDENTIALS="$SCRIPT_DIR/.subfix_support/doubao_credentials.json"
 
@@ -47,13 +49,15 @@ validate_confirmed_dialog_layouts() {
 }
 
 link_qwen_support() {
-  if [[ -x "$SOURCE_QWEN_CPP_DIR/build/qwen3-asr-cli" ]]; then
-    rm -rf "$HELPER_DIR/qwen3-asr.cpp" 2>/dev/null || true
+  if [[ -x "$SOURCE_QWEN_CPP_DIR/build/qwen3-asr-cli" && ! -e "$HELPER_DIR/qwen3-asr.cpp" && ! -L "$HELPER_DIR/qwen3-asr.cpp" ]]; then
     ln -s "$SOURCE_QWEN_CPP_DIR" "$HELPER_DIR/qwen3-asr.cpp" 2>/dev/null || true
   fi
-  if compgen -G "$SOURCE_QWEN_MODELS_DIR/qwen3-forced-aligner-0.6b-*.gguf" > /dev/null; then
-    rm -rf "$HELPER_DIR/models" 2>/dev/null || true
-    ln -s "$SOURCE_QWEN_MODELS_DIR" "$HELPER_DIR/models" 2>/dev/null || true
+  # Model files belong to the user; source sync only deploys plugin code/runtime.
+}
+
+copy_model_downloads_if_present() {
+  if [[ -f "$SOURCE_MODEL_DOWNLOADS" ]]; then
+    cp "$SOURCE_MODEL_DOWNLOADS" "$HELPER_DIR/model-downloads.json"
   fi
 }
 
@@ -82,7 +86,7 @@ echo "🔄 正在同步到 DaVinci Resolve 插件目录..."
 echo "📁 源文件: $SOURCE_LUA"
 echo "📁 目标: $SUBFIX_MENU_DIR/SubFix.lua"
 
-for required in "$SOURCE_LUA" "$SOURCE_GENERATOR_LUA" "$SOURCE_GENERATE_CORE" "$SOURCE_QWEN_LOCAL_MANAGER" "$SOURCE_PROCESS_GROUP" "$SOURCE_UPDATE_HELPER" "$SOURCE_ASR_HELPER" "$SOURCE_GENERATE_V4" "$SOURCE_GENERATE_V5" "$SOURCE_GENERATE_TEXTNORM" "$SOURCE_ASR_SETUP" "$SOURCE_SEGMENTATION_PROFILE" "$SOURCE_SEGMENTATION_PROFILE_V3" "$SOURCE_SEGMENTATION_PROFILE_V4"; do
+for required in "$SOURCE_LUA" "$SOURCE_GENERATOR_LUA" "$SOURCE_GENERATE_CORE" "$SOURCE_QWEN_LOCAL_MANAGER" "$SOURCE_MODEL_MANAGER" "$SOURCE_MODEL_CENTER" "$SOURCE_PROCESS_GROUP" "$SOURCE_UPDATE_HELPER" "$SOURCE_ASR_HELPER" "$SOURCE_GENERATE_V4" "$SOURCE_GENERATE_V5" "$SOURCE_GENERATE_TEXTNORM" "$SOURCE_ASR_SETUP" "$SOURCE_SEGMENTATION_PROFILE" "$SOURCE_SEGMENTATION_PROFILE_V3" "$SOURCE_SEGMENTATION_PROFILE_V4"; do
   if [[ ! -f "$required" ]]; then
     echo "❌ 未找到源文件: $required"
     exit 1
@@ -99,6 +103,8 @@ if cp "$SOURCE_LUA" "$SUBFIX_MENU_DIR/SubFix.lua" \
   && cp "$SOURCE_GENERATOR_LUA" "$SUBFIX_MENU_DIR/生成选区字幕.lua" \
   && cp "$SOURCE_GENERATE_CORE" "$HELPER_DIR/subfix_generate_selection_core.lua" \
   && cp "$SOURCE_QWEN_LOCAL_MANAGER" "$HELPER_DIR/subfix_qwen_local_manager.py" \
+  && cp "$SOURCE_MODEL_MANAGER" "$HELPER_DIR/subfix_model_manager.py" \
+  && cp "$SOURCE_MODEL_CENTER" "$HELPER_DIR/subfix_model_center.lua" \
   && cp "$SOURCE_PROCESS_GROUP" "$HELPER_DIR/subfix_process_group.py" \
   && cp "$SOURCE_UPDATE_HELPER" "$HELPER_DIR/subfix_update.py" \
   && cp "$SOURCE_ASR_HELPER" "$HELPER_DIR/subfix_asr_transcribe.py" \
@@ -108,8 +114,9 @@ if cp "$SOURCE_LUA" "$SUBFIX_MENU_DIR/SubFix.lua" \
   && cp "$SOURCE_ASR_SETUP" "$HELPER_DIR/setup_asr_env.sh" \
   && cp "$SOURCE_SEGMENTATION_PROFILE" "$HELPER_DIR/segmentation_profile.json" \
   && cp "$SOURCE_SEGMENTATION_PROFILE_V3" "$HELPER_DIR/segmentation_profile_v3.json" \
-  && cp "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" 2>/dev/null; then
-  chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" "$HELPER_DIR/subfix_process_group.py" 2>/dev/null || true
+  && cp "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" \
+  && copy_model_downloads_if_present 2>/dev/null; then
+  chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" "$HELPER_DIR/subfix_model_manager.py" "$HELPER_DIR/subfix_process_group.py" 2>/dev/null || true
   link_qwen_support
   copy_doubao_credentials_if_present
   rm -f "$RESOLVE_DIR/SubFix.lua" "$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua" "$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua" "$RESOLVE_DIR/subfix_asr_transcribe.py" "$RESOLVE_DIR/setup_asr_env.sh" 2>/dev/null || true
@@ -130,6 +137,8 @@ if command -v rsync &> /dev/null; then
     && rsync -av "$SOURCE_GENERATOR_LUA" "$SUBFIX_MENU_DIR/生成选区字幕.lua" \
     && rsync -av "$SOURCE_GENERATE_CORE" "$HELPER_DIR/subfix_generate_selection_core.lua" \
     && rsync -av "$SOURCE_QWEN_LOCAL_MANAGER" "$HELPER_DIR/subfix_qwen_local_manager.py" \
+    && rsync -av "$SOURCE_MODEL_MANAGER" "$HELPER_DIR/subfix_model_manager.py" \
+    && rsync -av "$SOURCE_MODEL_CENTER" "$HELPER_DIR/subfix_model_center.lua" \
     && rsync -av "$SOURCE_PROCESS_GROUP" "$HELPER_DIR/subfix_process_group.py" \
     && rsync -av "$SOURCE_UPDATE_HELPER" "$HELPER_DIR/subfix_update.py" \
     && rsync -av "$SOURCE_ASR_HELPER" "$HELPER_DIR/subfix_asr_transcribe.py" \
@@ -139,8 +148,9 @@ if command -v rsync &> /dev/null; then
     && rsync -av "$SOURCE_ASR_SETUP" "$HELPER_DIR/setup_asr_env.sh" \
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE" "$HELPER_DIR/segmentation_profile.json" \
     && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V3" "$HELPER_DIR/segmentation_profile_v3.json" \
-    && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" 2>/dev/null; then
-    chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" "$HELPER_DIR/subfix_process_group.py" 2>/dev/null || true
+    && rsync -av "$SOURCE_SEGMENTATION_PROFILE_V4" "$HELPER_DIR/segmentation_profile_v4.json" \
+    && copy_model_downloads_if_present 2>/dev/null; then
+    chmod +x "$HELPER_DIR/setup_asr_env.sh" "$HELPER_DIR/subfix_asr_transcribe.py" "$HELPER_DIR/subfix_qwen_local_manager.py" "$HELPER_DIR/subfix_model_manager.py" "$HELPER_DIR/subfix_process_group.py" 2>/dev/null || true
     link_qwen_support
     copy_doubao_credentials_if_present
     rm -f "$RESOLVE_DIR/SubFix.lua" "$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua" "$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua" "$RESOLVE_DIR/subfix_asr_transcribe.py" "$RESOLVE_DIR/setup_asr_env.sh" 2>/dev/null || true
@@ -173,6 +183,8 @@ echo "cp \"$SOURCE_LUA\" \"$SUBFIX_MENU_DIR/SubFix.lua\""
 echo "cp \"$SOURCE_GENERATOR_LUA\" \"$SUBFIX_MENU_DIR/生成选区字幕.lua\""
 echo "cp \"$SOURCE_GENERATE_CORE\" \"$HELPER_DIR/subfix_generate_selection_core.lua\""
 echo "cp \"$SOURCE_QWEN_LOCAL_MANAGER\" \"$HELPER_DIR/subfix_qwen_local_manager.py\""
+echo "cp \"$SOURCE_MODEL_MANAGER\" \"$HELPER_DIR/subfix_model_manager.py\""
+echo "cp \"$SOURCE_MODEL_CENTER\" \"$HELPER_DIR/subfix_model_center.lua\""
 echo "cp \"$SOURCE_PROCESS_GROUP\" \"$HELPER_DIR/subfix_process_group.py\""
 echo "cp \"$SOURCE_UPDATE_HELPER\" \"$HELPER_DIR/subfix_update.py\""
 echo "cp \"$SOURCE_ASR_HELPER\" \"$HELPER_DIR/subfix_asr_transcribe.py\""
@@ -183,8 +195,7 @@ echo "cp \"$SOURCE_ASR_SETUP\" \"$HELPER_DIR/setup_asr_env.sh\""
 echo "cp \"$SOURCE_SEGMENTATION_PROFILE\" \"$HELPER_DIR/segmentation_profile.json\""
 echo "cp \"$SOURCE_SEGMENTATION_PROFILE_V3\" \"$HELPER_DIR/segmentation_profile_v3.json\""
 echo "cp \"$SOURCE_SEGMENTATION_PROFILE_V4\" \"$HELPER_DIR/segmentation_profile_v4.json\""
-echo "ln -sfn \"$SOURCE_QWEN_CPP_DIR\" \"$HELPER_DIR/qwen3-asr.cpp\""
-echo "ln -sfn \"$SOURCE_QWEN_MODELS_DIR\" \"$HELPER_DIR/models\""
+echo "# 已有运行引擎和模型目录保持不变；缺少模型时在插件模型中心下载或导入。"
 echo "rm -f \"$RESOLVE_DIR/SubFix.lua\" \"$RESOLVE_DIR/SubFix_GenerateSelectionSubtitles.lua\" \"$SUBFIX_MENU_DIR/SubFix_GenerateSelectionSubtitles.lua\" \"$RESOLVE_DIR/subfix_asr_transcribe.py\" \"$RESOLVE_DIR/setup_asr_env.sh\""
 echo "rm -rf \"$RESOLVE_DIR/__pycache__\""
 exit 1

@@ -369,7 +369,7 @@ local function resolve_asr_paths()
     local user_runtime_python = user_support_dir .. "/runtime/python/bin/python3"
     local paths = {
         helper = helper_dir .. "/subfix_asr_transcribe.py",
-        qwen_manager = helper_dir .. "/subfix_qwen_local_manager.py",
+        qwen_manager = helper_dir .. "/subfix_model_manager.py",
         process_group = helper_dir .. "/subfix_process_group.py",
         setup = helper_dir .. "/setup_asr_env.sh",
         python = helper_dir .. "/.subfix_asr_env/bin/python",
@@ -385,7 +385,7 @@ local function resolve_asr_paths()
     end
     if not file_exists(paths.helper) and file_exists(root .. "/subfix_asr_transcribe.py") then
         paths.helper = root .. "/subfix_asr_transcribe.py"
-        paths.qwen_manager = root .. "/subfix_qwen_local_manager.py"
+        paths.qwen_manager = root .. "/subfix_model_manager.py"
         paths.process_group = root .. "/subfix_process_group.py"
         paths.setup = root .. "/setup_asr_env.sh"
         paths.python = root .. "/.subfix_asr_env/bin/python"
@@ -394,7 +394,7 @@ local function resolve_asr_paths()
     local module_dir = script_dir()
     if not file_exists(paths.helper) and file_exists(module_dir .. "/subfix_asr_transcribe.py") then
         paths.helper = module_dir .. "/subfix_asr_transcribe.py"
-        paths.qwen_manager = module_dir .. "/subfix_qwen_local_manager.py"
+        paths.qwen_manager = module_dir .. "/subfix_model_manager.py"
         paths.process_group = module_dir .. "/subfix_process_group.py"
         paths.setup = module_dir .. "/setup_asr_env.sh"
         paths.python = module_dir .. "/.subfix_asr_env/bin/python"
@@ -411,7 +411,7 @@ end
 
 local function build_qwen_status_command(paths, output_path)
     if not paths or not file_exists(paths.runtime_python) or not file_exists(paths.qwen_manager) then
-        return nil, "未找到本地 Qwen 安装管理器"
+        return nil, "模型中心组件缺失，请安装最新完整 SubFix 安装包"
     end
     return table.concat({
         "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
@@ -430,16 +430,6 @@ local function inspect_local_qwen(paths)
     if type(payload) ~= "table" then return {state = "missing", ready = false} end
     payload.ready = payload.ready == true
     return payload
-end
-
-local function build_qwen_install_command(paths, output_path, progress_path)
-    if not file_exists(paths.runtime_python) then return nil, "未找到 SubFix 内置 Python" end
-    if not file_exists(paths.qwen_manager) then return nil, "缺少本地 Qwen 安装管理器" end
-    return table.concat({
-        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
-        "--action", "install", "--output", shell_quote(output_path),
-        "--progress-json", shell_quote(progress_path),
-    }, " "), nil
 end
 
 -- 豆包（火山引擎）云端 ASR 密钥文件路径：必须与「实际被执行的」
@@ -562,51 +552,6 @@ local function save_doubao_backend_preference(backend)
     local data = read_generate_preferences()
     data.doubao_backend = normalize_doubao_backend(backend)
     return write_generate_preferences(data)
-end
-
-local function load_generate_hotword_entries()
-    local text = read_text_file(resolve_asr_paths().hotwords)
-    local payload = text and decode_json_text(text) or nil
-    local raw_entries = type(payload) == "table" and payload.entries or {}
-    if type(raw_entries) ~= "table" then return {} end
-    local entries, seen_terms = {}, {}
-    for _, raw_entry in ipairs(raw_entries) do
-        if type(raw_entry) == "table" then
-            local term = trim_text(tostring(raw_entry.term or ""))
-            if term ~= "" and not seen_terms[term] then
-                local aliases, seen_aliases = {}, {}
-                if type(raw_entry.aliases) == "table" then
-                    for _, raw_alias in ipairs(raw_entry.aliases) do
-                        local alias = trim_text(tostring(raw_alias or ""))
-                        if alias ~= "" and alias ~= term and not seen_aliases[alias] then
-                            aliases[#aliases + 1] = alias
-                            seen_aliases[alias] = true
-                        end
-                    end
-                end
-                entries[#entries + 1] = {term = term, aliases = aliases}
-                seen_terms[term] = true
-            end
-        end
-    end
-    return entries
-end
-
-local function save_generate_hotword_entries(entries)
-    local path = resolve_asr_paths().hotwords
-    local parts = {}
-    for _, entry in ipairs(entries or {}) do
-        local aliases = {}
-        for _, alias in ipairs(entry.aliases or {}) do
-            aliases[#aliases + 1] = '"' .. json_escape(alias) .. '"'
-        end
-        parts[#parts + 1] = string.format(
-            '{"term":"%s","aliases":[%s]}',
-            json_escape(entry.term),
-            table.concat(aliases, ",")
-        )
-    end
-    return write_text_file(path, '{"version":1,"entries":[' .. table.concat(parts, ",") .. "]}\n")
 end
 
 local function load_generate_hotword_entries()
@@ -1977,7 +1922,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_LENGTH_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
     local SUBTITLE_LENGTH_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_length_index = 1
-    local generate_preferences = read_generate_preferences()
+    local generate_preferences = runtime_options.model_center_draft or read_generate_preferences()
     for index, option in ipairs(SUBTITLE_LENGTH_OPTIONS) do
         if option.max_chars == tonumber(generate_preferences.max_chars) then
             selected_length_index = index
@@ -1997,9 +1942,9 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local SUBTITLE_ENGINE_SELECTED_PREFIX = TRACK_CHECKED_MARK .. " "
     local SUBTITLE_ENGINE_UNSELECTED_PREFIX = TRACK_UNCHECKED_MARK .. " "
     local selected_engine_index = 1
-    local selected_doubao_backend = read_doubao_backend_preference()
+    local selected_doubao_backend = generate_preferences.doubao_backend or read_doubao_backend_preference()
     -- 记住上次选择的识别模型：命中偏好则默认选它（找不到/无偏好则保持默认 Qwen）。
-    local last_engine_backend = read_last_engine_backend()
+    local last_engine_backend = generate_preferences.last_engine_backend or read_last_engine_backend()
     if last_engine_backend == "doubao_asr" or last_engine_backend == "doubao_asr_v2" then
         selected_engine_index = 2
     elseif last_engine_backend then
@@ -2532,19 +2477,19 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     local qwen_download_window = dispatcher:AddWindow({
         ID = "GenerateQwenDownloadWindow",
-        WindowTitle = "SubFix · 安装本地 Qwen",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 330, 420, 100}),
+        WindowTitle = "SubFix · 模型准备",
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 330, 480, 180}),
     },
     ui:VGroup{
         Spacing = 8,
         ContentsMargins = 14,
-        ui:Label{ID = "GenerateQwenDownloadStatusLabel", Text = "本地 Qwen 识别需要下载运行环境与 Qwen3-ASR-1.7B 模型。", Weight = 0},
-        ui:Label{ID = "GenerateQwenDownloadDetailLabel", Text = "下载完成后会自动选中 Qwen；规整字幕长度无需下载。", Weight = 0},
+        ui:Label{ID = "GenerateQwenDownloadStatusLabel", Text = "请在模型中心准备需要的模型。", WordWrap = true, Weight = 0},
+        ui:Label{ID = "GenerateQwenDownloadDetailLabel", Text = "本地识别需要 ASR 和对齐模型；云端识别只需对齐模型。", WordWrap = true, Weight = 0},
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
             MinimumSize = {0, 34},
-            ui:Button{ID = "GenerateQwenDownloadConfirmBtn", Text = "下载并使用", Weight = 1, MinimumSize = {0, 28}},
+            ui:Button{ID = "GenerateQwenDownloadConfirmBtn", Text = "打开模型中心", Weight = 1, MinimumSize = {0, 28}},
             ui:Button{ID = "GenerateQwenDownloadCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
         }
     })
@@ -2558,17 +2503,17 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local function show_qwen_status(qwen_status)
         qwen_download_is_ready = qwen_status and qwen_status.ready == true
         if qwen_download_is_ready then
-            if qwen_download_status_label then qwen_download_status_label.Text = "本地 Qwen 已安装，可直接开始生成。" end
-            if qwen_download_detail_label then qwen_download_detail_label.Text = "Qwen3-ASR-1.7B 与运行环境均已就绪，无需重复下载。" end
+            if qwen_download_status_label then qwen_download_status_label.Text = "选中的本地模型与对齐模型已就绪。" end
+            if qwen_download_detail_label then qwen_download_detail_label.Text = "可在模型中心切换识别模型或导入已有模型。" end
             if qwen_download_confirm_btn then
-                qwen_download_confirm_btn.Text = "知道了"
+                qwen_download_confirm_btn.Text = "打开模型中心"
                 qwen_download_confirm_btn.Enabled = true
             end
         else
-            if qwen_download_status_label then qwen_download_status_label.Text = "本地 Qwen 识别需要下载运行环境与 Qwen3-ASR-1.7B 模型。" end
-            if qwen_download_detail_label then qwen_download_detail_label.Text = "下载完成后会自动选中 Qwen；规整字幕长度无需下载。" end
+            if qwen_download_status_label then qwen_download_status_label.Text = "当前功能需要的模型或运行环境尚未就绪。" end
+            if qwen_download_detail_label then qwen_download_detail_label.Text = "在模型中心下载或导入。云端识别只需要共享对齐模型。" end
             if qwen_download_confirm_btn then
-                qwen_download_confirm_btn.Text = "下载并使用"
+                qwen_download_confirm_btn.Text = "打开模型中心"
                 qwen_download_confirm_btn.Enabled = true
             end
         end
@@ -2587,10 +2532,15 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     function qwen_download_window.On.GenerateQwenDownloadConfirmBtn.Clicked(ev)
-        if qwen_download_is_ready then
-            pcall(function() qwen_download_window:Hide() end)
-            return
+        local draft_tracks = {}
+        for _, row in ipairs(track_rows) do
+            if row.checked then draft_tracks[#draft_tracks + 1] = row.source.track_index end
         end
+        runtime_options.model_center_draft = {
+            last_engine_backend = read_selected_backend(), doubao_backend = selected_doubao_backend,
+            max_chars = read_selected_max_chars(), hotwords_enabled = hotwords_enabled,
+            audio_track_count = #audio_sources, selected_audio_tracks = draft_tracks
+        }
         qwen_install_requested = true
         pcall(function() qwen_download_window:Hide() end)
         pcall(function() selection_window:Hide() end)
@@ -2717,12 +2667,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
         selected_hotwords_json = hotwords_enabled and resolve_asr_paths().hotwords or nil
-        if selected_backend == "auto" then
-            local qwen_status = inspect_local_qwen(resolve_asr_paths())
-            if not qwen_status.ready then
-                open_qwen_download_dialog()
-                return
-            end
+        local qwen_status = inspect_local_qwen(resolve_asr_paths())
+        if (selected_backend == "auto" and not qwen_status.ready)
+            or not file_exists(qwen_status.aligner or "") then
+            runtime_options.model_center_focus = selected_backend ~= "auto" and "qwen3-forced-aligner-0.6b" or nil
+            open_qwen_download_dialog()
+            return
         end
         -- 记住本次生成选项，下次打开对话框时恢复。
         local selected_audio_tracks = {}
@@ -2758,7 +2708,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     pcall(function() if hotword_clear_confirm_window then hotword_clear_confirm_window:Hide() end end)
 
     if qwen_install_requested then
-        return nil, nil, nil, nil, nil, "__subfix_install_qwen__"
+        return nil, nil, nil, nil, nil, "__subfix_model_center__"
     end
 
     if not selected_audio_sources and not dialog_cancelled then
@@ -3165,7 +3115,11 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     subtitle_mode = subtitle_mode == "live" and "live" or "narration"
     -- backend 由生成对话框的"识别模型"选择决定；缺省回退到 DEFAULT_ASR_BACKEND(auto/Qwen 本地)。
     local asr_backend = (type(backend) == "string" and backend ~= "") and backend or DEFAULT_ASR_BACKEND
+    if asr_backend == "auto" then asr_backend = "qwen3_asr" end
     local qwen_status = inspect_local_qwen(paths)
+    if not file_exists(qwen_status.aligner or "") then
+        return nil, "缺少对齐模型，请在模型中心下载或导入 Qwen3-ForcedAligner-0.6B"
+    end
     local python = paths.python
     if asr_backend == "doubao_asr" or asr_backend == "doubao_asr_v2" then
         -- 豆包负责转写，但 v4/v5 仍依赖 Qwen 做强制时间对齐。
@@ -3178,13 +3132,13 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
             end
         end
     elseif not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
-        return nil, "本地 Qwen 尚未安装，请先双击“Qwen（本地）”完成下载安装"
+        return nil, "所选本地模型尚未就绪，请在模型中心下载、导入或补全运行环境"
     else
         python = qwen_status.python
     end
     local generate_engine = resolve_generate_engine()
-    local cmd_parts = {}
-    if asr_backend == "auto" then
+    local cmd_parts = {"SUBFIX_QWEN3_ALIGNER_GGUF=" .. shell_quote(qwen_status.aligner)}
+    if asr_backend == "auto" or asr_backend == "qwen3_asr" then
         cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
     end
     local command_args = {}
@@ -3283,11 +3237,11 @@ local function run_background_command_with_progress(cmd, progress_path, progress
         }, " ")
     else
         -- v3.2.0 cannot add new paths, so incremental upgrades need an inline equivalent.
-        local inline_group_code = 'import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])'
+        local process_group_code = [[import os,sys; os.setsid(); os.execl("/bin/sh", "sh", "-c", sys.argv[1])]]
         grouped_cmd = table.concat({
             shell_quote(paths.runtime_python),
             "-c",
-            shell_quote(inline_group_code),
+            shell_quote(process_group_code),
             shell_quote(cmd),
         }, " ")
     end
@@ -3498,105 +3452,90 @@ local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, jso
     return true
 end
 
-local function show_qwen_install_complete_dialog()
-    if not dispatcher or not ui then return end
-    local complete_window = dispatcher:AddWindow({
-        ID = "GenerateQwenInstallCompleteWindow",
-        WindowTitle = "SubFix · 本地 Qwen 安装完成",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 420, 110}),
-    },
-    ui:VGroup{
-        Spacing = 8,
-        ContentsMargins = 14,
-        ui:Label{Text = "本地 Qwen 已安装完成。", Weight = 0},
-        ui:Label{Text = "Qwen3-ASR-1.7B 已就绪，可直接开始生成字幕。", Weight = 0},
-        ui:HGroup{
-            Weight = 0,
-            MinimumSize = {0, 34},
-            ui:Button{ID = "GenerateQwenInstallCompleteBtn", Text = "继续", Weight = 1, MinimumSize = {0, 28}}
-        }
-    })
-    local function close_complete_window()
-        pcall(function() complete_window:Hide() end)
-    end
-    function complete_window.On.GenerateQwenInstallCompleteBtn.Clicked(ev) close_complete_window() end
-    function complete_window.On.GenerateQwenInstallCompleteWindow.Close(ev) close_complete_window() end
-    complete_window:Show()
-end
-
-local function install_local_qwen_with_progress()
+local function model_center_query(action, model_id)
     local paths = resolve_asr_paths()
-    local existing_status = inspect_local_qwen(paths)
-    if existing_status.ready then
-        show_qwen_install_complete_dialog()
-        return true
-    end
     local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
-    local root = temp_dir()
-    local output_path = root .. "/subfix_qwen_install_" .. uid .. ".json"
-    local progress_path = output_path .. ".progress.json"
-    local cmd, cmd_err = build_qwen_install_command(paths, output_path, progress_path)
-    if not cmd then return false, cmd_err end
-    local progress_state, progress_err = show_generate_progress_window()
-    if not progress_state then return false, progress_err end
-    update_generate_progress_window(progress_state, {stage = "准备下载", message = "正在准备本地 Qwen 安装", indeterminate = true})
-    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
-    os.execute("rm -f " .. shell_quote(progress_path) .. " 2>/dev/null")
+    local output_path = temp_dir() .. "/subfix_models_" .. uid .. ".json"
+    local cmd, err = build_qwen_status_command(paths, output_path)
+    if not cmd then return nil, err end
+    cmd = cmd:gsub("%-%-action status", "--action " .. action)
+    if model_id then cmd = cmd .. " --model-id " .. shell_quote(model_id) end
+    os.execute(cmd .. " >/dev/null 2>&1")
     local payload = decode_json_text(read_text_file(output_path) or "")
-    os.execute("rm -f " .. shell_quote(output_path) .. " 2>/dev/null")
-    if not ok then
-        local message = type(payload) == "table" and tostring(payload.error or "") or ""
-        if message == "" then message = tostring(output or "本地 Qwen 安装失败") end
-        finish_generate_progress_window(progress_state, status == "cancelled" and "已取消" or "失败", message)
-        pcall(function() progress_state.window:Hide() end)
-        return false, message
-    end
-    local qwen_status = inspect_local_qwen(paths)
-    if not qwen_status.ready then
-        local message = "本地 Qwen 安装后校验未通过"
-        finish_generate_progress_window(progress_state, "失败", message)
-        pcall(function() progress_state.window:Hide() end)
-        return false, message
-    end
-    finish_generate_progress_window(progress_state, "完成", "本地 Qwen 已安装")
-    pcall(function() progress_state.window:Hide() end)
-    show_qwen_install_complete_dialog()
-    return true
+    os.remove(output_path)
+    if type(payload) ~= "table" then return nil, "模型状态读取失败，请重试或安装最新完整包" end
+    if payload.ok == false or payload.error then return nil, tostring(payload.error or "模型操作失败") end
+    return payload
 end
 
-local function show_qwen_install_failed_dialog(message)
-    if not dispatcher or not ui then return false end
-    local retry = false
-    local failed_window = dispatcher:AddWindow({
-        ID = "GenerateQwenInstallFailedWindow",
-        WindowTitle = "SubFix · 本地 Qwen 安装失败",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({560, 340, 560, 240}),
-    },
-    ui:VGroup{
-        Spacing = 8,
-        ContentsMargins = 14,
-        ui:Label{Text = "本地 Qwen 尚未安装完成：", Weight = 0},
-        ui:TextEdit{ID = "GenerateQwenInstallErrorText", PlainText = tostring(message or "未知错误"), ReadOnly = true, Weight = 1, MinimumSize = {0, 80}},
-        ui:HGroup{
-            Weight = 0,
-            Spacing = 8,
-            MinimumSize = {0, 34},
-            ui:Button{ID = "GenerateQwenInstallRetryBtn", Text = "重试", Weight = 1, MinimumSize = {0, 28}},
-            ui:Button{ID = "GenerateQwenInstallFailedCancelBtn", Text = "取消", Weight = 1, MinimumSize = {0, 28}}
-        }
-    })
-    local function close_failed_window(value)
-        retry = value == true
-        pcall(function() failed_window:Hide() end)
-        pcall(function() dispatcher:ExitLoop() end)
+local function perform_model_center_action(action)
+    if action.kind == "select" then return model_center_query("select", action.model_id) end
+    local paths = resolve_asr_paths()
+    local uid = tostring(os.time()) .. "_" .. tostring(math.random(100000, 999999))
+    local output_path = temp_dir() .. "/subfix_model_task_" .. uid .. ".json"
+    local progress_path = output_path .. ".progress.json"
+    local cmd = table.concat({
+        "env", "PYTHONDONTWRITEBYTECODE=1", shell_quote(paths.runtime_python), "-B", shell_quote(paths.qwen_manager),
+        "--action", shell_quote(action.kind), "--model-id", shell_quote(action.model_id),
+        "--source", shell_quote(action.source or "auto"),
+        "--output", shell_quote(output_path), "--progress-json", shell_quote(progress_path)
+    }, " ")
+    if action.kind == "import" then cmd = cmd .. " --input-path " .. shell_quote(action.input_path) end
+    local progress_state, progress_err = show_generate_progress_window()
+    if not progress_state then return nil, progress_err end
+    pcall(function() progress_state.window.WindowTitle = "SubFix · 模型准备" end)
+    local ok, output, status = run_background_command_with_progress(cmd, progress_path, progress_state)
+    local payload = decode_json_text(read_text_file(output_path) or "")
+    os.remove(output_path)
+    os.remove(progress_path)
+    pcall(function() progress_state.window:Hide() end)
+    if status == "cancelled" then return nil, "已取消。已完成的下载缓存会保留，可稍后重试。" end
+    if not ok or type(payload) ~= "table" or payload.ok == false or payload.error then
+        return nil, tostring(type(payload) == "table" and payload.error or output or "操作失败，请重试或改用离线导入。")
     end
-    function failed_window.On.GenerateQwenInstallRetryBtn.Clicked(ev) close_failed_window(true) end
-    function failed_window.On.GenerateQwenInstallFailedCancelBtn.Clicked(ev) close_failed_window(false) end
-    function failed_window.On.GenerateQwenInstallFailedWindow.Close(ev) close_failed_window(false) end
-    failed_window:Show()
-    dispatcher:RunLoop()
-    pcall(function() failed_window:Hide() end)
-    return retry
+    return payload
+end
+
+local function open_model_center(focus_model_id)
+    local paths = resolve_asr_paths()
+    if not file_exists(paths.qwen_manager) then return false, "模型中心组件缺失，请安装最新完整 SubFix 安装包" end
+    local ui_path = paths.qwen_manager:gsub("subfix_model_manager%.py$", "subfix_model_center.lua")
+    local chunk, err = loadfile(ui_path)
+    if not chunk then return false, "模型中心界面缺失，请安装最新完整 SubFix 安装包：" .. tostring(err) end
+    local loaded, center = pcall(chunk)
+    if not loaded or type(center) ~= "table" or type(center.open) ~= "function" then
+        return false, "模型中心无法加载，请安装最新完整 SubFix 安装包"
+    end
+    if not ui or not dispatcher then return false, "无法初始化 Resolve UI" end
+    local ok, result = pcall(center.open, {
+        ui = ui, dispatcher = dispatcher, geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry,
+        focus_model_id = focus_model_id, query = model_center_query, perform = perform_model_center_action,
+        browse = function(directory)
+            if directory then return fusion_app:RequestDir("") end
+            return fusion_app:RequestFile("", "*.gguf")
+        end
+    })
+    return ok and result == true, not ok and tostring(result) or nil
+end
+
+function SubFixGenerateSelectionCore.open_model_center(options)
+    runtime_options = options or {}
+    local ok, err = open_model_center(runtime_options.focus_model_id)
+    runtime_options = {}
+    return ok, err
+end
+
+function SubFixGenerateSelectionCore.ensure_alignment_model(options)
+    runtime_options = options or {}
+    local status = inspect_local_qwen(resolve_asr_paths())
+    if not file_exists(status.aligner or "") then
+        local ok, err = open_model_center("qwen3-forced-aligner-0.6b")
+        if not ok then runtime_options = {}; return false, err end
+        status = inspect_local_qwen(resolve_asr_paths())
+    end
+    runtime_options = {}
+    if not file_exists(status.aligner or "") then return false, "对齐模型尚未就绪，请在模型中心下载或导入后再试" end
+    return true
 end
 
 local function parse_generated_srt_rows(srt_path, fps, base_frame)
@@ -3793,17 +3732,20 @@ local function append_rebuild_srt_to_timeline(media_pool, media_pool_item)
 end
 
 local function import_rebuild_srt_with_retry(media_pool, rebuild_srt_path)
+    local folder_hint = "；原字幕未清空，请检查媒体夹是否被其他协作者占用，切换到可写媒体夹后重试"
+    local folder_ok, folder = pcall(function() return media_pool:GetCurrentFolder() end)
+    if not folder_ok or not folder then
+        return nil, "无法获取当前媒体夹" .. folder_hint
+    end
     local last_error = ""
     for attempt = 1, 2 do
-        local root = media_pool and media_pool:GetRootFolder()
-        if root then
-            local ok_folder, folder_ret = pcall(function() return media_pool:SetCurrentFolder(root) end)
-            if not ok_folder or folder_ret == false then
-                last_error = "无法切换媒体池根目录"
-            end
+        -- 重试仍使用本次选中的媒体夹，不能回退到可能被协作者锁定的主媒体夹。
+        local ok_folder, folder_ret = pcall(function() return media_pool:SetCurrentFolder(folder) end)
+        if not ok_folder or folder_ret ~= true then
+            return nil, "无法切换到选中的媒体夹" .. folder_hint
         end
         local ok_import, items = pcall(function() return media_pool:ImportMedia({rebuild_srt_path}) end)
-        if ok_import and items and #items > 0 then
+        if ok_import and type(items) == "table" and items[1] then
             if attempt > 1 then
                 print("[SubFix Generate] 重试导入重建字幕 SRT 成功")
             end
@@ -3815,7 +3757,7 @@ local function import_rebuild_srt_with_retry(media_pool, rebuild_srt_path)
             os.execute("sleep 0.25")
         end
     end
-    return nil, "导入重建字幕 SRT 失败（已重试）: " .. tostring(last_error)
+    return nil, "导入重建字幕 SRT 失败（已重试）: " .. tostring(last_error) .. folder_hint
 end
 
 local function rebuild_target_subtitle_track_from_rows(project, timeline, rows, fps, base_frame)
@@ -3902,13 +3844,10 @@ local function generate_selection_subtitles()
     -- 选择识别模型（Qwen/豆包）与字幕长度，故不再对单候选自动跳过弹窗、直接生成。
     while true do
         selected_audio_sources, subtitle_mode, max_chars, backend, hotwords_json, selection_err = show_audio_track_selection_dialog(audio_sources, scope, fps)
-        if selection_err ~= "__subfix_install_qwen__" then break end
-        local install_ok, install_err = false, nil
-        repeat
-            install_ok, install_err = install_local_qwen_with_progress()
-        until install_ok or not show_qwen_install_failed_dialog(install_err)
-        if not install_ok then error(install_err or "已取消本地 Qwen 安装") end
-        save_last_engine_backend("auto")
+        if selection_err ~= "__subfix_model_center__" then break end
+        local center_ok, center_err = open_model_center(runtime_options.model_center_focus)
+        runtime_options.model_center_focus = nil
+        if not center_ok then error(center_err or "无法打开模型中心") end
     end
     if not selected_audio_sources then error(selection_err or "已取消") end
     local selected_track_sources = collect_selected_track_sources(selected_audio_sources)

@@ -654,6 +654,7 @@ DOUBAO_ASR_V2_MAX_TRANSIENT_ERRORS = 5
 DOUBAO_ASR_V2_QUERY_BACKOFF_SECONDS = 0.5
 DOUBAO_ASR_V2_QUERY_MAX_BACKOFF_SECONDS = 2.0
 QWEN3_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+QWEN3_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN3_CPP_BIN_ENV = "SUBFIX_QWEN3_ASR_CPP_BIN"
 QWEN3_CPP_ALIGNER_GGUF_ENV = "SUBFIX_QWEN3_ALIGNER_GGUF"
 QWEN3_FORCED_ALIGNER_MODEL_NAMES = (
@@ -671,6 +672,7 @@ DEFAULT_FFMPEG_CANDIDATES = (
     "/opt/homebrew/bin/ffmpeg",
     "/usr/local/bin/ffmpeg",
 )
+_QWEN3_ASR_MODEL_CACHE: dict[tuple[str, str, str, str | None], tuple[Any, str, str]] = {}
 _OPENAI_WHISPER_MODEL_CACHE: dict[str, Any] = {}
 HOTWORD_MAX_ENTRIES = 200
 HOTWORD_CHINESE_DIGITS = str.maketrans("0123456789", "零一二三四五六七八九")
@@ -4395,8 +4397,15 @@ def cut_audio(
     if source_end is not None and source_end > source_start:
         cmd.extend(["-to", f"{source_end:.3f}"])
     cmd.extend(["-i", str(audio)])
+    filters = []
     if audio_channel_index is not None and audio_channel_index > 0:
-        cmd.extend(["-filter:a", f"pan=mono|c0=c{audio_channel_index - 1}"])
+        filters.append(f"pan=mono|c0=c{audio_channel_index - 1}")
+    if source_end is not None and source_end > source_start:
+        # Input -to follows packet timestamps; malformed timestamps can decode extra samples.
+        max_samples = max(1, round((source_end - source_start) * 16000))
+        filters.extend(["aresample=16000", f"atrim=end_sample={max_samples}"])
+    if filters:
+        cmd.extend(["-filter:a", ",".join(filters)])
     cmd.extend(["-ac", "1", "-ar", "16000", "-vn", str(output)])
     subprocess.run(cmd, check=True, text=True, capture_output=True)
 
@@ -4453,14 +4462,80 @@ def transcribe_openai_whisper(audio_path: Path, model: str, language: str | None
         raise RuntimeError(f"OpenAI Whisper 转写失败: {exc}") from exc
 
 
+def qwen3_data_root() -> Path:
+    configured = str(os.getenv("SUBFIX_DATA_ROOT") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / "Library" / "Application Support" / "SubFix"
+
+
+def qwen3_asr_directory_is_complete(path: Path) -> bool:
+    if not path.is_dir() or not (path / "config.json").is_file():
+        return False
+    if (path / "model.safetensors").is_file():
+        return True
+    index_path = path / "model.safetensors.index.json"
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        shards = set(index["weight_map"].values())
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    return bool(shards) and all(
+        isinstance(name, str) and Path(name).name == name and (path / name).is_file()
+        for name in shards
+    )
+
+
+def resolve_local_qwen3_asr_model(requested_model: str) -> Path:
+    known_models = {
+        "qwen3-asr-0.6b": "Qwen/Qwen3-ASR-0.6B",
+        "qwen3-asr-1.7b": QWEN3_ASR_MODEL,
+    }
+    configured = str(os.getenv("SUBFIX_QWEN3_ASR_MODEL") or "").strip()
+    explicit = configured or (requested_model if requested_model.lower() in known_models or requested_model in known_models.values() else "")
+    selected = ""
+    if explicit:
+        selected = next((key for key, value in known_models.items() if explicit.lower() == key or explicit == value), "")
+        if not selected:
+            local_path = Path(explicit).expanduser()
+            if qwen3_asr_directory_is_complete(local_path):
+                return local_path
+            raise RuntimeError("本地 Qwen 模型缺失或不完整，请在模型中心下载或重新导入模型。")
+    else:
+        try:
+            selection = json.loads((qwen3_data_root() / "model-selection.json").read_text(encoding="utf-8"))
+            selected = str(selection.get("selected_model_id") or "")
+        except (OSError, ValueError, AttributeError):
+            pass
+        if selected not in known_models:
+            selected = ""
+
+    hf_home = Path(os.getenv("HF_HOME") or Path.home() / ".cache" / "huggingface").expanduser()
+    cache_override = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
+    cache_roots = [Path(cache_override).expanduser()] if cache_override else [hf_home / "hub"]
+    model_ids = [selected] if selected else ["qwen3-asr-1.7b", "qwen3-asr-0.6b"]
+    for model_id in model_ids:
+        candidates = [qwen3_data_root() / "models" / model_id]
+        candidates.extend(root / "models" / model_id for root in qwen3_support_roots())
+        for cache_root in cache_roots:
+            snapshot_root = cache_root / ("models--" + known_models[model_id].replace("/", "--")) / "snapshots"
+            if snapshot_root.is_dir():
+                candidates.extend(sorted(snapshot_root.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True))
+        for candidate in candidates:
+            if qwen3_asr_directory_is_complete(candidate):
+                return candidate
+    raise RuntimeError("尚未安装所选 Qwen 识别模型，请在模型中心下载或导入后重试。")
+
+
 def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
+    # Resolve dependencies before importing torch or allocating model memory.
+    model_name = str(resolve_local_qwen3_asr_model(model))
+    _aligner_bin, aligner_path = resolve_qwen3_cpp_paths()
+    aligner_name = str(aligner_path)
     try:
         import torch  # type: ignore
         from qwen_asr import Qwen3ASRModel  # type: ignore
     except Exception as exc:  # pragma: no cover - depends on optional local setup
-        raise RuntimeError("Qwen3-ASR 环境未安装，请安装 qwen-asr 或继续使用 Whisper fallback") from exc
+        raise RuntimeError("Qwen3-ASR 运行环境未安装，请在模型中心准备本地运行环境。") from exc
 
-    model_name = os.getenv("SUBFIX_QWEN3_ASR_MODEL") or QWEN3_ASR_MODEL
     device_map = os.getenv("SUBFIX_QWEN3_ASR_DEVICE_MAP") or "auto"
     dtype = qwen3_torch_dtype(torch)
 
@@ -4468,11 +4543,12 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
         "device_map": device_map,
         "max_inference_batch_size": 1,
         "max_new_tokens": int(os.getenv("SUBFIX_QWEN3_ASR_MAX_NEW_TOKENS") or "512"),
+        "local_files_only": True,
     }
     if dtype is not None:
         init_kwargs["dtype"] = dtype
 
-    aligner_name = "qwen3_cpp"
+    cache_key = (model_name, aligner_name, device_map, str(dtype))
     try:
         mps_module = getattr(torch, "mps", None)
         mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
@@ -4493,7 +4569,12 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
                 mps_module.set_per_process_memory_fraction(fraction)
             except Exception as exc:
                 raise LocalQwenSafetyError(f"无法启用 MPS 每进程内存上限，拒绝加载模型: {exc}") from exc
-        qwen_model = Qwen3ASRModel.from_pretrained(model_name, **init_kwargs)
+        cached_model = _QWEN3_ASR_MODEL_CACHE.get(cache_key)
+        if cached_model is None:
+            qwen_model = Qwen3ASRModel.from_pretrained(model_name, **init_kwargs)
+            _QWEN3_ASR_MODEL_CACHE[cache_key] = (qwen_model, aligner_name, device_map)
+        else:
+            qwen_model, aligner_name, device_map = cached_model
     except LocalQwenSafetyError:
         raise
     except Exception as exc:  # pragma: no cover - depends on optional local setup/model cache
@@ -4504,11 +4585,11 @@ def load_qwen3_asr_model(model: str) -> tuple[Any, str, str, str | None]:
 
 
 def qwen3_force_align_items(audio_path: Path, text: str, language: str) -> list[dict[str, Any]]:
-    with tempfile.TemporaryDirectory(prefix="subfix_qwen3_align_") as temporary_directory:
-        return [
-            {"text": item["word"], "start": item["start"], "end": item["end"]}
-            for item in qwen3_cpp_force_align_items(audio_path, text, language, Path(temporary_directory))
-        ]
+    if not str(text).strip():
+        return []
+    with tempfile.TemporaryDirectory(prefix="subfix-qwen-align-") as folder:
+        items, _diagnostic = run_qwen3_cpp_alignment(audio_path, str(text), language, Path(folder))
+    return [{"text": item["word"], "start": item["start"], "end": item["end"]} for item in items]
 
 
 def qwen3_result_to_payload(
@@ -4553,6 +4634,7 @@ def qwen3_result_to_payload(
         "text": text,
         "diagnostic": {
             "forced_aligner": aligner_name,
+            "align_engine": "qwen3_cpp",
             "device_map": device_map,
             "requested_model": requested_model,
             "forced_align_item_count": len(words),
@@ -4580,100 +4662,6 @@ def _transcribe_qwen3_model(
             raise
         kwargs.pop("context", None)
         return qwen_model.transcribe(**kwargs), "unsupported"
-
-
-def qwen3_worker_result(result: Any, model_name: str, device_map: str, status: str) -> dict[str, Any]:
-    return {
-        "text": str(qwen3_timestamp_value(result, "text") or "").strip(),
-        "language": qwen3_timestamp_value(result, "language"),
-        "model": model_name,
-        "device_map": device_map,
-        "hotword_context_status": status,
-    }
-
-
-def run_qwen3_asr_worker_mode(request_path: Path, output_path: Path) -> None:
-    request = json.loads(request_path.read_text(encoding="utf-8"))
-    if not isinstance(request, dict):
-        raise RuntimeError("Qwen3-ASR worker 请求必须是 JSON 对象")
-    progress_path = Path(request["progress_json"]) if request.get("progress_json") else None
-    write_progress(progress_path, "load_qwen_model", "正在加载语音模型")
-    qwen_model, model_name, _aligner_name, device_map = load_qwen3_asr_model(
-        str(request.get("model") or QWEN3_ASR_MODEL)
-    )
-    try:
-        write_progress(progress_path, "run_qwen_asr", "正在识别语音")
-        results, status = _transcribe_qwen3_model(
-            qwen_model,
-            str(request.get("audio") or ""),
-            request.get("language"),
-            request.get("context"),
-        )
-    except LocalQwenSafetyError:
-        raise
-    except Exception as exc:
-        if is_local_qwen_memory_error(exc):
-            raise LocalQwenSafetyError(f"Qwen3-ASR 推理触发内存保护: {exc}") from exc
-        raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
-    first_result = results[0] if isinstance(results, list) and results else results
-    write_payload(output_path, {"ok": True, **qwen3_worker_result(first_result, model_name, device_map, status)})
-
-
-def run_qwen3_asr_worker(
-    audio_path: Path, model: str, language: str | None, context: str | None = None
-) -> dict[str, Any]:
-    snapshot = read_local_resource_snapshot()
-    assert_local_qwen_resources(snapshot, "asr")
-    with tempfile.TemporaryDirectory(prefix="subfix_qwen3_asr_worker_") as temporary_directory:
-        worker_dir = Path(temporary_directory)
-        request_path = worker_dir / "request.json"
-        output_path = worker_dir / "output.json"
-        worker_progress_path = worker_dir / "progress.json"
-        write_payload(
-            request_path,
-            {"audio": str(audio_path), "model": model, "language": language, "context": context,
-             "progress_json": str(worker_progress_path)},
-        )
-        child_env = dict(os.environ)
-        child_env["SUBFIX_QWEN3_ASR_MAX_BATCH"] = "1"
-        child_env["SUBFIX_QWEN_GENERATE_BATCH_SIZE"] = "1"
-        child_env["_SUBFIX_QWEN_ASR_RSS_LIMIT_BYTES"] = str(local_qwen_rss_limit(snapshot, "asr"))
-        returncode, log_text = run_guarded_local_qwen_command(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "--mode",
-                "qwen_asr_worker",
-                "--worker-request-json",
-                str(request_path),
-                "--output",
-                str(output_path),
-            ],
-            "asr",
-            timeout_seconds=LOCAL_QWEN_ASR_TIMEOUT_SECONDS,
-            env=child_env,
-            worker_progress_path=worker_progress_path,
-        )
-        payload: dict[str, Any] = {}
-        if output_path.exists():
-            try:
-                loaded = json.loads(output_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    payload = loaded
-            except (OSError, json.JSONDecodeError):
-                payload = {}
-        if payload.get("error_type") == "LocalQwenSafetyError":
-            detail = log_text.strip()[-2000:]
-            raise LocalQwenSafetyError(
-                str(payload.get("error") or "Qwen3-ASR worker 触发资源保护")
-                + (f"\n底层日志（末尾）：\n{detail}" if detail else "")
-            )
-        worker_detail = str(payload.get("error") or "")
-        raise_for_local_qwen_returncode(returncode, "asr", f"{worker_detail}\n{log_text}")
-        if returncode != 0 or payload.get("ok") is not True:
-            detail = str(payload.get("error") or log_text or returncode).strip()
-            raise RuntimeError(f"Qwen3-ASR worker 失败: {detail[-2000:]}")
-        return payload
 
 
 def transcribe_qwen3_asr(
@@ -4925,6 +4913,7 @@ def _doubao_asr_v2_response_fields(response_payload: dict[str, Any], status_code
 class _DoubaoTransientError(RuntimeError):
     """The response is inconclusive; query the same task instead of resubmitting."""
 
+
 def _doubao_checkpoint_path(
     audio_bytes: bytes, body: dict[str, Any], api_key: str, model: str, language: str | None,
 ) -> Path:
@@ -4945,6 +4934,7 @@ def _doubao_checkpoint_path(
     }
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
     return root / f"{digest}.json"
+
 
 def _read_doubao_checkpoint(path: Path) -> dict[str, Any]:
     try:
@@ -4969,6 +4959,7 @@ def _read_doubao_checkpoint(path: Path) -> dict[str, Any]:
         ):
             return checkpoint
     raise RuntimeError(f"豆包断点缓存格式损坏：{path}；请保留该文件用于排查，移出缓存目录后重试")
+
 
 def _write_doubao_checkpoint(path: Path, checkpoint: dict[str, Any]) -> None:
     temporary_path = None
@@ -5328,48 +5319,6 @@ def transcribe_with_backend(
 
 
 DOUBAO_ASR_BACKENDS = frozenset({"doubao_asr", "doubao_asr_v2"})
-
-
-def transcribe_v4_retry_audio(
-    audio_path: Path,
-    model: str,
-    language: str | None,
-    *,
-    backend: str,
-    hotword_context: str = "",
-) -> dict[str, Any]:
-    """Retry a v4/v5 window with the backend explicitly selected by the user."""
-    if backend == "doubao_asr":
-        return transcribe_doubao_asr(audio_path, model, language)
-    if backend == "doubao_asr_v2":
-        return transcribe_doubao_asr_v2(audio_path, model, language)
-    return (
-        transcribe_qwen3_asr(audio_path, model, language, context=hotword_context)
-        if hotword_context
-        else transcribe_qwen3_asr(audio_path, model, language)
-    )
-
-
-def align_v4_retry_audio(
-    audio_path: Path,
-    text: str,
-    language: str,
-    *,
-    backend: str,
-) -> list[dict[str, Any]]:
-    """Provide fallback timestamps without crossing ASR backend boundaries."""
-    if backend not in DOUBAO_ASR_BACKENDS:
-        return qwen3_force_align_items(audio_path, text, language)
-    clean_text = str(text or "").strip()
-    if not clean_text:
-        return []
-    return [
-        {
-            "text": clean_text,
-            "start": 0.0,
-            "end": max(0.001, audio_duration_seconds(audio_path)),
-        }
-    ]
 
 
 def should_try_qwen_batch_backend(backend: str) -> bool:
@@ -7236,6 +7185,7 @@ def ctc_align_text_rows(
 def qwen3_support_roots() -> list[Path]:
     module_dir = Path(__file__).resolve().parent
     roots = [
+        qwen3_data_root(),
         module_dir / ".subfix_support",
         module_dir,
         Path.cwd() / ".subfix_support",
@@ -7267,10 +7217,7 @@ def discover_qwen3_aligner_model() -> Path | None:
         model_dir = root / "models"
         for model_name in QWEN3_FORCED_ALIGNER_MODEL_NAMES:
             candidate = model_dir / model_name
-            if candidate.exists():
-                return candidate
-        for candidate in sorted(model_dir.glob("qwen3-forced-aligner-0.6b-*.gguf")):
-            if candidate.exists():
+            if candidate.is_file():
                 return candidate
     return None
 
@@ -7296,87 +7243,32 @@ def resolve_qwen3_cpp_paths() -> tuple[Path, Path]:
     model_value = str(os.getenv(QWEN3_CPP_ALIGNER_GGUF_ENV) or "").strip()
     if model_value:
         model_path = Path(model_value).expanduser()
-        if not model_path.exists():
-            raise RuntimeError(f"{QWEN3_CPP_ALIGNER_GGUF_ENV} 指向的模型不存在: {model_value}")
+        if not model_path.is_file():
+            raise RuntimeError(f"对齐模型不存在，请在模型中心下载或导入后重试：{model_value}")
     else:
         discovered_model = discover_qwen3_aligner_model()
         if not discovered_model:
-            raise RuntimeError(f"{QWEN3_CPP_ALIGNER_GGUF_ENV} 未配置，且未在 .subfix_support/models 中找到 Qwen3 forced aligner GGUF")
+            raise RuntimeError("尚未安装 Qwen 对齐模型，请在模型中心下载或导入后重试。")
         model_path = discovered_model
     return bin_path, model_path
 
 
-def qwen3_cpp_runtime_env(bin_path: Path) -> dict[str, str]:
-    env = dict(os.environ)
-    if sys.platform == "darwin":
-        # Older installations retain build-machine RPATHs; load their bundled libraries locally.
-        env["DYLD_LIBRARY_PATH"] = str(bin_path.resolve().parent)
-    return env
-
-
-def qwen3_cpp_force_align_items(
+def run_qwen3_cpp_alignment(
     audio_path: Path,
-    text: str,
+    alignment_text: str,
     language: str | None,
     work_dir: Path,
-    output_path: Path | None = None,
-) -> list[dict[str, Any]]:
-    alignment_text = str(text or "").strip()
-    if not alignment_text:
-        raise RuntimeError("Qwen3 forced align 文本为空")
-
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     bin_path, model_path = resolve_qwen3_cpp_paths()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_path or work_dir / f"qwen_forced_align_{int(time.time() * 1000)}_{os.getpid()}.json"
-    cmd = [
-        str(bin_path),
-        "-m",
-        str(model_path),
-        "-f",
-        str(audio_path),
-        "--align",
-        "--text",
-        alignment_text,
-        "--language",
-        qwen3_language_name(language) or "Chinese",
-        "-o",
-        str(output_path),
-    ]
-    try:
-        output_path.unlink(missing_ok=True)
-        returncode, log_text = run_guarded_local_qwen_command(
-            cmd,
-            "gguf",
-            timeout_seconds=LOCAL_QWEN_GGUF_TIMEOUT_SECONDS,
-            cwd=work_dir,
-            env=qwen3_cpp_runtime_env(bin_path),
-        )
-    except LocalQwenSafetyError:
-        output_path.unlink(missing_ok=True)
-        raise
-    if returncode != 0:
-        output_path.unlink(missing_ok=True)
-        raise_for_local_qwen_returncode(returncode, "gguf", log_text)
-        detail = log_text.strip()
-        raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or returncode}")
-    if not output_path.exists():
-        raise RuntimeError(f"Qwen3 forced align 未生成输出 JSON: {output_path}")
-
-    try:
-        qwen_payload = json.loads(output_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"Qwen3 forced align 输出 JSON 非法: {exc}") from exc
-
-    timestamp_items = qwen3_timestamp_words(qwen_payload)
-    if not timestamp_items:
-        raise RuntimeError("Qwen3 forced align 输出没有词/字时间戳")
-    latest_timestamp = max(
-        max(float(item.get("start") or 0.0), float(item.get("end") or 0.0))
-        for item in timestamp_items
-    )
-    if latest_timestamp <= 0.001:
-        raise RuntimeError("Qwen3 forced align 时间戳无效：所有词/字均停留在 0 秒")
-    return timestamp_items
+    output_path = work_dir / f"qwen_forced_align_{int(time.time() * 1000)}_{os.getpid()}.json"
+    items = qwen3_cpp_force_align_items(audio_path, alignment_text, language, work_dir, output_path)
+    return items, {
+        "align_engine": "qwen3_cpp",
+        "qwen_item_count": len(items),
+        "qwen_output_path": str(output_path),
+        "qwen_cli": str(bin_path),
+        "qwen_model": str(model_path),
+    }
 
 
 def qwen3_cpp_forced_align_text_rows(
@@ -7788,6 +7680,215 @@ def run_qwen_forced_align_batch_plan(
     if failed_batch_errors:
         payload["error"] = "；".join(failed_batch_errors[:3])
     return payload
+
+
+def qwen3_worker_result(result: Any, model_name: str, device_map: str, status: str) -> dict[str, Any]:
+    return {
+        "text": str(qwen3_timestamp_value(result, "text") or "").strip(),
+        "language": qwen3_timestamp_value(result, "language"),
+        "model": model_name,
+        "device_map": device_map,
+        "hotword_context_status": status,
+    }
+
+
+def run_qwen3_asr_worker_mode(request_path: Path, output_path: Path) -> None:
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    if not isinstance(request, dict):
+        raise RuntimeError("Qwen3-ASR worker 请求必须是 JSON 对象")
+    progress_path = Path(request["progress_json"]) if request.get("progress_json") else None
+    write_progress(progress_path, "load_qwen_model", "正在加载语音模型")
+    qwen_model, model_name, _aligner_name, device_map = load_qwen3_asr_model(
+        str(request.get("model") or QWEN3_ASR_MODEL)
+    )
+    try:
+        write_progress(progress_path, "run_qwen_asr", "正在识别语音")
+        results, status = _transcribe_qwen3_model(
+            qwen_model,
+            str(request.get("audio") or ""),
+            request.get("language"),
+            request.get("context"),
+        )
+    except LocalQwenSafetyError:
+        raise
+    except Exception as exc:
+        if is_local_qwen_memory_error(exc):
+            raise LocalQwenSafetyError(f"Qwen3-ASR 推理触发内存保护: {exc}") from exc
+        raise RuntimeError(f"Qwen3-ASR 转写失败: {exc}") from exc
+    first_result = results[0] if isinstance(results, list) and results else results
+    write_payload(output_path, {"ok": True, **qwen3_worker_result(first_result, model_name, device_map, status)})
+
+
+def run_qwen3_asr_worker(
+    audio_path: Path, model: str, language: str | None, context: str | None = None
+) -> dict[str, Any]:
+    snapshot = read_local_resource_snapshot()
+    assert_local_qwen_resources(snapshot, "asr")
+    with tempfile.TemporaryDirectory(prefix="subfix_qwen3_asr_worker_") as temporary_directory:
+        worker_dir = Path(temporary_directory)
+        request_path = worker_dir / "request.json"
+        output_path = worker_dir / "output.json"
+        worker_progress_path = worker_dir / "progress.json"
+        write_payload(
+            request_path,
+            {"audio": str(audio_path), "model": model, "language": language, "context": context,
+             "progress_json": str(worker_progress_path)},
+        )
+        child_env = dict(os.environ)
+        child_env["SUBFIX_QWEN3_ASR_MAX_BATCH"] = "1"
+        child_env["SUBFIX_QWEN_GENERATE_BATCH_SIZE"] = "1"
+        child_env["_SUBFIX_QWEN_ASR_RSS_LIMIT_BYTES"] = str(local_qwen_rss_limit(snapshot, "asr"))
+        returncode, log_text = run_guarded_local_qwen_command(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--mode",
+                "qwen_asr_worker",
+                "--worker-request-json",
+                str(request_path),
+                "--output",
+                str(output_path),
+            ],
+            "asr",
+            timeout_seconds=LOCAL_QWEN_ASR_TIMEOUT_SECONDS,
+            env=child_env,
+            worker_progress_path=worker_progress_path,
+        )
+        payload: dict[str, Any] = {}
+        if output_path.exists():
+            try:
+                loaded = json.loads(output_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+        if payload.get("error_type") == "LocalQwenSafetyError":
+            detail = log_text.strip()[-2000:]
+            raise LocalQwenSafetyError(
+                str(payload.get("error") or "Qwen3-ASR worker 触发资源保护")
+                + (f"\n底层日志（末尾）：\n{detail}" if detail else "")
+            )
+        worker_detail = str(payload.get("error") or "")
+        raise_for_local_qwen_returncode(returncode, "asr", f"{worker_detail}\n{log_text}")
+        if returncode != 0 or payload.get("ok") is not True:
+            detail = str(payload.get("error") or log_text or returncode).strip()
+            raise RuntimeError(f"Qwen3-ASR worker 失败: {detail[-2000:]}")
+        return payload
+
+
+def transcribe_v4_retry_audio(
+    audio_path: Path,
+    model: str,
+    language: str | None,
+    *,
+    backend: str,
+    hotword_context: str = "",
+) -> dict[str, Any]:
+    """Retry a v4/v5 window with the backend explicitly selected by the user."""
+    if backend == "doubao_asr":
+        return transcribe_doubao_asr(audio_path, model, language)
+    if backend == "doubao_asr_v2":
+        return transcribe_doubao_asr_v2(audio_path, model, language)
+    return (
+        transcribe_qwen3_asr(audio_path, model, language, context=hotword_context)
+        if hotword_context
+        else transcribe_qwen3_asr(audio_path, model, language)
+    )
+
+
+def align_v4_retry_audio(
+    audio_path: Path,
+    text: str,
+    language: str,
+    *,
+    backend: str,
+) -> list[dict[str, Any]]:
+    """Provide fallback timestamps without crossing ASR backend boundaries."""
+    if backend not in DOUBAO_ASR_BACKENDS:
+        return qwen3_force_align_items(audio_path, text, language)
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return []
+    return [
+        {
+            "text": clean_text,
+            "start": 0.0,
+            "end": max(0.001, audio_duration_seconds(audio_path)),
+        }
+    ]
+
+
+def qwen3_cpp_runtime_env(bin_path: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        # Older installations retain build-machine RPATHs; load their bundled libraries locally.
+        env["DYLD_LIBRARY_PATH"] = str(bin_path.resolve().parent)
+    return env
+
+
+def qwen3_cpp_force_align_items(
+    audio_path: Path,
+    text: str,
+    language: str | None,
+    work_dir: Path,
+    output_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    alignment_text = str(text or "").strip()
+    if not alignment_text:
+        raise RuntimeError("Qwen3 forced align 文本为空")
+
+    bin_path, model_path = resolve_qwen3_cpp_paths()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_path or work_dir / f"qwen_forced_align_{int(time.time() * 1000)}_{os.getpid()}.json"
+    cmd = [
+        str(bin_path),
+        "-m",
+        str(model_path),
+        "-f",
+        str(audio_path),
+        "--align",
+        "--text",
+        alignment_text,
+        "--language",
+        qwen3_language_name(language) or "Chinese",
+        "-o",
+        str(output_path),
+    ]
+    try:
+        output_path.unlink(missing_ok=True)
+        returncode, log_text = run_guarded_local_qwen_command(
+            cmd,
+            "gguf",
+            timeout_seconds=LOCAL_QWEN_GGUF_TIMEOUT_SECONDS,
+            cwd=work_dir,
+            env=qwen3_cpp_runtime_env(bin_path),
+        )
+    except LocalQwenSafetyError:
+        output_path.unlink(missing_ok=True)
+        raise
+    if returncode != 0:
+        output_path.unlink(missing_ok=True)
+        raise_for_local_qwen_returncode(returncode, "gguf", log_text)
+        detail = log_text.strip()
+        raise RuntimeError(f"Qwen3 forced align 执行失败: {detail or returncode}")
+    if not output_path.exists():
+        raise RuntimeError(f"Qwen3 forced align 未生成输出 JSON: {output_path}")
+
+    try:
+        qwen_payload = json.loads(output_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Qwen3 forced align 输出 JSON 非法: {exc}") from exc
+
+    timestamp_items = qwen3_timestamp_words(qwen_payload)
+    if not timestamp_items:
+        raise RuntimeError("Qwen3 forced align 输出没有词/字时间戳")
+    latest_timestamp = max(
+        max(float(item.get("start") or 0.0), float(item.get("end") or 0.0))
+        for item in timestamp_items
+    )
+    if latest_timestamp <= 0.001:
+        raise RuntimeError("Qwen3 forced align 时间戳无效：所有词/字均停留在 0 秒")
+    return timestamp_items
 
 
 def main(argv: list[str] | None = None) -> int:
