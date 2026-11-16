@@ -220,7 +220,15 @@ def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_
         local DEFAULT_ASR_LANGUAGE="zh"
     ''' + source[start:end] + r'''
         local command, err = build_asr_helper_batch_command("/batch", "/srt", "/json", 108000, 30, "/progress", "narration", 25, backend, nil)
-        if not aligner_present then
+        if backend ~= "auto" then
+            if runtime_present then
+                assert(command and not err)
+                assert(command:find("'/bundled/python'", 1, true))
+                assert(not command:find("SUBFIX_QWEN3_", 1, true))
+            else
+                assert(not command and err:find("内置 Python 缺失", 1, true))
+            end
+        elseif not aligner_present then
             assert(not command and err:find("缺少对齐模型", 1, true))
         elseif qwen_ready then
             assert(command and not err)
@@ -237,7 +245,9 @@ def test_backend_selects_a_usable_runtime(run_lua, backend, qwen_ready, runtime_
         if command then
             local expected_backend = backend == "auto" and "qwen3_asr" or backend
             assert(command:find("--backend '" .. expected_backend .. "'", 1, true))
-            assert(command:find("SUBFIX_QWEN3_ALIGNER_GGUF='/aligner.gguf'", 1, true))
+            if backend == "auto" then
+                assert(command:find("SUBFIX_QWEN3_ALIGNER_GGUF='/aligner.gguf'", 1, true))
+            end
             assert(not command:find("/obsolete/python", 1, true))
         end
     ''')

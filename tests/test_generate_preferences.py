@@ -42,14 +42,17 @@ def dialog(run_lua, tmp_path):
     """
     support += section("local function normalize_doubao_backend(", "local function load_generate_hotword_entries(")
     run_lua(support + """
-        local runtime_options = {}
         save_engine = save_last_engine_backend
         save_doubao = save_doubao_backend_preference
         local TRACK_CHECKED_MARK, TRACK_UNCHECKED_MARK = 'yes', 'no'
         local function resolve_asr_paths() return {hotwords = 'hotwords.json'} end
         local function load_generate_hotword_entries() return entries or {{term = 'SubFix'}} end
-        local function inspect_local_qwen() return {ready = true, aligner = "/test/aligner.gguf"} end
-        local function file_exists(path) return path == "/test/aligner.gguf" end
+        local function inspect_local_qwen()
+            assert(not forbid_model_inspection, 'cloud generation inspected local models')
+            return model_status or {ready = true, aligner = 'aligner.gguf'}
+        end
+        local function file_exists(path) return path == 'aligner.gguf' end
+        local runtime_options = {}
         local function format_audio_source_label() return 'A1' end
         local function set_tree_item_text(item, column, text)
             item.Text = item.Text or {}; item.Text[column] = text
@@ -133,6 +136,60 @@ def test_generation_restores_length_and_disabled_hotwords_after_model_changes(di
     saved = json.loads(prefs.read_text())
     assert saved["max_chars"] == 25
     assert saved["hotwords_enabled"] is True
+
+
+@pytest.mark.parametrize("backend", ["doubao_asr", "doubao_asr_v2"])
+def test_cloud_generation_does_not_require_local_models(dialog, backend):
+    run, _ = dialog
+    run("cloud_backend = " + json.dumps(backend))
+    run('''
+        model_status = {ready = false, aligner = ''}
+        forbid_model_inspection = true
+        assert(save_doubao(cloud_backend))
+        assert(save_engine(cloud_backend))
+        interaction = function(w) w.On.GenerateSelectionConfirmBtn.Clicked() end
+        local sources, _, _, backend, _, err = open_dialog()
+        assert(sources and backend == cloud_backend and err == nil)
+    ''')
+
+
+def test_missing_aligner_routes_local_generation_to_model_center(dialog):
+    run, _ = dialog
+    run('''
+        model_status = {ready = false, aligner = ''}
+        assert(save_engine('auto'))
+        interaction = function(w)
+            w.On.GenerateSelectionConfirmBtn.Clicked()
+            windows.GenerateQwenDownloadWindow.On.GenerateQwenDownloadConfirmBtn.Clicked()
+        end
+        local sources, _, _, _, _, err = open_dialog()
+        assert(sources == nil and err == '__subfix_model_center__')
+    ''')
+
+
+def test_model_center_round_trip_preserves_unsaved_generation_choices(dialog):
+    run, prefs = dialog
+    run('''
+        assert(save_engine('auto'))
+        interaction = function(w, items)
+            w.On.GenerateSubtitleLengthShortBtn.Clicked()
+            click_track(w, items, 1)
+            click_track(w, items, 2)
+            model_status = {ready = false, aligner = ''}
+            w.On.GenerateSelectionConfirmBtn.Clicked()
+            windows.GenerateQwenDownloadWindow.On.GenerateQwenDownloadConfirmBtn.Clicked()
+        end
+        local _, _, _, _, _, err = open_dialog({1, 2})
+        assert(err == '__subfix_model_center__')
+        interaction = function(w, items)
+            assert(items.GenerateSubtitleEngineQwenBtn.Text:match('^yes'))
+            assert(items.GenerateSubtitleLengthShortBtn.Text:match('^yes'))
+            assert_checked_tracks(items, {2})
+            w.On.GenerateSelectionCancelBtn.Clicked()
+        end
+        open_dialog({1, 2})
+    ''')
+    assert json.loads(prefs.read_text())["last_engine_backend"] == "auto"
 
 
 @pytest.mark.parametrize("seed", [{}, {"max_chars": 999, "hotwords_enabled": "false"}, {"last_engine_backend": "doubao_asr_v2"}])

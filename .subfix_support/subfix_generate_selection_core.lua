@@ -2484,7 +2484,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         Spacing = 8,
         ContentsMargins = 14,
         ui:Label{ID = "GenerateQwenDownloadStatusLabel", Text = "请在模型中心准备需要的模型。", WordWrap = true, Weight = 0},
-        ui:Label{ID = "GenerateQwenDownloadDetailLabel", Text = "本地识别需要 ASR 和对齐模型；云端识别只需对齐模型。", WordWrap = true, Weight = 0},
+        ui:Label{ID = "GenerateQwenDownloadDetailLabel", Text = "本地识别需要 ASR 和对齐模型；豆包使用云端时间戳，无需本地模型。", WordWrap = true, Weight = 0},
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
@@ -2511,7 +2511,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             end
         else
             if qwen_download_status_label then qwen_download_status_label.Text = "当前功能需要的模型或运行环境尚未就绪。" end
-            if qwen_download_detail_label then qwen_download_detail_label.Text = "在模型中心下载或导入。云端识别只需要共享对齐模型。" end
+            if qwen_download_detail_label then qwen_download_detail_label.Text = "请在模型中心下载或导入本地模型。豆包生成字幕无需本地模型。" end
             if qwen_download_confirm_btn then
                 qwen_download_confirm_btn.Text = "打开模型中心"
                 qwen_download_confirm_btn.Enabled = true
@@ -2667,12 +2667,13 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         selected_max_chars = read_selected_max_chars()
         selected_backend = read_selected_backend()
         selected_hotwords_json = hotwords_enabled and resolve_asr_paths().hotwords or nil
-        local qwen_status = inspect_local_qwen(resolve_asr_paths())
-        if (selected_backend == "auto" and not qwen_status.ready)
-            or not file_exists(qwen_status.aligner or "") then
-            runtime_options.model_center_focus = selected_backend ~= "auto" and "qwen3-forced-aligner-0.6b" or nil
-            open_qwen_download_dialog()
-            return
+        if selected_backend == "auto" then
+            local qwen_status = inspect_local_qwen(resolve_asr_paths())
+            if not qwen_status.ready or not file_exists(qwen_status.aligner or "") then
+                runtime_options.model_center_focus = nil
+                open_qwen_download_dialog()
+                return
+            end
         end
         -- 记住本次生成选项，下次打开对话框时恢复。
         local selected_audio_tracks = {}
@@ -3116,29 +3117,28 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     -- backend 由生成对话框的"识别模型"选择决定；缺省回退到 DEFAULT_ASR_BACKEND(auto/Qwen 本地)。
     local asr_backend = (type(backend) == "string" and backend ~= "") and backend or DEFAULT_ASR_BACKEND
     if asr_backend == "auto" then asr_backend = "qwen3_asr" end
-    local qwen_status = inspect_local_qwen(paths)
-    if not file_exists(qwen_status.aligner or "") then
-        return nil, "缺少对齐模型，请在模型中心下载或导入 Qwen3-ForcedAligner-0.6B"
-    end
+    local qwen_status = {}
     local python = paths.python
     if asr_backend == "doubao_asr" or asr_backend == "doubao_asr_v2" then
-        -- 豆包负责转写，但 v4/v5 仍依赖 Qwen 做强制时间对齐。
-        if qwen_status and qwen_status.ready and file_exists(qwen_status.python or "") then
-            python = qwen_status.python
-        else
-            python = paths.runtime_python
-            if not file_exists(python) then
-                return nil, "SubFix 内置 Python 缺失，请重新安装完整 SubFix 测试版"
-            end
+        -- 豆包使用原生时间戳及自身的缺失时间戳处理，不依赖本地 Qwen。
+        python = paths.runtime_python
+        if not file_exists(python) then
+            return nil, "SubFix 内置 Python 缺失，请重新安装完整 SubFix 测试版"
         end
-    elseif not (qwen_status and qwen_status.ready and file_exists(qwen_status.python or "")) then
-        return nil, "所选本地模型尚未就绪，请在模型中心下载、导入或补全运行环境"
     else
+        qwen_status = inspect_local_qwen(paths)
+        if not file_exists(qwen_status.aligner or "") then
+            return nil, "缺少对齐模型，请在模型中心下载或导入 Qwen3-ForcedAligner-0.6B"
+        end
+        if not (qwen_status.ready and file_exists(qwen_status.python or "")) then
+            return nil, "所选本地模型尚未就绪，请在模型中心下载、导入或补全运行环境"
+        end
         python = qwen_status.python
     end
     local generate_engine = resolve_generate_engine()
-    local cmd_parts = {"SUBFIX_QWEN3_ALIGNER_GGUF=" .. shell_quote(qwen_status.aligner)}
+    local cmd_parts = {}
     if asr_backend == "auto" or asr_backend == "qwen3_asr" then
+        cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ALIGNER_GGUF=" .. shell_quote(qwen_status.aligner)
         cmd_parts[#cmd_parts + 1] = "SUBFIX_QWEN3_ASR_MODEL=" .. shell_quote(qwen_status.model)
     end
     local command_args = {}
