@@ -1,21 +1,21 @@
 {
   "schemaVersion": 1,
   "channel": "stable",
-  "version": "3.4.1",
+  "version": "3.4.2",
   "platform": "macos",
   "arch": "arm64",
-  "publishedAt": "2026-11-16T10:20:27Z",
-  "name": "SubFix v3.4.1",
-  "notes": "v3.4.1 修复了豆包生成字幕时误要求下载 Qwen 对齐模型，以及把完整安装包更新误报为网络故障的问题。\n\nv3.4.0 可直接点「下载并安装」，完成后重启 DaVinci Resolve。已有模型和设置会保留。\n\n本次更新将插件的官网下载和检查更新接入国内可直连的官网。3.3.9 及更早版本请通过新官网完整安装。",
-  "releaseUrl": "https://github.com/HooperH/SubFix/releases/tag/v3.4.1",
-  "downloadUrl": "https://hooperh.github.io/SubFix/downloads/SubFix-v3.4.1-macOS-CN.pkg",
-  "sizeBytes": 29553496,
+  "publishedAt": "2026-11-26T06:49:14Z",
+  "name": "SubFix v3.4.2",
+  "notes": "- 生成字幕时可以粘贴参考文稿，或导入 TXT、Markdown、Word（.docx）文件。SubFix 会按 Resolve 项目保存文稿和勾选状态。\n- 设置入点和出点可生成选区字幕。未设置时默认读取整条时间线的音频。改善了不连续音频片段的字幕对齐，避免字幕跨过片段之间的长空白。\n- 改进热词中英文大小写、数字和型号的显示，并在主窗口增加「前往官网」按钮。\n\n使用 v3.4.0 或 v3.4.1 可在插件内点击「检查更新」并选择「下载并安装」。更新完成后重新打开插件。v3.3.9 及更早版本请从官网下载完整安装包。",
+  "releaseUrl": "https://github.com/HooperH/SubFix/releases/tag/v3.4.2",
+  "downloadUrl": "https://hooperh.github.io/SubFix/downloads/SubFix-v3.4.2-macOS.pkg",
+  "sizeBytes": 29586003,
   "update": {
-    "url": "https://hooperh.github.io/SubFix/updates/SubFix-3.4.0-to-3.4.1-cn.zip",
-    "sizeBytes": 233551,
-    "sha256": "96db2645325db512c0514a434a87d772f75d59dbb1e2ab72ddccd79257f5bb01",
+    "url": "https://hooperh.github.io/SubFix/updates/SubFix-update-v3.4.2-full.zip",
+    "sizeBytes": 2409561,
+    "sha256": "d3d851e1f6f7577b1441f2891f05fb5902b99696c75ba3b89e3d3afe8ca58285",
     "fallbackUrls": [
-      "https://github.com/HooperH/SubFix/releases/download/v3.4.1/SubFix-3.4.0-to-3.4.1-cn.zip"
+      "https://github.com/HooperH/SubFix/releases/download/v3.4.2/SubFix-update-v3.4.2-full.zip"
     ]
   }
 }
