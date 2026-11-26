@@ -30,6 +30,7 @@ import urllib.request
 import uuid
 import wave
 from datetime import datetime, timezone
+from functools import partial
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -715,10 +716,35 @@ def load_hotword_entries(path: str | Path | None) -> list[dict[str, Any]]:
     return entries
 
 
-def build_hotword_context(entries: list[dict[str, Any]]) -> str:
+def build_hotword_context(entries: list[dict[str, Any]], backend: str = "auto") -> str:
     terms = [str(entry.get("term") or "").strip() for entry in entries[:HOTWORD_MAX_ENTRIES]]
     terms = [term for term in terms if term]
+    if terms and backend in DOUBAO_ASR_BACKENDS:
+        return json.dumps({"hotwords": [{"word": term} for term in terms]}, ensure_ascii=False)
     return "请严格使用以下专有名词的标准写法；英文和数字不要改写为中文：" + "、".join(terms) if terms else ""
+
+
+# Keep each excerpt short enough to leave room for model output and context metadata.
+REFERENCE_EXCERPT_CHARS = 600
+
+
+def generation_reference_context(reference: str, hotwords: str, backend: str,
+                                 window: dict, audio_spans: list[tuple[int, int]]) -> str:
+    if not reference:
+        return hotwords
+    if len(reference) > REFERENCE_EXCERPT_CHARS:
+        # Follow the position in the selected audio, excluding gaps between clips.
+        start, end = window["start_frame"], window["end_frame"]
+        elapsed = sum(max(0, min(start, right) - left) for left, right in audio_spans)
+        duration = sum(right - left for left, right in audio_spans)
+        fraction = min(1.0, elapsed / max(1, duration - (end - start)))
+        offset = round((len(reference) - REFERENCE_EXCERPT_CHARS) * fraction)
+        reference = reference[offset:offset + REFERENCE_EXCERPT_CHARS]
+    if backend in DOUBAO_ASR_BACKENDS:
+        corpus = json.loads(hotwords) if hotwords else {}
+        corpus.update(context_type="dialog_ctx", context_data=[{"text": reference}])
+        return json.dumps(corpus, ensure_ascii=False)
+    return (hotwords + "\n" if hotwords else "") + "以下是参考文稿，仅用于辨别人名、术语和措辞。请按实际语音转写。\n" + reference
 
 
 def implicit_hotword_aliases(term: str) -> list[str]:
@@ -730,31 +756,52 @@ def implicit_hotword_aliases(term: str) -> list[str]:
 
 
 def apply_hotword_replacements_to_units(
-    units: list[dict[str, Any]], entries: list[dict[str, Any]]
+    units: list[dict[str, Any]], entries: list[dict[str, Any]], *, display_text: bool = True,
 ) -> int:
-    replacements: list[tuple[str, str]] = []
+    replacements: list[tuple[str, str, bool]] = []
     seen_aliases: set[str] = set()
+    compact_owners: dict[str, set[str]] = {}
     for entry in entries:
         term = str(entry.get("term") or "").strip()
-        for alias in [*(entry.get("aliases") or []), *implicit_hotword_aliases(term)]:
+        spoken_digits = implicit_hotword_aliases(term)
+        spellings = [*(entry.get("aliases") or []), *spoken_digits]
+        # Alignment folds Latin letters to lowercase even when ASR heard the
+        # name correctly. Restore the configured spelling on the display row.
+        if display_text and re.search(r"[A-Za-z]", term):
+            spellings.append(term)
+        for alias in spellings:
             alias_text = str(alias or "").strip()
             alias_key = alias_text.casefold()
+            compact_owners.setdefault(alias_key.replace(" ", ""), set()).add(term)
             if term and alias_text and alias_key not in seen_aliases:
-                replacements.append((alias_text, term))
+                # Timed units may lose the printed spaces of a model name and
+                # spell its number in Chinese. Keep every model character in
+                # order; optional spaces belong only at dictionary boundaries.
+                model_spacing = (display_text and " " in alias_text and bool(spoken_digits)
+                                 and bool(re.search(r"[A-Za-z]", term))
+                                 and (alias_text == term or alias_text in spoken_digits))
+                replacements.append((alias_text, term, model_spacing))
                 seen_aliases.add(alias_key)
     replacements.sort(key=lambda item: len(item[0]), reverse=True)
+
+    patterns = []
+    for alias, term, model_spacing in replacements:
+        value = re.escape(alias)
+        if model_spacing and len(compact_owners[alias.casefold().replace(" ", "")]) == 1:
+            value = r"[ \t]*".join(re.escape(part) for part in re.split(" +", alias))
+        latin = re.search(r"[A-Za-z0-9]", alias)
+        if latin:
+            value = r"(?<![A-Za-z0-9_])" + value + r"(?![A-Za-z0-9_])"
+        patterns.append((re.compile(value, re.IGNORECASE if latin else 0), term))
 
     changed_count = 0
     for unit in units:
         text = str(unit.get("text") or "")
-        for alias, term in replacements:
-            if re.search(r"[A-Za-z0-9]", alias):
-                pattern = r"(?<![A-Za-z0-9_])" + re.escape(alias) + r"(?![A-Za-z0-9_])"
-                text, replaced = re.subn(pattern, term, text, flags=re.IGNORECASE)
-            else:
-                replaced = text.count(alias)
-                text = text.replace(alias, term)
-            changed_count += replaced
+        for pattern, term in patterns:
+            replaced = sum(match[0] != term for match in pattern.finditer(text))
+            if replaced:
+                text = pattern.sub(lambda _: term, text)
+                changed_count += replaced
         unit["text"] = text
     return changed_count
 
@@ -856,6 +903,7 @@ def start_generation_trace(args: argparse.Namespace) -> dict[str, Any]:
         "code_fingerprints": {key: generation_file_fingerprint(path) for key, path in sources.items()},
         "profile_fingerprint": generation_file_fingerprint(generation_profile_path(getattr(args, "segmentation_profile", None), args.generate_engine)),
         "hotwords_fingerprint": generation_file_fingerprint(getattr(args, "hotwords_json", None)),
+        "reference_fingerprint": generation_file_fingerprint(getattr(args, "reference_file", None)),
         "parameters": {
             "requested_backend": args.backend,
             "requested_model": Path(str(args.model)).name,
@@ -1045,6 +1093,7 @@ def sanitize_generate_diagnostic_payload(payload: dict[str, Any]) -> dict[str, A
         "confirmed_silence_preserved_count",
         "overlong_tail_reclaimed_count",
         "tail_extended_row_count",
+        "picture_cut_count",
         "textnorm_changed_row_count",
         "profile_load_status",
         "failure_code",
@@ -1239,8 +1288,19 @@ def normalize_generated_subtitle_text(text: str) -> str:
     return value
 
 
+def format_generated_pause_spaces(text: str) -> str:
+    """Display an ellipsis as one space between words and nothing at a line edge."""
+    def gap(match: re.Match[str]) -> str:
+        start, end = match.span()
+        if start == 0 or end == len(text) or text[start - 1] in "\r\n" or text[end] in "\r\n":
+            return ""
+        return " "
+
+    return re.sub(r"[^\S\r\n]*(?:(?:…|\.{3,})[^\S\r\n]*)+", gap, text)
+
+
 def strip_generated_subtitle_punctuation(text: str) -> str:
-    value = str(text or "")
+    value = format_generated_pause_spaces(str(text or ""))
     value = re.sub(r"[，。！？、；：,.!?;:\"'“”‘’（）()《》【】\[\]{}<>…·/\\|]+", "", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
@@ -3501,6 +3561,8 @@ def load_generate_subtitles_batch_plan(batch_plan_json: str | None) -> list[dict
         source_end_float = float(source_end) if source_end is not None else None
         if source_end_float is not None and source_end_float <= source_start:
             continue
+        cut_frames = batch.get("picture_cuts")
+        picture_cuts = [f for f in cut_frames if type(f) is int] if isinstance(cut_frames, list) else []
         batches.append(
             {
                 "batch_id": str(batch.get("batch_id") or index),
@@ -3514,6 +3576,7 @@ def load_generate_subtitles_batch_plan(batch_plan_json: str | None) -> list[dict
                 "track_order": int(float(batch.get("track_order") or batch.get("track_index") or 0)),
                 "track_index": int(float(batch.get("track_index") or 0)),
                 "track_name": str(batch.get("track_name") or ""),
+                "picture_cuts": picture_cuts,
                 "item_index": int(float(batch.get("item_index") or 0)),
             }
         )
@@ -4785,7 +4848,9 @@ def _doubao_asr_timestamp_payload(result: Any) -> tuple[list[dict[str, Any]], li
     return segments, words
 
 
-def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
+def transcribe_doubao_asr(
+    audio_path: Path, model: str, language: str | None, *, context: str = "",
+) -> dict[str, Any]:
     """Transcribe via Volcano Engine (豆包) 录音文件极速版识别 HTTP API.
 
     Word timestamps are normalized from the API's milliseconds to seconds.
@@ -4827,6 +4892,8 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
         "audio": {"data": base64.b64encode(audio_bytes).decode("ascii")},
         "request": {"model_name": "bigmodel", "show_utterances": True},
     }
+    if context:
+        body["request"]["corpus"] = {"context": context}
     headers = {
         "Content-Type": "application/json",
         "X-Api-Resource-Id": resource_id,
@@ -4871,6 +4938,7 @@ def transcribe_doubao_asr(audio_path: Path, model: str, language: str | None) ->
                     "text": text,
                     "diagnostic": {
                         "resource_id": resource_id,
+                        "hotword_context_status": "submitted" if context else "not_requested",
                         "endpoint": endpoint,
                         "status_code": status_code,
                         "log_id": log_id,
@@ -5026,7 +5094,9 @@ def _doubao_asr_v2_post(
     return status_code, response_payload, log_id
 
 
-def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None) -> dict[str, Any]:
+def transcribe_doubao_asr_v2(
+    audio_path: Path, model: str, language: str | None, *, context: str = "",
+) -> dict[str, Any]:
     """Transcribe through 豆包录音文件识别模型 2.0 标准版's async API."""
     api_key = _doubao_asr_api_key()
     audio_bytes = Path(audio_path).read_bytes()
@@ -5060,6 +5130,8 @@ def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None)
             "enable_channel_split": False,
         },
     }
+    if context:
+        submit_body["request"]["corpus"] = {"context": context}
     checkpoint_path = _doubao_checkpoint_path(audio_bytes, submit_body, api_key, model, language)
     checkpoint = _read_doubao_checkpoint(checkpoint_path)
     if checkpoint.get("state") == "complete":
@@ -5138,6 +5210,7 @@ def transcribe_doubao_asr_v2(audio_path: Path, model: str, language: str | None)
                 "text": str(result.get("text") or "").strip(),
                 "diagnostic": {
                     "resource_id": DOUBAO_ASR_V2_RESOURCE_ID,
+                    "hotword_context_status": "submitted" if context else "not_requested",
                     "submit_endpoint": DOUBAO_ASR_V2_SUBMIT_ENDPOINT,
                     "query_endpoint": DOUBAO_ASR_V2_QUERY_ENDPOINT,
                     "task_id": task_id,
@@ -5205,8 +5278,10 @@ def transcribe_v4_window_batch(
     doubao_status_codes: list[str] = []
     for window_audio_path in window_audio_paths:
         try:
-            transcribe = transcribe_doubao_asr_v2 if backend == "doubao_asr_v2" else transcribe_doubao_asr
-            payload = transcribe(window_audio_path, args.model, args.language)
+            payload = transcribe_v4_retry_audio(
+                window_audio_path, args.model, args.language, backend=backend,
+                hotword_context=getattr(args, "hotword_context", ""),
+            )
             payloads.append(payload)
             # 收集火山返回的追踪/计费线索，便于在诊断里核对每次调用是否真计费。
             call_diag = payload.get("diagnostic") or {}
@@ -5294,10 +5369,10 @@ def transcribe_with_backend(
                     if context
                     else transcribe_qwen3_asr(audio_path, model, language)
                 )
-            elif candidate == "doubao_asr":
-                payload = transcribe_doubao_asr(audio_path, model, language)
-            elif candidate == "doubao_asr_v2":
-                payload = transcribe_doubao_asr_v2(audio_path, model, language)
+            elif candidate in DOUBAO_ASR_BACKENDS:
+                payload = transcribe_v4_retry_audio(
+                    audio_path, model, language, backend=candidate, hotword_context=context or "",
+                )
             elif candidate in EXTERNAL_TRANSCRIBE_COMMAND_ENV:
                 payload = transcribe_external_backend(audio_path, model, language, candidate)
             else:
@@ -5568,7 +5643,7 @@ def run_generate_subtitles_batch_plan_v3(
         subtitle_mode = "narration"
     configured_hotword_entries = load_hotword_entries(getattr(args, "hotwords_json", None))
     hotword_entries = configured_hotword_entries[:HOTWORD_MAX_ENTRIES]
-    hotword_context = build_hotword_context(hotword_entries)
+    hotword_context = build_hotword_context(hotword_entries, args.backend)
     args.hotword_context = hotword_context
     ffmpeg_path = resolve_ffmpeg(args.ffmpeg)
     segmentation_profile, _profile_status = load_generation_profile(args, "v3")
@@ -6012,6 +6087,8 @@ def select_adaptive_subtitle_candidates(
             int(unit.get("track_index") or 0),
         )
     )
+    selected = generate_v4.restore_corroborated_short_flips(selected, units, fps)
+    selected = generate_v4.reconcile_short_speech_handoffs(selected, units, fps)
     return selected, {
         **stage_diagnostic,
         "adaptive_fast_unit_count": sum(len(overlapping(region)) for region in safe_regions),
@@ -6050,16 +6127,13 @@ def run_generate_subtitles_batch_plan_v4(
         subtitle_mode = "narration"
     configured_hotword_entries = load_hotword_entries(getattr(args, "hotwords_json", None))
     hotword_entries = configured_hotword_entries[:HOTWORD_MAX_ENTRIES]
-    hotword_context = build_hotword_context(hotword_entries)
+    hotword_context = build_hotword_context(hotword_entries, args.backend)
     args.hotword_context = hotword_context
     uses_doubao_backend = backend_label in DOUBAO_ASR_BACKENDS
-    retry_transcribe_fn = lambda audio_path, model_name, language_name: transcribe_v4_retry_audio(
-        audio_path,
-        model_name,
-        language_name,
-        backend=backend_label,
-        hotword_context=hotword_context,
-    )
+    reference_file = getattr(args, "reference_file", None)
+    reference = Path(reference_file).read_text(encoding="utf-8-sig").strip() if reference_file else ""
+    if len(reference) > 10000:
+        raise ValueError("参考文稿超过 10000 字，请精简后再生成")
     retry_align_fn = lambda audio_path, text, language: align_v4_retry_audio(
         audio_path,
         text,
@@ -6179,6 +6253,13 @@ def run_generate_subtitles_batch_plan_v4(
         ]
         if not windows:
             raise RuntimeError(f"{engine_label} 未生成连续音轨窗口")
+        spans = generate_v4.merge_audio_spans([(w["start_frame"], w["end_frame"]) for w in windows])
+        def window_context(window):
+            return generation_reference_context(reference, hotword_context, backend_label, window, spans)
+
+        def retry_transcriber(window):
+            return partial(transcribe_v4_retry_audio, backend=backend_label, hotword_context=window_context(window))
+
         write_progress(
             progress_path,
             "generate_subtitle_batch",
@@ -6189,7 +6270,7 @@ def run_generate_subtitles_batch_plan_v4(
             progress_total=100,
         )
         raw_payloads: list[dict[str, Any]] = []
-        batch_size = qwen_generate_batch_size()
+        batch_size = 1 if len(reference) > REFERENCE_EXCERPT_CHARS else qwen_generate_batch_size()
         for offset in range(0, len(windows), batch_size):
             chunk = windows[offset:offset + batch_size]
             write_progress(
@@ -6201,10 +6282,14 @@ def run_generate_subtitles_batch_plan_v4(
                 progress_index=v4_progress_point(25, 55, offset, len(windows)),
                 progress_total=100,
             )
+            if reference:
+                args.hotword_context = window_context(chunk[0])
             chunk_payloads, chunk_asr_diagnostic = transcribe_v4_window_batch(
                 [Path(window["audio_path"]) for window in chunk],
                 args,
             )
+            if reference and chunk_asr_diagnostic.get("hotword_context_supported") is False:
+                raise RuntimeError("当前识别模型不支持参考文稿，请切换模型或清空文稿后重试")
             raw_payloads.extend(chunk_payloads)
             for source_payload in chunk_payloads:
                 record_generation_asr(args, source_payload)
@@ -6236,6 +6321,11 @@ def run_generate_subtitles_batch_plan_v4(
             )
         if len(raw_payloads) != len(windows):
             raise RuntimeError(f"{engine_label} {asr_label} 窗口数量不匹配: {len(raw_payloads)} != {len(windows)}")
+        if uses_doubao_backend and hotword_entries:
+            submitted = all((payload.get("diagnostic") or {}).get("hotword_context_status") == "submitted"
+                            for payload in raw_payloads)
+            diagnostic["hotword_injected_count"] = len(hotword_entries) if submitted else 0
+            diagnostic["hotword_context_supported"] = submitted
         track_by_index = {int(track["track_index"]): track for track in prepared_tracks}
         recovered_payloads: list[dict[str, Any]] = []
         recovery_diagnostics: list[dict[str, Any]] = []
@@ -6259,7 +6349,7 @@ def run_generate_subtitles_batch_plan_v4(
                     retry_dir=tmp_path / "asr_recovery",
                     model=args.model,
                     language=args.language,
-                    transcribe_fn=retry_transcribe_fn,
+                    transcribe_fn=retry_transcriber(window),
                 )
             except generate_v4.V4AlignmentError:
                 diagnostic["asr_unrecovered_window_count"] += 1
@@ -6318,7 +6408,7 @@ def run_generate_subtitles_batch_plan_v4(
                     int(region["end_frame"]),
                     float(track["fps"]),
                 )
-                retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
+                retry_payload = retry_transcriber(region)(retry_path, args.model, args.language)
                 record_generation_asr(args, retry_payload, "retry_candidate")
                 diagnostic["local_retry_elapsed_seconds"] += time.monotonic() - local_retry_started_at
                 write_progress(
@@ -6354,7 +6444,7 @@ def run_generate_subtitles_batch_plan_v4(
                         "speech_seconds": audio_duration_seconds(retry_path),
                     }
                 )
-        if hotword_context:
+        if hotword_context and not uses_doubao_backend:
             diagnostic["hotword_context_supported"] = not any(
                 str((payload.get("diagnostic") or {}).get("hotword_context_status") or "")
                 == "unsupported"
@@ -6414,11 +6504,7 @@ def run_generate_subtitles_batch_plan_v4(
             )
             track_index = int(window["track_index"])
             track = track_by_index[track_index]
-            track_windows = [
-                candidate
-                for candidate in windows
-                if int(candidate.get("track_index") or 0) == track_index
-            ]
+            track_windows = track["windows"]
             local_index = next(
                 (index for index, candidate in enumerate(track_windows) if int(candidate.get("window_index") or 0) == int(window.get("window_index") or 0)),
                 -1,
@@ -6495,6 +6581,12 @@ def run_generate_subtitles_batch_plan_v4(
                 if context_retry and adjacent_window is not None
                 else int(window["start_frame"])
             )
+            score_end_frame = int(window["end_frame"])
+            if context_retry and adjacent_window is not None:
+                score_end_frame = max(score_end_frame, int(adjacent_window["end_frame"]))
+            aligned_units = generate_v4.group_units_by_audio_span(
+                aligned_units, [(score_start_frame, score_end_frame)]
+            )[0]
             aligned_units = generate_v4.score_aligned_units_from_audio(
                 score_audio_path,
                 aligned_units,
@@ -6556,7 +6648,7 @@ def run_generate_subtitles_batch_plan_v4(
                     }
                 )
             diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
-                aligned_units, hotword_entries
+                aligned_units, hotword_entries, display_text=False
             )
             units_by_track.setdefault(track_index, []).extend(aligned_units)
             successful_alignment_windows.append(
@@ -6610,7 +6702,7 @@ def run_generate_subtitles_batch_plan_v4(
                     float(track["fps"]),
                 )
                 try:
-                    retry_payload = retry_transcribe_fn(retry_path, args.model, args.language)
+                    retry_payload = retry_transcriber(region)(retry_path, args.model, args.language)
                     record_generation_asr(args, retry_payload, "retry_candidate")
                     retry_units, retry_align_diagnostic = generate_v4.require_aligned_units(
                         retry_path,
@@ -6647,7 +6739,7 @@ def run_generate_subtitles_batch_plan_v4(
                     unit["alignment_repaired_unit_count"] = int(retry_align_diagnostic.get("alignment_repaired_unit_count") or 0)
                     unit["unit_count"] = len(retry_units)
                 diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
-                    retry_units, hotword_entries
+                    retry_units, hotword_entries, display_text=False
                 )
                 units_by_track.setdefault(track_index, []).extend(retry_units)
                 retry_regions.append(
@@ -6821,93 +6913,33 @@ def run_generate_subtitles_batch_plan_v4(
             }
             for unit in canonical_units
         ]
-        subtitle_rows, segmentation_diagnostic = generate_v4.segment_canonical_units(
-            canonical_units,
-            subtitle_mode,
-            profile,
-            float(args.fps or 30.0),
-            max_chars=getattr(args, "max_chars", None),
-        )
-        subtitle_rows, overlong_tail_reclaimed_count = generate_v4.reclaim_overlong_unit_tails(
-            subtitle_rows,
-            canonical_units,
-            float(args.fps or 30.0),
-        )
-        diagnostic["overlong_tail_reclaimed_count"] = overlong_tail_reclaimed_count
-        subtitle_rows, word_boundary_protected_count = generate_v4.protect_word_boundaries(
-            subtitle_rows,
-            canonical_units,
-            float(args.fps or 30.0),
-        )
-        diagnostic["word_boundary_protected_count"] = word_boundary_protected_count
-        subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(
-            subtitle_rows,
-            canonical_units,
-            getattr(args, "max_chars", None),
-        )
-        diagnostic["hard_char_split_count"] = hard_char_split_count
-        subtitle_rows = generate_v4.restore_display_spacing(subtitle_rows, canonical_units)
-        subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
-        diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
-        if v5_mode and v5_writeback == "live" and subtitle_rows:
-            refined_rows: list[dict[str, Any]] = []
-            refinement_diagnostic = {
-                "audio_refinement_mode": v5_writeback,
-                "audio_refined_row_count": 0,
-                "energy_valley_boundary_count": 0,
-                "confirmed_silence_preserved_count": 0,
-            }
-            for track in prepared_tracks:
-                track_index = int(track["track_index"])
-                track_rows = [
-                    row
-                    for row in subtitle_rows
-                    if int(row.get("speaker_track_index") or 0) == track_index
-                ]
-                if not track_rows:
-                    continue
-                refine_boundaries = (
-                    generate_v5.refine_subtitle_boundaries
-                    if v5_writeback == "live"
-                    else generate_v5.shadow_refine_subtitle_boundaries
-                )
-                refined_track_rows, track_refinement = refine_boundaries(
-                    track_rows,
-                    Path(track["audio_path"]),
-                    int(track["timeline_start_frame"]),
-                    float(track["fps"]),
-                )
-                refined_rows.extend(refined_track_rows)
-                for key, value in track_refinement.items():
-                    if isinstance(value, (int, float)):
-                        refinement_diagnostic[key] = int(refinement_diagnostic.get(key) or 0) + int(value)
-                    else:
-                        refinement_diagnostic[key] = value
-            subtitle_rows, refinement_conflicts = generate_v5.preserve_refined_row_order(refined_rows)
-            refinement_diagnostic["audio_refinement_overlap_prevented_count"] = refinement_conflicts
-            refinement_diagnostic["audio_refined_row_count"] = sum(
-                row["start_frame"] != row["original_start_frame"] or row["end_frame"] != row["original_end_frame"]
-                for row in subtitle_rows
+        unit_groups = generate_v4.group_units_by_audio_span(canonical_units, spans)
+        candidate_groups = generate_v4.group_units_by_audio_span(candidates, spans)
+        picture_cuts = sorted({f for batch in batches for f in batch.get("picture_cuts", [])})
+        diagnostic["picture_cut_count"] = len(picture_cuts)
+        tokenizer = generate_v4.hotword_tokenizer(configured_hotword_entries)
+        subtitle_rows = []
+        for (start, end), units, witnesses in zip(spans, unit_groups, candidate_groups):
+            if not units:
+                continue
+            rows, span_diagnostic = segment_audio_span(
+                units, witnesses, args=args, subtitle_mode=subtitle_mode, profile=profile,
+                active_mode_profile=active_mode_profile, v5_mode=v5_mode, v5_writeback=v5_writeback,
+                prepared_tracks=prepared_tracks, work_items=work_items, picture_cuts=picture_cuts,
+                hotword_entries=hotword_entries, tokenizer=tokenizer, audio_span=(start, end),
             )
-            diagnostic.update(refinement_diagnostic)
-        # Display continuity is the final timing step. In v5, keep the original
-        # long pauses protected above instead of filling them from duration alone.
-        tail_extension_gap_seconds = generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS
-        if v5_mode:
-            tail_extension_gap_seconds = min(tail_extension_gap_seconds, 0.20)
-        tail_extension_max_gap_frames = int(round(tail_extension_gap_seconds * float(args.fps or 30.0)))
-        subtitle_rows, tail_extended_row_count = generate_v4.extend_subtitle_row_tails(
-            subtitle_rows,
-            float(args.fps or 30.0),
-            tail_extension_max_gap_frames,
-        )
-        diagnostic["tail_extended_row_count"] = tail_extended_row_count
-        diagnostic["hotword_replacement_count"] += apply_hotword_replacements_to_units(
-            subtitle_rows, hotword_entries
-        )
+            for row in rows:
+                row["start_frame"] = max(start, row["start_frame"])
+                row["end_frame"] = min(end, row["end_frame"])
+                if row["end_frame"] > row["start_frame"]:
+                    subtitle_rows.append(row)
+            for key, value in span_diagnostic.items():
+                if key.endswith("_count"):
+                    diagnostic[key] = diagnostic.get(key, 0) + value
+                else:
+                    diagnostic[key] = value
         for index, row in enumerate(subtitle_rows, start=1):
             row["index"] = index
-        diagnostic.update(segmentation_diagnostic)
         mode_profile = active_mode_profile if v5_mode else (((profile or {}).get("modes") or {}).get(subtitle_mode) if profile else None)
         boundary_model = (mode_profile or {}).get("boundary_model") if isinstance(mode_profile, dict) else None
         canonical_text = "".join(generate_v4.normalize_text(unit.get("text")) for unit in canonical_units)
@@ -6974,6 +7006,139 @@ def run_generate_subtitles_batch_plan_v4(
         "text": "".join(str(row.get("text") or "") for row in subtitle_rows),
         "diagnostic": diagnostic,
     }
+
+
+def segment_audio_span(canonical_units, candidates, *, args, subtitle_mode, profile, active_mode_profile,
+                       v5_mode, v5_writeback, prepared_tracks, work_items, picture_cuts, hotword_entries,
+                       tokenizer, audio_span):
+    """Run all boundary-changing passes within a single continuous audio range."""
+    diagnostic = {}
+    subtitle_rows, segmentation_diagnostic = generate_v4.segment_canonical_units(
+        canonical_units,
+        subtitle_mode,
+        profile,
+        float(args.fps or 30.0),
+        max_chars=getattr(args, "max_chars", None),
+    )
+    if v5_mode:
+        max_chars = generate_v4._segmentation_length_parameters(
+            subtitle_mode, active_mode_profile, getattr(args, "max_chars", None)
+        )[-1]
+        subtitle_rows, diagnostic["clause_continuation_count"] = generate_v4.repair_clause_continuations(
+            subtitle_rows, canonical_units, candidates, float(args.fps or 30.0), max_chars
+        )
+    subtitle_rows, overlong_tail_reclaimed_count = generate_v4.reclaim_overlong_unit_tails(
+        subtitle_rows,
+        canonical_units,
+        float(args.fps or 30.0),
+    )
+    diagnostic["overlong_tail_reclaimed_count"] = overlong_tail_reclaimed_count
+    subtitle_rows, word_boundary_protected_count = generate_v4.protect_word_boundaries(
+        subtitle_rows,
+        canonical_units,
+        float(args.fps or 30.0),
+        tokenizer=tokenizer,
+    )
+    diagnostic["word_boundary_protected_count"] = word_boundary_protected_count
+    if v5_mode:
+        subtitle_rows, diagnostic["phrase_reflow_count"] = generate_v4.reflow_phrase_boundaries(
+            subtitle_rows, canonical_units, candidates, float(args.fps or 30.0), max_chars, tokenizer
+        )
+    subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(
+        subtitle_rows,
+        canonical_units,
+        getattr(args, "max_chars", None),
+        tokenizer=tokenizer,
+    )
+    diagnostic["hard_char_split_count"] = hard_char_split_count
+    subtitle_rows = generate_v4.restore_display_spacing(
+        subtitle_rows, canonical_units, float(args.fps or 30.0) if v5_mode else None
+    )
+    subtitle_rows, textnorm_diagnostic = generate_textnorm.normalize_subtitle_rows(subtitle_rows)
+    diagnostic["textnorm_changed_row_count"] = textnorm_diagnostic["textnorm_changed_row_count"]
+    if v5_mode and v5_writeback == "live" and subtitle_rows:
+        refined_rows: list[dict[str, Any]] = []
+        refinement_diagnostic = {
+            "audio_refinement_mode": v5_writeback,
+            "audio_refined_row_count": 0,
+            "energy_valley_boundary_count": 0,
+            "confirmed_silence_preserved_count": 0,
+        }
+        for track in prepared_tracks:
+            track_index = int(track["track_index"])
+            track_rows = [
+                row
+                for row in subtitle_rows
+                if int(row.get("speaker_track_index") or 0) == track_index
+            ]
+            if not track_rows:
+                continue
+            track_path = Path(track["audio_path"])
+            track_start = int(track["timeline_start_frame"])
+            track_end = int(track["timeline_end_frame"])
+            audio_start = max(track_start, audio_span[0])
+            audio_end = min(track_end, audio_span[1])
+            if (audio_start, audio_end) != (track_start, track_end):
+                # Read the waveform for this span once, without scanning a long empty gap.
+                span_path = track_path.with_suffix(".span.wav")
+                generate_v4.write_context_window_audio(
+                    track_path, span_path, track_start, audio_start, audio_end, float(track["fps"])
+                )
+                track_path = span_path
+            refined_track_rows, track_refinement = generate_v5.refine_subtitle_boundaries(
+                track_rows, track_path, audio_start, float(track["fps"])
+            )
+            refined_rows.extend(refined_track_rows)
+            for key, value in track_refinement.items():
+                if isinstance(value, (int, float)):
+                    refinement_diagnostic[key] = int(refinement_diagnostic.get(key) or 0) + int(value)
+                else:
+                    refinement_diagnostic[key] = value
+        subtitle_rows, refinement_conflicts = generate_v5.preserve_refined_row_order(refined_rows)
+        refinement_diagnostic["audio_refinement_overlap_prevented_count"] = refinement_conflicts
+        refinement_diagnostic["audio_refined_row_count"] = sum(
+            row["start_frame"] != row["original_start_frame"] or row["end_frame"] != row["original_end_frame"]
+            for row in subtitle_rows
+        )
+        diagnostic.update(refinement_diagnostic)
+    # Display continuity is the final timing step. In v5, keep the original
+    # long pauses protected above instead of filling them from duration alone.
+    tail_extension_gap_seconds = generate_v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS
+    if v5_mode:
+        tail_extension_gap_seconds = min(tail_extension_gap_seconds, 0.20)
+    tail_extension_max_gap_frames = int(round(tail_extension_gap_seconds * float(args.fps or 30.0)))
+    subtitle_rows, tail_extended_row_count = generate_v4.extend_subtitle_row_tails(
+        subtitle_rows,
+        float(args.fps or 30.0),
+        tail_extension_max_gap_frames,
+    )
+    diagnostic["tail_extended_row_count"] = tail_extended_row_count
+    diagnostic["hotword_replacement_count"] = apply_hotword_replacements_to_units(
+        subtitle_rows, hotword_entries
+    )
+    if v5_mode and v5_writeback == "live":
+        last = subtitle_rows[-1] if subtitle_rows else None
+        final_clip_end = max((
+            item["timeline_end_frame"] for item in work_items
+            if last and item["track_index"] == last.get("speaker_track_index")
+            and item["timeline_end_frame"] is not None
+            and item["timeline_start_frame"] < last["end_frame"] <= item["timeline_end_frame"]
+        ), default=None)
+        subtitle_rows = generate_v5.stabilize_brief_cues(
+            subtitle_rows, canonical_units, float(args.fps or 30.0), max_chars, candidates,
+            timeline_end_frame=final_clip_end, picture_cuts=picture_cuts,
+        )
+        subtitle_rows = generate_v4.split_delayed_endings(
+            subtitle_rows, canonical_units, float(args.fps or 30.0), picture_cuts, max_chars
+        )
+    for row in subtitle_rows:
+        if v5_mode:
+            # Keep display punctuation out of word alignment and character offsets.
+            row["text"] = generate_v4.punctuate_spoken_restarts(row["text"])
+        row["text"] = format_generated_pause_spaces(row["text"])
+    subtitle_rows = generate_v4.split_display_commas(subtitle_rows, canonical_units)
+    diagnostic.update(segmentation_diagnostic)
+    return subtitle_rows, diagnostic
 
 
 def run_generate_subtitles_batch_plan_v5(
@@ -7785,10 +7950,11 @@ def transcribe_v4_retry_audio(
     hotword_context: str = "",
 ) -> dict[str, Any]:
     """Retry a v4/v5 window with the backend explicitly selected by the user."""
-    if backend == "doubao_asr":
-        return transcribe_doubao_asr(audio_path, model, language)
-    if backend == "doubao_asr_v2":
-        return transcribe_doubao_asr_v2(audio_path, model, language)
+    if backend in DOUBAO_ASR_BACKENDS:
+        transcribe = transcribe_doubao_asr_v2 if backend == "doubao_asr_v2" else transcribe_doubao_asr
+        if hotword_context:
+            return transcribe(audio_path, model, language, context=hotword_context)
+        return transcribe(audio_path, model, language)
     return (
         transcribe_qwen3_asr(audio_path, model, language, context=hotword_context)
         if hotword_context
@@ -7919,6 +8085,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--segmentation-profile")
     parser.add_argument("--hotwords-json")
+    parser.add_argument("--reference-file", help="UTF-8 reference manuscript for this generation")
     parser.add_argument("--calibration-json", action="append", default=[])
     parser.add_argument(
         "--backend",

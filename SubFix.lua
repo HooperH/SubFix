@@ -24,7 +24,7 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.4.1"
+SUBFIX_VERSION = "3.4.2"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
 _subfix_script_started_at = os.clock()
@@ -13184,7 +13184,9 @@ function run_generate_selection_subtitles_from_subfix(target_window)
         return false
     end
 
+    local config = read_shared_config_from_ui()
     local ok, run_err = core.run({
+        reference_text = config.is_script_enabled and config.script_content or "",
         script_root = script_root,
         target_subtitle_track = 1
     })
@@ -18209,6 +18211,13 @@ local mini_content = ui:VGroup({
 })
 
 local function create_full_content()
+local function toolbar_button(attrs)
+    attrs.Weight = 1
+    attrs.MinimumSize = {64, 40}
+    attrs.MaximumSize = {16777215, 40}
+    return ui:Button(attrs)
+end
+
 return ui:VGroup({
     Weight = 1,
     ID = "MainRoot",
@@ -18246,11 +18255,10 @@ return ui:VGroup({
                     ui:Button({ID = "TrackSpinDown", Text = "▼", Weight = 1, MinimumSize = {20, 16}})
                 })
             }),
-            ui:Button({ID = "RefreshBtn", Text = "刷新字幕", Weight = 0}),
-            ui:Button({ID = "CheckUpdateBtn", Text = "检查更新", Weight = 0}),
-            ui:Button({ID = "ModelCenterBtn", Text = "模型中心", Weight = 0}),
-            -- 加载状态标签已删除（底部「已加载 N 条」更准确）。HGap 保留右侧空间。
-            ui:HGap(0, 1.0),
+            toolbar_button({ID = "RefreshBtn", Text = "刷新字幕"}),
+            toolbar_button({ID = "CheckUpdateBtn", Text = "检查更新"}),
+            toolbar_button({ID = "ModelCenterBtn", Text = "模型中心"}),
+            toolbar_button({ID = "WebsiteBtn", Text = "前往官网"}),
             ui:Button({
                 ID = "ForceQuitBtn",
                 Text = "⏻",
@@ -22549,8 +22557,10 @@ function subfix_update_python_path(helper)
     return ok_python and python ~= "" and python or nil
 end
 
-function open_subfix_update_website()
-    local url = "https://subfix-by-hooper.ysjf.chatgpt.site/"
+function open_subfix_update_website(url)
+    if type(url) ~= "string" or not url:match("^https://[^/%s]+/") or url:find("[%s%c]") then
+        url = "https://hooperh.github.io/SubFix/download/"
+    end
     local ok, result = pcall(os.execute, "/usr/bin/open " .. shell_quote(url) .. " >/dev/null 2>&1")
     if not ok or (result ~= true and result ~= 0) then
         return false, "无法打开浏览器，请手动访问：\n" .. url
@@ -22560,20 +22570,21 @@ end
 
 function show_subfix_update_confirm(payload, failure_message)
     payload = type(payload) == "table" and payload or {}
+    local manual = payload.manual_update_required == true
     local dialog = dispatcher:AddWindow({ID = "SubFixUpdateConfirm", WindowTitle = "SubFix 更新", Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({480, 300, 460, 220})},
         ui:VGroup{ContentsMargins = 18, Spacing = 8,
             ui:Label{Text = failure_message and "更新暂未完成" or ("发现新版本 v" .. tostring(payload.version or "?")), Weight = 0},
-            ui:TextEdit{ID = "SubFixUpdateNotes", PlainText = tostring(failure_message or payload.notes or ""), ReadOnly = true, Weight = 1},
+            ui:TextEdit{ID = "SubFixUpdateNotes", PlainText = tostring(failure_message or (manual and payload.error) or payload.notes or ""), ReadOnly = true, Weight = 1},
             ui:HGroup{Weight = 0, Spacing = 8,
-                ui:Button{ID = "SubFixUpdateInstall", Text = "下载并安装", Hidden = failure_message ~= nil, Weight = 1},
-                ui:Button{ID = "SubFixUpdateWebsite", Text = "官网下载", Weight = 1},
+                ui:Button{ID = "SubFixUpdateInstall", Text = "下载并安装", Hidden = failure_message ~= nil or manual, Weight = 1},
+                ui:Button{ID = "SubFixUpdateWebsite", Text = manual and "下载完整安装包" or "官网下载", Weight = 1},
                 ui:Button{ID = "SubFixUpdateCancel", Text = failure_message and "关闭" or "取消", Weight = 1}
             }
         })
     local action = "cancel"
     function dialog.On.SubFixUpdateInstall.Clicked(ev) action = "install"; dialog:Hide(); dispatcher:ExitLoop() end
     function dialog.On.SubFixUpdateWebsite.Clicked(ev)
-        local opened, message = open_subfix_update_website()
+        local opened, message = open_subfix_update_website(manual and payload.manual_download_url or nil)
         if opened then
             action = "website"; dialog:Hide(); dispatcher:ExitLoop()
         else
@@ -22628,6 +22639,9 @@ function run_subfix_update_check(cmd, output_path)
     })
     local result = decode_json_text(read_text_file(output_path) or "")
     os.remove(output_path)
+    if call_ok and type(result) == "table" and result.manual_update_required == true and result.update_available == true then
+        return true, result
+    end
     if not call_ok or not ok or type(result) ~= "table" or result.ok ~= true then
         local message = trim_text(tostring((not call_ok and ok) or (type(result) == "table" and result.error) or output or ""))
         local status = type(result) == "table" and result.update_available == false and "no_update" or "failed"
@@ -22702,6 +22716,11 @@ function win.On.ModelCenterBtn.Clicked(ev)
     open_subfix_model_center(win)
 end
 
+function win.On.WebsiteBtn.Clicked(ev)
+    local opened, message = open_subfix_update_website("https://hooperh.github.io/SubFix/")
+    update_shared_status(win, opened and "已打开 SubFix 官网" or message)
+end
+
 function win.On.CheckUpdateBtn.Clicked(ev)
     if SUBFIX_UPDATE_RUNNING then return end
     SUBFIX_UPDATE_RUNNING = true
@@ -22727,12 +22746,12 @@ function win.On.CheckUpdateBtn.Clicked(ev)
             return
         end
         local action = show_subfix_update_confirm(payload)
-        if action == "install" then
+        if action == "install" and not payload.manual_update_required then
             local installed, message, install_status = run_subfix_update(payload)
             update_shared_status(win, message)
             if not installed and install_status ~= "cancelled" then show_subfix_update_confirm(nil, message) end
         elseif action == "website" then
-            update_shared_status(win, "已打开官网下载页面")
+            update_shared_status(win, payload.manual_update_required and "已打开完整安装包下载链接" or "已打开官网下载页面")
         else
             update_shared_status(win, "已取消更新")
         end

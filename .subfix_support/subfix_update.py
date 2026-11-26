@@ -28,8 +28,8 @@ import zipfile
 
 REPOSITORY = "HooperH/SubFix"
 RELEASE_API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
-WEBSITE_URL = "https://subfix-by-hooper.ysjf.chatgpt.site/"
-WEBSITE_API_URL = WEBSITE_URL + "api/latest-release"
+WEBSITE_URL = "https://hooperh.github.io/SubFix/"
+WEBSITE_API_URL = WEBSITE_URL + "updates/latest.json"
 UPDATE_CACHE_ROOT = Path.home() / "Library/Caches/SubFix/updates"
 MAX_UPDATE_BYTES = 256 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
@@ -139,6 +139,14 @@ def _no_update(remote_version: str, current_version: str) -> dict[str, Any] | No
     return None
 
 
+def _manual_update_required(version: str, download_url: str) -> dict[str, Any]:
+    return {
+        "ok": False, "update_available": True, "manual_update_required": True,
+        "version": version, "manual_download_url": download_url,
+        "error": f"发现新版 {version}，请前往官网下载完整安装包覆盖升级，无需卸载。",
+    }
+
+
 def release_to_update_info(release: dict[str, Any], current_version: str) -> dict[str, Any]:
     if release.get("draft") is True or release.get("prerelease") is True:
         return {"ok": False, "error": "最新发布不是稳定版"}
@@ -165,6 +173,10 @@ def release_to_update_info(release: dict[str, Any], current_version: str) -> dic
     zip_url = asset_urls.get(prefix + ".zip")
     sha256_url = asset_urls.get(prefix + ".sha256")
     if not zip_url or not sha256_url:
+        for suffix in ("macOS.pkg", "Full-macOS.zip"):
+            installer_url = asset_urls.get(f"SubFix-v{remote_version}-{suffix}")
+            if installer_url:
+                return _manual_update_required(remote_version, _https_url(installer_url))
         return {"ok": False, "error": "Release 缺少更新 ZIP 或 SHA-256 校验文件"}
     return {
         "ok": True,
@@ -174,7 +186,7 @@ def release_to_update_info(release: dict[str, Any], current_version: str) -> dic
         "notes": str(release.get("body") or ""),
         "zip_url": zip_url,
         "sha256_url": sha256_url,
-        "manual_download_url": WEBSITE_URL,
+        "manual_download_url": WEBSITE_URL + "download/",
     }
 
 
@@ -194,6 +206,18 @@ def manifest_to_update_info(manifest: dict[str, Any], current_version: str) -> d
     _https_url(manifest.get("releaseUrl"))
     if type(manifest.get("sizeBytes")) is not int or manifest["sizeBytes"] <= 0:
         raise UpdateError("官网安装包大小无效")
+    for field in ("name", "notes"):
+        if field in manifest and not isinstance(manifest[field], str):
+            raise UpdateError("官网更新说明格式错误")
+    if manifest.get("installationMode") not in (None, "full"):
+        raise UpdateError("官网安装方式无效")
+    if manifest.get("installationMode") == "full":
+        if "update" not in manifest or manifest["update"] is not None:
+            raise UpdateError("完整安装发布不能包含增量更新包")
+        no_update = _no_update(version, current_version)
+        if no_update is not None:
+            return {**no_update, "manual_download_url": manual_url}
+        return _manual_update_required(version, manual_url)
     update = manifest.get("update")
     if not isinstance(update, dict):
         raise UpdateError("官网缺少更新包清单")
@@ -206,9 +230,6 @@ def manifest_to_update_info(manifest: dict[str, Any], current_version: str) -> d
     if not isinstance(fallbacks, list) or len(fallbacks) > 3:
         raise UpdateError("官网备用下载地址无效")
     fallbacks = [_https_url(item) for item in fallbacks]
-    for field in ("name", "notes"):
-        if field in manifest and not isinstance(manifest[field], str):
-            raise UpdateError("官网更新说明格式错误")
     no_update = _no_update(version, current_version)
     if no_update is not None:
         return {**no_update, "manual_download_url": manual_url}
@@ -243,9 +264,7 @@ def check_for_update(current_version: str, timeout_seconds: float = 10) -> dict[
             with _time_limit(budget):
                 if source == "website":
                     return manifest_to_update_info(_read_json_url(WEBSITE_API_URL, budget), current_version)
-                result = release_to_update_info(fetch_latest_release(budget), current_version)
-                if result.get("ok") or result.get("update_available") is False:
-                    return result
+                return release_to_update_info(fetch_latest_release(budget), current_version)
         except (UpdateError, URLError, OSError, HTTPException, ValueError, UnicodeDecodeError):
             continue
     raise UpdateError("官网和备用更新源暂时无法连接，请稍后重试或前往官网下载")
@@ -574,7 +593,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "check":
             payload = check_for_update(args.current_version)
             write_output(args.output, payload)
-            return 0 if payload.get("ok") else 1
+            # Old Lua clients use ok to decide whether an incremental ZIP can be installed.
+            # A full-installer result completes the check but must keep ok false for them.
+            return 0 if payload.get("ok") or payload.get("manual_update_required") else 1
         if args.action in ("download", "install"):
             def report_download(downloaded: int, total: int | None) -> None:
                 amount = f"{downloaded / (1024 * 1024):.2f} MB"

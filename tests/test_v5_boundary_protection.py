@@ -112,16 +112,16 @@ def test_pipeline_extends_display_only_after_refinement_and_keeps_long_pauses(tm
         return v5.v4.extend_subtitle_row_tails(*args)
 
     source = (ROOT / "subfix_asr_transcribe.py").read_text()
-    start = source.index("        subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(")
-    end = source.index('        diagnostic["hotword_replacement_count"] +=', start)
+    start = source.index("    subtitle_rows, hard_char_split_count = generate_v4.enforce_hard_char_limit(")
+    end = source.index('    diagnostic["hotword_replacement_count"] =', start)
     rows = [{"text": "前句", "start_frame": 15, "end_frame": 30, "speaker_track_index": 1},
             {"text": "后句", "start_frame": 45, "end_frame": 60, "speaker_track_index": 1}]
     namespace = dict(
-        subtitle_rows=rows, canonical_units=[], Path=Path, args=SimpleNamespace(fps=30.0, max_chars=20),
-        diagnostic={}, v5_mode=use_v5, v5_writeback="live",
-        prepared_tracks=[{"track_index": 1, "audio_path": audio, "timeline_start_frame": 0, "fps": 30.0}],
+        subtitle_rows=rows, canonical_units=[], tokenizer=None, Path=Path, args=SimpleNamespace(fps=30.0, max_chars=20),
+        diagnostic={}, audio_span=(0, 75), v5_mode=use_v5, v5_writeback="live",
+        prepared_tracks=[{"track_index": 1, "audio_path": audio, "timeline_start_frame": 0, "timeline_end_frame": 75, "fps": 30.0}],
         generate_v4=SimpleNamespace(
-            enforce_hard_char_limit=lambda rows, *_: (rows, 0),
+            enforce_hard_char_limit=v5.v4.enforce_hard_char_limit,
             restore_display_spacing=lambda rows, *_: rows,
             extend_subtitle_row_tails=extend_record,
             SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS=v5.v4.SUBTITLE_ROW_TAIL_EXTENSION_GAP_SECONDS),

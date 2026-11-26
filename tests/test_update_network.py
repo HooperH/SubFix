@@ -37,6 +37,58 @@ class Response(io.BytesIO):
         return self.url
 
 
+@pytest.mark.parametrize("current,available", [("3.3.9", True), ("3.4.0", False), ("3.4.1", False)])
+def test_full_installer_release_is_checked_without_github(monkeypatch, current, available):
+    data = {**manifest("3.4.0"), "installationMode": "full", "update": None}
+    calls = []
+    def read(url, timeout):
+        calls.append(url)
+        assert url == updater.WEBSITE_API_URL
+        return data
+    monkeypatch.setattr(updater, "_read_json_url", read)
+    result = updater.check_for_update(current)
+    assert calls == ["https://hooperh.github.io/SubFix/updates/latest.json"]
+    assert result["version"] == "3.4.0"
+    assert result["update_available"] is available
+    assert "zip_url" not in result
+    if available:
+        assert result["manual_update_required"] and not result["ok"]
+        assert "完整安装包" in result["error"]
+    elif current == "3.4.0":
+        assert result["error"] == "当前已是最新稳定版"
+
+
+def test_full_install_mode_never_accepts_an_incremental_payload():
+    with pytest.raises(updater.UpdateError):
+        updater.manifest_to_update_info({**manifest(), "installationMode": "full"}, "3.4.0")
+
+
+def test_github_full_installer_release_prompts_manual_upgrade():
+    result = updater.release_to_update_info({"tag_name": "v3.4.0", "assets": [{
+        "name": "SubFix-v3.4.0-macOS.pkg",
+        "browser_download_url": "https://github.com/HooperH/SubFix/releases/download/v3.4.0/SubFix-v3.4.0-macOS.pkg",
+    }]}, "3.3.9")
+    assert result["manual_update_required"] and not result["ok"]
+    assert "zip_url" not in result
+
+
+def test_failed_website_and_installer_only_github_complete_check(monkeypatch, tmp_path):
+    pkg = "https://github.com/HooperH/SubFix/releases/download/v3.4.1/SubFix-v3.4.1-macOS.pkg"
+    def read(url, timeout):
+        if url == updater.WEBSITE_API_URL:
+            raise URLError("offline")
+        assert url == updater.RELEASE_API_URL
+        return {"tag_name": "v3.4.1", "assets": [
+            {"name": "SubFix-v3.4.1-macOS.pkg", "browser_download_url": pkg}
+        ]}
+    monkeypatch.setattr(updater, "_read_json_url", read)
+    output = tmp_path / "check.json"
+    assert updater.main(["check", "--current-version", "3.4.0", "--output", str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert result["manual_update_required"] and result["update_available"] and not result["ok"]
+    assert result["manual_download_url"] == pkg and "zip_url" not in result
+
+
 def archive_bytes(version="3.4.1"):
     body = io.BytesIO()
     with zipfile.ZipFile(body, "w") as archive:

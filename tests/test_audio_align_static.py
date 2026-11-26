@@ -1751,7 +1751,7 @@ def test_generate_selection_subtitles_subplugin_accepts_single_sided_timeline_ma
         GENERATOR_CORE_SOURCE.index("local function read_timeline_in_out_scope") : GENERATOR_CORE_SOURCE.index("local function read_generation_scope")
     ]
 
-    assert "read_timeline_in_out_scope(timeline, fps)" in GENERATOR_CORE_SOURCE
+    assert "read_timeline_in_out_scope(timeline, fps, first, last)" in GENERATOR_CORE_SOURCE
     assert "local mark_candidates = {" in scope_body
     assert "for _, mark in pairs(mark_candidates) do" not in scope_body
     assert "for _, mark in ipairs(mark_candidates) do" in scope_body
@@ -1761,20 +1761,19 @@ def test_generate_selection_subtitles_subplugin_accepts_single_sided_timeline_ma
     assert "单侧 I/O 范围过长" not in scope_body
     assert '"In/Out (Out only)"' in scope_body
     assert '"In/Out (In only)"' in scope_body
-    assert "未读取到 O 点；请按 O 设置结束点后再生成" in scope_body
 
 
-def test_generate_selection_subtitles_subplugin_requires_real_in_out_scope():
+def test_generate_selection_subtitles_subplugin_defaults_to_full_timeline_without_clip_or_playhead_fallback():
     body = GENERATOR_CORE_SOURCE[
         GENERATOR_CORE_SOURCE.index("function generate_selection_subtitles") : GENERATOR_CORE_SOURCE.index("local ok, err = pcall")
     ]
     scope_body = GENERATOR_CORE_SOURCE[
         GENERATOR_CORE_SOURCE.index("local function read_generation_scope") : GENERATOR_CORE_SOURCE.index("local function get_audio_item_source_offset_frames")
     ]
-    assert "read_timeline_in_out_scope(timeline, fps)" in scope_body
+    assert "read_timeline_in_out_scope(timeline, fps, first, last)" in scope_body
     assert "read_selected_timeline_item_scope(timeline)" not in scope_body
     assert "read_playhead_timeline_item_scope(timeline, fps)" not in scope_body
-    assert "灰色时间线选择或鼠标选中片段 Resolve 脚本 API 读不到" in scope_body
+    assert '"full_timeline"' in scope_body
     assert "使用范围来源=%s" in body
 
 
@@ -1821,12 +1820,14 @@ def test_generate_selection_subtitles_subplugin_prompts_for_audio_track():
     assert 'WindowTitle = "SubFix · 生成选区字幕"' in GENERATOR_CORE_SOURCE
     # Window height includes the 字幕长度、识别模型与热词行；合并豆包主入口
     # 不应回退热词布局所需的现有高度。
-    assert "Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 420, 316})" in GENERATOR_CORE_SOURCE
+    assert "Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 440, 348})" in GENERATOR_CORE_SOURCE
     assert "selected_audio_sources" in GENERATOR_CORE_SOURCE
-    assert "local checked = index == 1" in GENERATOR_CORE_SOURCE
+    assert "local checked = full_timeline or index == 1" in GENERATOR_CORE_SOURCE
     assert "collect_audio_sources_for_scope(timeline, scope, fps)" in GENERATOR_CORE_SOURCE
     assert "collect_video_match_tokens_for_scope" not in GENERATOR_CORE_SOURCE
-    assert 'timeline:GetTrackCount("video")' not in GENERATOR_CORE_SOURCE
+    audio_collection = GENERATOR_CORE_SOURCE[GENERATOR_CORE_SOURCE.index("local function collect_audio_sources_for_scope"):
+                                            GENERATOR_CORE_SOURCE.index("local function clear_subtitle_track_clips")]
+    assert 'timeline:GetTrackCount("video")' not in audio_collection
     assert "video_match_score" not in GENERATOR_CORE_SOURCE
     assert "匹配画面" not in GENERATOR_CORE_SOURCE
     assert "candidate.is_selected" in GENERATOR_CORE_SOURCE
@@ -2036,7 +2037,8 @@ def test_generate_selection_subtitles_subplugin_writes_source_audio_batch_plan_b
 
     assert "collect_selected_track_sources(selected_audio_sources)" in generate_body
     assert "optimize_selected_track_sources_for_generation(selected_track_sources, fps)" in generate_body
-    assert "write_generate_batch_plan(batch_plan_path, selected_track_sources, fps)" in generate_body
+    assert "pcall(collect_generation_picture_cuts, timeline, scope)" in generate_body
+    assert "write_generate_batch_plan(batch_plan_path, selected_track_sources, fps, cuts_ok and cuts or {})" in generate_body
     assert "selected_track_sources = {timeline_mix_source}" not in generate_body
     assert "使用时间线混音" not in generate_body
 

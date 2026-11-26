@@ -1,5 +1,5 @@
 #!/usr/bin/env lua
--- SubFix shared module: generate subtitles for the current DaVinci Resolve In/Out selection.
+-- Generate subtitles for the timeline In/Out range, or the whole timeline when unmarked.
 
 local SubFixGenerateSelectionCore = {}
 local runtime_options = {}
@@ -122,9 +122,9 @@ end
 local function write_text_file(path, content)
     local file = io.open(tostring(path or ""), "w")
     if not file then return false end
-    file:write(tostring(content or ""))
-    file:close()
-    return true
+    local written = file:write(tostring(content or ""))
+    local closed = file:close()
+    return written ~= nil and closed ~= nil
 end
 
 local function json_escape(value)
@@ -230,7 +230,8 @@ local function decode_json_text(json_text)
                     parts[#parts + 1] = mapped
                     pos = pos + 2
                 elseif esc == "u" then
-                    parts[#parts + 1] = "?"
+                    local code = tonumber(json_text:sub(pos + 2, pos + 5), 16)
+                    parts[#parts + 1] = code and code < 128 and string.char(code) or "?"
                     pos = pos + 6
                 else
                     fail("bad escape")
@@ -378,6 +379,7 @@ local function resolve_asr_paths()
         generation_history = user_support_dir .. "/generation_history",
         plugin_source = root .. "/SubFix.lua",
         generation_core_source = script_dir() .. "/subfix_generate_selection_core.lua",
+        reference_base = user_support_dir .. "/subfix_generate_reference",
         hotwords = user_support_dir .. "/hotwords.json"
     }
     if not file_exists(paths.plugin_source) and file_exists(root .. "/SubFix/SubFix.lua") then
@@ -554,6 +556,38 @@ local function save_doubao_backend_preference(backend)
     return write_generate_preferences(data)
 end
 
+local function project_reference_path(project)
+    local ok, id = pcall(function() return project:GetUniqueId() end)
+    if not ok or type(id) ~= "string" or trim_text(id) == "" then return nil end
+    -- 按字节编码，让不同项目 ID 在大小写不敏感的文件系统上也各有一份。
+    local key = id:gsub(".", function(byte) return string.format("%02x", byte:byte()) end)
+    return resolve_asr_paths().reference_base .. "." .. key .. ".json"
+end
+
+local function read_generate_reference(path)
+    if not path then return nil end
+    local raw = read_text_file(path)
+    local data = raw and decode_json_text(raw)
+    if type(data) == "table" and type(data.text) == "string" and type(data.enabled) == "boolean" then
+        return data
+    end
+end
+
+local function write_generate_reference(path, text, enabled)
+    local pipe = io.popen("/usr/bin/mktemp " .. shell_quote(path .. ".XXXXXX") .. " 2>/dev/null", "r")
+    if not pipe then return false end
+    local temp = pipe:read("*l")
+    pipe:close()
+    if not temp or temp == "" then return false end
+    local escaped = json_escape(text):gsub("[%z\1-\31]", function(c)
+        return string.format("\\u%04x", string.byte(c))
+    end)
+    local content = string.format('{"enabled":%s,"text":"%s"}\n', tostring(enabled), escaped)
+    if write_text_file(temp, content) and os.rename(temp, path) then return true end
+    os.remove(temp)
+    return false
+end
+
 local function load_generate_hotword_entries()
     local text = read_text_file(resolve_asr_paths().hotwords)
     local payload = text and decode_json_text(text) or nil
@@ -716,8 +750,8 @@ local timeline_item_is_selected
 local function get_timeline_frame_bounds(timeline)
     local ok_start, timeline_start = pcall(function() return timeline:GetStartFrame() end)
     local ok_end, timeline_end = pcall(function() return timeline:GetEndFrame() end)
-    timeline_start = ok_start and tonumber(timeline_start) or 0
-    timeline_end = ok_end and tonumber(timeline_end) or timeline_start
+    timeline_start = ok_start and tonumber(timeline_start) or nil
+    timeline_end = ok_end and tonumber(timeline_end) or nil
     return timeline_start, timeline_end
 end
 
@@ -833,12 +867,13 @@ local function expand_scope_from_seed_item(timeline, track_type, track_index, se
     return records[first_index].start_frame, records[last_index].end_frame, (last_index - first_index + 1)
 end
 
-local function read_timeline_in_out_scope(timeline, fps)
-    local timeline_start, timeline_end = get_timeline_frame_bounds(timeline)
+local function read_timeline_in_out_scope(timeline, fps, timeline_start, timeline_end)
     local ok_marks, marks = pcall(function() return timeline:GetMarkInOut() end)
-    if not ok_marks or type(marks) ~= "table" then
-        return nil, "请先用 I/O 设置 In/Out 选区"
+    if not ok_marks or (marks ~= nil and type(marks) ~= "table") then
+        return nil, "无法读取时间线 In/Out 标记"
     end
+    if marks == nil then return nil end
+    local has_marks = false
     local mark_candidates = {}
     if marks.video ~= nil then mark_candidates[#mark_candidates + 1] = marks.video end
     if marks.audio ~= nil then mark_candidates[#mark_candidates + 1] = marks.audio end
@@ -856,6 +891,7 @@ local function read_timeline_in_out_scope(timeline, fps)
             source_label = "In/Out (In only)"
         end
         if mark_in ~= nil and mark_out ~= nil then
+            has_marks = true
             local start_frame = normalize_mark_frame(mark_in, timeline_start, timeline_end, fps)
             local end_frame = normalize_mark_frame(mark_out, timeline_start, timeline_end, fps)
             if source_label == "In/Out (Out only)" then
@@ -884,7 +920,8 @@ local function read_timeline_in_out_scope(timeline, fps)
             end
         end
     end
-    return nil, "未读取到 O 点；请按 O 设置结束点后再生成"
+    if has_marks then return nil, "In/Out 范围无效，请检查时间线标记" end
+    return nil
 end
 
 local function read_selected_timeline_item_scope(timeline)
@@ -1037,11 +1074,12 @@ local function read_playhead_timeline_item_scope(timeline, fps)
 end
 
 local function read_generation_scope(timeline, fps)
-    local scope, scope_err = read_timeline_in_out_scope(timeline, fps)
-    if scope and scope.mode == WORK_SCOPE_MODE_SELECTION then
-        return scope
-    end
-    return nil, (scope_err or "请先用 I/O 设置 In/Out 选区") .. "；灰色时间线选择或鼠标选中片段 Resolve 脚本 API 读不到"
+    local first, last = get_timeline_frame_bounds(timeline)
+    if not first or not last then return nil, "无法读取时间线起止帧" end
+    if last <= first then return nil, "时间线为空，没有可识别的音频" end
+    local scope, err = read_timeline_in_out_scope(timeline, fps, first, last)
+    if scope or err then return scope, err end
+    return build_timeline_item_scope("full_timeline", "整条时间线", first, last, first, last)
 end
 
 local function get_audio_item_source_offset_frames(item, timeline_fps)
@@ -1168,7 +1206,7 @@ local function parse_source_audio_channel_mapping(item, media_item, fps, source_
     result.audio_mapping_source = "linked_audio"
     result.audio_mapping_fallback_reason = ""
     result.linked_offset_samples = linked_offset_samples
-    result.source_start_seconds = math.max(0, (source_frames / effective_fps) + (linked_offset_samples / math.max(1, sample_rate)))
+    result.source_start_seconds = (source_frames / effective_fps) + (linked_offset_samples / math.max(1, sample_rate))
     local linked_path_channel_index = math.max(1, tonumber(linked_local_channel_index) or 1)
     local linked_path_channel_count = 0
     for _, key in ipairs(linked_keys) do
@@ -1229,12 +1267,12 @@ end
 
 local function collect_audio_sources_for_scope(timeline, scope, fps)
     if type(scope) ~= "table" or scope.mode ~= WORK_SCOPE_MODE_SELECTION then
-        return nil, "请先用 I/O 设置 In/Out 选区"
+        return nil, "无效的字幕生成范围"
     end
     local scope_start = tonumber(scope.start_frame)
     local scope_end = tonumber(scope.end_frame)
     if not scope_start or not scope_end or scope_end <= scope_start then
-        return nil, "请先用 I/O 设置 In/Out 选区"
+        return nil, "无效的字幕生成范围"
     end
     local ok_track_count, track_count = pcall(function() return timeline:GetTrackCount("audio") end)
     track_count = ok_track_count and tonumber(track_count) or 0
@@ -1266,30 +1304,39 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
                         local mapped_audio = parse_source_audio_channel_mapping(item, media_item, source_offset_fps, source_offset_frames, file_path)
                         file_path = mapped_audio.file_path or file_path
                         local item_source_start_seconds = tonumber(mapped_audio.source_start_seconds) or (source_offset_frames / source_offset_fps)
-                        local source_start_seconds = item_source_start_seconds + ((overlap_start - item_start) / effective_fps)
-                        local source_end_seconds = source_start_seconds + (overlap_frames / effective_fps)
-                        local candidate = {
-                            file_path = file_path,
-                            file_name = basename(file_path),
-                            track_index = track_index,
-                            track_name = track_display_name,
-                            item_index = item_index,
-                            item_start_frame = item_start,
-                            item_end_frame = item_end,
-                            start_frame = overlap_start,
-                            end_frame = overlap_end,
-                            source_offset_frames = source_offset_frames,
-                            source_start_seconds = source_start_seconds,
-                            source_end_seconds = source_end_seconds,
-                            overlap_frames = overlap_frames
-                        }
-                        candidate.audio_mapping_source = mapped_audio.audio_mapping_source or "media_pool_file"
-                        candidate.audio_mapping_fallback_reason = mapped_audio.audio_mapping_fallback_reason or ""
-                        candidate.linked_offset_samples = mapped_audio.linked_offset_samples
-                        candidate.audio_channel_index = mapped_audio.audio_channel_index
-                        candidate.audio_mapping_muted = mapped_audio.audio_mapping_muted == true
-                        candidate.is_selected = timeline_item_is_selected(item)
-                        audio_sources[#audio_sources + 1] = candidate
+                        -- A linked recorder can start after the camera clip. Keep its first
+                        -- available sample at the corresponding timeline frame.
+                        if item_source_start_seconds < 0 then
+                            local first_audio_frame = item_start + math.ceil(-item_source_start_seconds * effective_fps - 1e-8)
+                            overlap_start = math.max(overlap_start, first_audio_frame)
+                            overlap_frames = overlap_end - overlap_start
+                        end
+                        if overlap_frames > 0 then
+                            local source_start_seconds = math.max(0, item_source_start_seconds + ((overlap_start - item_start) / effective_fps))
+                            local source_end_seconds = source_start_seconds + (overlap_frames / effective_fps)
+                            local candidate = {
+                                file_path = file_path,
+                                file_name = basename(file_path),
+                                track_index = track_index,
+                                track_name = track_display_name,
+                                item_index = item_index,
+                                item_start_frame = item_start,
+                                item_end_frame = item_end,
+                                start_frame = overlap_start,
+                                end_frame = overlap_end,
+                                source_offset_frames = source_offset_frames,
+                                source_start_seconds = source_start_seconds,
+                                source_end_seconds = source_end_seconds,
+                                overlap_frames = overlap_frames
+                            }
+                            candidate.audio_mapping_source = mapped_audio.audio_mapping_source or "media_pool_file"
+                            candidate.audio_mapping_fallback_reason = mapped_audio.audio_mapping_fallback_reason or ""
+                            candidate.linked_offset_samples = mapped_audio.linked_offset_samples
+                            candidate.audio_channel_index = mapped_audio.audio_channel_index
+                            candidate.audio_mapping_muted = mapped_audio.audio_mapping_muted == true
+                            candidate.is_selected = timeline_item_is_selected(item)
+                            audio_sources[#audio_sources + 1] = candidate
+                        end
                     end
                 end
             end
@@ -1304,7 +1351,7 @@ local function collect_audio_sources_for_scope(timeline, scope, fps)
     end)
 
     if #audio_sources == 0 then
-        return nil, "未找到与选区重叠的本地音频片段"
+        return nil, "生成范围内没有可读取的本地音频片段"
     end
     return audio_sources
 end
@@ -1701,11 +1748,61 @@ local function optimize_selected_track_sources_for_generation(selected_track_sou
     return deduped, stats
 end
 
-local function write_generate_batch_plan(path, selected_track_sources, fps)
+-- Resolve can expose disabled camera angles and overlapping transition items.
+-- Only a change on the uppermost enabled picture is a useful subtitle cut.
+local function collect_generation_picture_cuts(timeline, scope)
+    local events, frames, active, cuts = {}, {}, {}, {}
+    local tracks = timeline:GetTrackCount("video") or 0
+    local function add(frame, track, delta)
+        if not events[frame] then
+            events[frame] = {}
+            frames[#frames + 1] = frame
+        end
+        events[frame][track] = (events[frame][track] or 0) + delta
+    end
+    for track = 1, tracks do
+        if timeline:GetIsTrackEnabled("video", track) then
+            for _, item in ipairs(timeline:GetItemListInTrack("video", track) or {}) do
+                local first, last = item:GetStart(), item:GetEnd()
+                if first and last and last > first and last > scope.start_frame and first < scope.end_frame
+                        and item:GetClipEnabled() then
+                    add(first, track, 1)
+                    add(last, track, -1)
+                end
+            end
+        end
+    end
+    table.sort(frames)
+    local top = 0
+    for _, frame in ipairs(frames) do
+        local before, count = top, active[top]
+        for track, delta in pairs(events[frame]) do
+            active[track] = (active[track] or 0) + delta
+        end
+        top = tracks
+        while top > 0 and (active[top] or 0) == 0 do top = top - 1 end
+        if frame > scope.start_frame and frame < scope.end_frame and
+                (before ~= top or (count == 1 and active[top] == 1 and events[frame][top] ~= nil)) then
+            cuts[#cuts + 1] = frame
+        end
+    end
+    return cuts
+end
+
+local function write_generate_batch_plan(path, selected_track_sources, fps, picture_cuts)
     local lines = {"{", '  "batches": ['}
     for index, source in ipairs(selected_track_sources or {}) do
         local audio_channel_index = tonumber(source.audio_channel_index)
         lines[#lines + 1] = "    {"
+        local cuts = {}
+        for _, frame in ipairs(picture_cuts or {}) do
+            if frame >= source.start_frame and frame <= source.end_frame then
+                cuts[#cuts + 1] = frame
+            end
+        end
+        if #cuts > 0 then
+            lines[#lines + 1] = '      "picture_cuts": [' .. table.concat(cuts, ",") .. '],'
+        end
         lines[#lines + 1] = string.format('      "batch_id": "track%d_item%d_%d",', tonumber(source.track_index) or 0, tonumber(source.item_index) or 0, index)
         lines[#lines + 1] = string.format('      "audio": "%s",', json_escape(source.file_path))
         lines[#lines + 1] = string.format('      "source_start": %.6f,', tonumber(source.source_start_seconds) or 0)
@@ -1905,7 +2002,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         return nil, nil, nil, nil, nil, "无法初始化 Resolve UI"
     end
     if type(audio_sources) ~= "table" or #audio_sources == 0 then
-        return nil, nil, nil, nil, nil, "未找到与选区重叠的本地音频片段"
+        return nil, nil, nil, nil, nil, "生成范围内没有可读取的本地音频片段"
     end
 
     local selected_audio_sources = nil
@@ -1968,7 +2065,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     local selection_window = dispatcher:AddWindow({
         ID = "GenerateSelectionWindow",
         WindowTitle = "SubFix · 生成选区字幕",
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 420, 316}),
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({460, 250, 440, 348}),
     },
     ui:VGroup{
         Spacing = 8,
@@ -1999,9 +2096,16 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         ui:HGroup{
             Weight = 0,
             Spacing = 8,
-            ui:Label{Text = "热词库：", Weight = 0},
+            ui:Label{Text = "热词库：", Weight = 0, MinimumSize = {64, 20}},
             ui:Button{ID = "GenerateHotwordToggleBtn", Text = "", Weight = 0, MinimumSize = {0, 20}},
             ui:Button{ID = "GenerateHotwordManageBtn", Text = "管理…", Weight = 0, MinimumSize = {0, 20}},
+            ui:HGap(0, 1)
+        },
+        ui:HGroup{
+            Weight = 0, Spacing = 8,
+            ui:Label{Text = "参考文稿：", Weight = 0, MinimumSize = {64, 20}},
+            ui:Button{ID = "GenerateReferenceToggleBtn", Text = "", Weight = 0, MinimumSize = {0, 20}},
+            ui:Button{ID = "GenerateReferenceManageBtn", Text = "管理…", Weight = 0, MinimumSize = {0, 20}},
             ui:HGap(0, 1)
         },
         ui:Label{
@@ -2026,6 +2130,130 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     })
 
     local items = selection_window:GetItems()
+    local project_path = runtime_options.project_reference_path
+    local saved_reference = read_generate_reference(project_path)
+    local previous_reference, previous_label
+    if not saved_reference then
+        previous_reference = read_generate_reference(resolve_asr_paths().reference_base .. ".json")
+        previous_label = "载入旧版文稿"
+        if (not previous_reference or previous_reference.text == "") and trim_text(runtime_options.correction_reference) ~= "" then
+            previous_reference = {text = runtime_options.correction_reference, enabled = true}
+            previous_label = "载入矫正文稿"
+        end
+        saved_reference = {text = "", enabled = false}
+    end
+    local reference_text, reference_enabled = saved_reference.text, saved_reference.enabled
+    if runtime_options.model_center_draft then
+        reference_text = runtime_options.reference_text or ""
+        reference_enabled = runtime_options.reference_enabled == true
+    end
+    local reference_hint = project_path and "粘贴文稿或关键词，最多 10000 字。" or "未取得项目 ID，参考文稿仅用于本次生成。"
+    local reference_window = dispatcher:AddWindow({
+        ID = "GenerateReferenceWindow", WindowTitle = "SubFix · 管理参考文稿",
+        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({475, 250, 460, 280})
+    }, ui:VGroup{
+        ContentsMargins = 12, Spacing = 8,
+        ui:Label{ID = "GenerateReferenceStatus", Text = reference_hint, Weight = 0},
+        ui:TextEdit{ID = "GenerateReferenceText", PlainText = reference_text, AcceptRichText = false,
+            Weight = 1, MinimumSize = {0, 100}, Events = {TextChanged = true},
+            PlaceholderText = "输入文稿、人名或术语，或导入 TXT、Markdown、Word（.docx）"},
+        ui:HGroup{Weight = 0, Spacing = 8,
+            ui:Button{ID = "GenerateReferenceImport", Text = "导入文档…", Weight = 0},
+            ui:Button{ID = "GenerateReferencePrevious", Text = previous_label or "", Visible = previous_reference ~= nil and previous_reference.text ~= "", Weight = 0},
+            ui:Button{ID = "GenerateReferenceClear", Text = "清空", Weight = 0},
+            ui:HGap(0, 1),
+            ui:Button{ID = "GenerateReferenceDone", Text = "完成", Weight = 0}
+        }
+    })
+    local reference_items = reference_window:GetItems()
+    local reference_input = reference_items.GenerateReferenceText
+    local reference_status = reference_items.GenerateReferenceStatus
+    local function refresh_reference()
+        local text = trim_text(reference_input.PlainText or "")
+        if text == "" or reference_text == "" then reference_enabled = text ~= "" end
+        reference_text = text
+        local _, count = text:gsub("[^\128-\191]", "")
+        local mark = reference_enabled and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK
+        items.GenerateReferenceToggleBtn.Text = mark .. " " .. count .. " 字"
+        return count
+    end
+    local function reference_fits()
+        if refresh_reference() <= 10000 or not reference_enabled then return true end
+        reference_status.Text = "参考文稿超过 10000 字，请精简后再生成"
+        reference_window:Show()
+        return false
+    end
+    local function remember_reference(show_error)
+        refresh_reference()
+        if saved_reference and saved_reference.text == reference_text and saved_reference.enabled == reference_enabled then
+            return true
+        end
+        if not project_path then return true end
+        if not write_generate_reference(project_path, reference_text, reference_enabled) then
+            local message = "参考文稿保存失败，请检查插件支持目录的写入权限后重试"
+            reference_status.Text = message
+            if show_error then reference_window:Show() else print("[SubFix Generate] " .. message) end
+            return false
+        end
+        saved_reference = {text = reference_text, enabled = reference_enabled}
+        return true
+    end
+    function reference_window.On.GenerateReferenceText.TextChanged(ev)
+        refresh_reference()
+    end
+    function reference_window.On.GenerateReferencePrevious.Clicked(ev)
+        if not previous_reference then return end
+        reference_input.PlainText = previous_reference.text
+        refresh_reference()
+        reference_enabled = previous_reference.enabled
+        refresh_reference()
+    end
+    function reference_window.On.GenerateReferenceClear.Clicked(ev)
+        reference_input.PlainText = ""
+        saved_reference = nil
+        if remember_reference(true) then reference_status.Text = reference_hint end
+    end
+    function reference_window.On.GenerateReferenceImport.Clicked(ev)
+        local ok, path = pcall(function() return fusion_app:RequestFile("") end)
+        if not ok then reference_status.Text = "无法打开文件选择器，可直接粘贴文稿"; return end
+        if not path or path == "" then return end
+        local ext = path:lower():match("%.([^.]+)$")
+        if ext ~= "txt" and ext ~= "md" and ext ~= "docx" then
+            reference_status.Text = "请选择 TXT、Markdown 或 Word（.docx）文档"
+            return
+        end
+        local format = ext == "docx" and "docx" or "txt"
+        local pipe = io.popen("/usr/bin/textutil -convert txt -stdout -encoding UTF-8 -format "
+            .. format .. " " .. shell_quote(path) .. " 2>/dev/null", "r")
+        local text = pipe and pipe:read(40004)
+        if pipe then pipe:close() end
+        if text and #text == 40004 then
+            reference_status.Text = "参考文稿超过 10000 字，请精简后再导入"
+            return
+        end
+        text = trim_text((text or ""):gsub("^\239\187\191", ""))
+        if text == "" then reference_status.Text = "文档没有可读取的文字，可直接粘贴文稿"; return end
+        local _, count = text:gsub("[^\128-\191]", "")
+        if count > 10000 then reference_status.Text = "参考文稿超过 10000 字，请精简后再导入"; return end
+        reference_input.PlainText = text
+        refresh_reference()
+        reference_status.Text = "已导入参考文稿，可在下方编辑"
+    end
+    function reference_window.On.GenerateReferenceDone.Clicked(ev)
+        if reference_fits() and remember_reference(true) then reference_window:Hide() end
+    end
+    function reference_window.On.GenerateReferenceWindow.Close(ev)
+        if reference_fits() and remember_reference(true) then reference_window:Hide() end
+    end
+    function selection_window.On.GenerateReferenceManageBtn.Clicked(ev)
+        reference_window:Show()
+    end
+    function selection_window.On.GenerateReferenceToggleBtn.Clicked(ev)
+        if refresh_reference() == 0 then reference_window:Show(); return end
+        reference_enabled = not reference_enabled
+        remember_reference(true)
+    end
+    refresh_reference()
     local track_tree = items and items.GenerateAudioTrackTree or nil
     if not track_tree then return nil, nil, nil, nil, "无法初始化音频轨道列表" end
     pcall(function() track_tree.ColumnCount = 2 end)
@@ -2119,7 +2347,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             ui:HGroup{
                 Weight = 0, Spacing = 8,
                 ui:Label{Text = "标准词：", Weight = 0},
-                ui:LineEdit{ID = "GenerateHotwordTermInput", PlaceholderText = "例如 DaVinci Resolve", Weight = 1}
+                ui:LineEdit{ID = "GenerateHotwordTermInput", PlaceholderText = "例如 DaVinci Resolve", Weight = 1, Events = {ReturnPressed = true}}
             },
             ui:HGroup{
                 Weight = 0, Spacing = 8,
@@ -2186,7 +2414,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             local item = get_tree_event_value(ev, {"item", "Item", "currentItem", "CurrentItem"}) or get_selected_tree_node(hotword_tree)
             selected_hotword_index = item and item_map[item] or nil
         end
-        function hotword_library_window.On.GenerateHotwordAddBtn.Clicked(ev)
+        local function add_hotword()
             local term = trim_text(term_input and term_input.Text or "")
             if term == "" then set_hotword_status("请填写标准词") return end
             hotword_entries[#hotword_entries + 1] = {term = term, aliases = {}}
@@ -2197,6 +2425,12 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
             if term_input then pcall(function() term_input.Text = "" end) end
             refresh_hotword_toggle()
             set_hotword_status("已添加，点击完成保存")
+        end
+        function hotword_library_window.On.GenerateHotwordAddBtn.Clicked(ev)
+            add_hotword()
+        end
+        function hotword_library_window.On.GenerateHotwordTermInput.ReturnPressed(ev)
+            add_hotword()
         end
         function hotword_library_window.On.GenerateHotwordDeleteBtn.Clicked(ev)
             if not selected_hotword_index then set_hotword_status("请先选择要删除的词条") return end
@@ -2536,6 +2770,9 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         for _, row in ipairs(track_rows) do
             if row.checked then draft_tracks[#draft_tracks + 1] = row.source.track_index end
         end
+        refresh_reference()
+        runtime_options.reference_text = reference_text
+        runtime_options.reference_enabled = reference_enabled
         runtime_options.model_center_draft = {
             last_engine_backend = read_selected_backend(), doubao_backend = selected_doubao_backend,
             max_chars = read_selected_max_chars(), hotwords_enabled = hotwords_enabled,
@@ -2563,7 +2800,9 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
 
     -- 轨道数量一致时按轨道编号恢复，避免将勾选套到不同的列表行。
     local restored_tracks, has_restored_track = {}, false
-    if generate_preferences.audio_track_count == #audio_sources
+    local full_timeline = scope.source == "full_timeline"
+    if (not full_timeline or runtime_options.model_center_draft)
+        and generate_preferences.audio_track_count == #audio_sources
         and type(generate_preferences.selected_audio_tracks) == "table" then
         for _, track_index in ipairs(generate_preferences.selected_audio_tracks) do
             if type(track_index) == "number" and track_index > 0 and track_index % 1 == 0 then
@@ -2579,7 +2818,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     for index, source in ipairs(audio_sources) do
         local ok_item, item = pcall(function() return track_tree:NewItem() end)
         if ok_item and item then
-            local checked = index == 1
+            local checked = full_timeline or index == 1
             if has_restored_track then checked = restored_tracks[source.track_index] == true end
             track_rows[index] = {source = source, checked = checked, item = item}
             set_tree_item_text(item, 0, checked and TRACK_CHECKED_MARK or TRACK_UNCHECKED_MARK)
@@ -2656,6 +2895,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     function selection_window.On.GenerateSelectionConfirmBtn.Clicked(ev)
+        if not reference_fits() then return end
+        remember_reference()
         selected_audio_sources = collect_checked_audio_sources()
         if #selected_audio_sources < 1 then
             selected_audio_sources = nil
@@ -2680,12 +2921,14 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
         for _, source in ipairs(selected_audio_sources) do
             selected_audio_tracks[#selected_audio_tracks + 1] = source.track_index
         end
-        save_last_engine_backend(selected_backend, selected_max_chars, hotwords_enabled, #audio_sources, selected_audio_tracks)
+        local remembered_track_count = not full_timeline and #audio_sources or nil
+        save_last_engine_backend(selected_backend, selected_max_chars, hotwords_enabled, remembered_track_count, selected_audio_tracks)
         pcall(function() selection_window:Hide() end)
         pcall(function() dispatcher:ExitLoop() end)
     end
 
     function selection_window.On.GenerateSelectionCancelBtn.Clicked(ev)
+        if refresh_reference() <= 10000 then remember_reference() end
         dialog_cancelled = true
         selected_audio_sources = nil
         pcall(function() selection_window:Hide() end)
@@ -2693,6 +2936,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     end
 
     function selection_window.On.GenerateSelectionWindow.Close(ev)
+        if refresh_reference() <= 10000 then remember_reference() end
         dialog_cancelled = true
         selected_audio_sources = nil
         pcall(function() selection_window:Hide() end)
@@ -2702,6 +2946,7 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     selection_window:Show()
     dispatcher:RunLoop()
     pcall(function() selection_window:Hide() end)
+    pcall(function() reference_window:Hide() end)
     pcall(function() doubao_key_window:Hide() end)
     pcall(function() doubao_reminder_window:Hide() end)
     pcall(function() qwen_download_window:Hide() end)
@@ -2728,6 +2973,8 @@ local function show_audio_track_selection_dialog(audio_sources, scope, fps)
     if #selected_audio_sources == 0 then
         return nil, nil, nil, nil, nil, "请至少选择一个音频轨道"
     end
+    if refresh_reference() > 10000 and reference_enabled then return nil, nil, nil, nil, nil, "参考文稿过长" end
+    runtime_options.reference_text = reference_enabled and reference_text or ""
     return selected_audio_sources, subtitle_mode, selected_max_chars, selected_backend, selected_hotwords_json, nil
 end
 
@@ -3108,7 +3355,7 @@ local function build_asr_helper_command(audio_source, srt_path, json_path, timel
     return table.concat(cmd_parts, " "), nil
 end
 
-local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
+local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json, reference_path)
     local paths = resolve_asr_paths()
     if not file_exists(paths.helper) then
         return nil, "缺少 ASR helper: " .. tostring(paths.helper)
@@ -3174,6 +3421,10 @@ local function build_asr_helper_batch_command(batch_plan_path, srt_path, json_pa
     if profile_path then
         cmd_parts[#cmd_parts + 1] = "--segmentation-profile"
         cmd_parts[#cmd_parts + 1] = shell_quote(profile_path)
+    end
+    if reference_path then
+        cmd_parts[#cmd_parts + 1] = "--reference-file"
+        cmd_parts[#cmd_parts + 1] = shell_quote(reference_path)
     end
     if hotwords_json and file_exists(hotwords_json) then
         cmd_parts[#cmd_parts + 1] = "--hotwords-json"
@@ -3433,7 +3684,7 @@ end
 
 local function run_asr_helper_batch_with_progress(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_state, source_count, subtitle_mode, max_chars, backend, hotwords_json, effective_audio_seconds)
     local progress_path = json_path .. ".progress.json"
-    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json)
+    local cmd, cmd_err = build_asr_helper_batch_command(batch_plan_path, srt_path, json_path, timeline_start_frame, fps, progress_path, subtitle_mode, max_chars, backend, hotwords_json, runtime_options.reference_path)
     if not cmd then return false, cmd_err end
     local duration_text = format_generate_audio_duration(effective_audio_seconds)
     update_generate_progress_window(
@@ -3807,11 +4058,12 @@ local function generate_selection_subtitles()
     local project = pm and pm:GetCurrentProject()
     local timeline = project and project:GetCurrentTimeline()
     if not project or not timeline then error("没有打开的时间线") end
+    runtime_options.project_reference_path = project_reference_path(project)
 
     local fps = parse_fps(timeline:GetSetting("timelineFrameRate"))
     local scope, scope_err = read_generation_scope(timeline, fps)
     if not scope or scope.mode ~= WORK_SCOPE_MODE_SELECTION then
-        error(scope_err or "请先用 I/O 设置 In/Out 选区")
+        error(scope_err or "无法确定字幕生成范围")
     end
     print(string.format(
         "[SubFix Generate] 使用范围来源=%s 帧范围 %d-%d，时长 %.2fs%s",
@@ -3885,6 +4137,12 @@ local function generate_selection_subtitles()
         ))
     end
 
+    if runtime_options.reference_text and runtime_options.reference_text ~= "" then
+        runtime_options.reference_path = os.tmpname()
+        if not write_text_file(runtime_options.reference_path, runtime_options.reference_text) then
+            error("无法准备本次识别的参考文稿")
+        end
+    end
     local progress_state, progress_err = show_generate_progress_window()
     if not progress_state then error(progress_err or "无法打开进度窗口") end
 
@@ -3894,7 +4152,8 @@ local function generate_selection_subtitles()
     local srt_path = root .. "/GeneratedSelection_" .. uid .. ".srt"
     local batch_plan_path = root .. "/GeneratedSelection_" .. uid .. ".batch_plan.json"
     local audio_diag_path = json_path .. ".audio_source.json"
-    if not write_generate_batch_plan(batch_plan_path, selected_track_sources, fps) then
+    local cuts_ok, cuts = pcall(collect_generation_picture_cuts, timeline, scope)
+    if not write_generate_batch_plan(batch_plan_path, selected_track_sources, fps, cuts_ok and cuts or {}) then
         finish_generate_progress_window(progress_state, "失败", "无法写入批量生成计划")
         error("无法写入批量生成计划")
     end
@@ -4035,7 +4294,7 @@ local function generate_selection_subtitles()
         finish_generate_progress_window(progress_state, "失败", import_err)
         error(import_err)
     end
-    local completion_message = "选区字幕已生成并写回时间线"
+    local completion_message = scope.source == "full_timeline" and "全片字幕已生成并写回时间线" or "选区字幕已生成并写回时间线"
     if type(generation_trace) == "table" and generation_trace.run_id then
         local run_id = tostring(generation_trace.run_id)
         completion_message = completion_message .. "｜版本记录 " .. run_id:sub(1, 8)
@@ -4053,12 +4312,13 @@ end
 
 function SubFixGenerateSelectionCore.run(options)
     options = options or {}
-    runtime_options = options
+    runtime_options = {script_root = options.script_root, correction_reference = options.reference_text}
     TARGET_SUBTITLE_TRACK = tonumber(options.target_subtitle_track) or 1
 
     local ok, err = pcall(function()
         return generate_selection_subtitles()
     end)
+    if runtime_options.reference_path then os.remove(runtime_options.reference_path) end
     runtime_options = {}
     if not ok then
         print("[SubFix Generate] 失败: " .. tostring(err))

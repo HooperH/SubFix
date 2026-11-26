@@ -8,7 +8,7 @@ from test_normalize_length_options import run_lua  # noqa: F401
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / "SubFix.lua").read_text(encoding="utf-8")
-UPDATE_FUNCTIONS = SOURCE[SOURCE.index("function open_subfix_update_website()"):SOURCE.index("function win.On.ModelCenterBtn.Clicked")]
+UPDATE_FUNCTIONS = SOURCE[SOURCE.index("function open_subfix_update_website("):SOURCE.index("function win.On.ModelCenterBtn.Clicked")]
 CHECK_HANDLER = SOURCE[SOURCE.index("function win.On.CheckUpdateBtn.Clicked(ev)"):SOURCE.index("-- 更新时间线按钮（自动备份后执行）")]
 QUOTE = SOURCE[SOURCE.index("local function shell_quote(value)"):SOURCE.index("\nend", SOURCE.index("local function shell_quote(value)")) + 4] + "\n"
 
@@ -128,8 +128,32 @@ assert(SUBFIX_UPDATE_RUNNING == false)
 ''')
 
 
+@pytest.mark.parametrize("helper_exit_ok", [True, False])
+def test_full_installer_check_reaches_new_version_dialog(run_lua, helper_exit_ok):
+    run_lua(QUOTE + UPDATE_FUNCTIONS + HARNESS + f'helper_exit_ok = {str(helper_exit_ok).lower()}\n' + r'''
+local result = {ok = false, update_available = true, manual_update_required = true, version = "3.4.1",
+    manual_download_url = "https://example.invalid/full.pkg", error = "下载完整安装包"}
+run_subfix_background_command = function() return helper_exit_ok, "" end
+decode_json_text = function() return result end
+win = {On = {CheckUpdateBtn = {}}, GetItems = function() return {CheckUpdateBtn = {}} end}
+SUBFIX_VERSION = "3.4.0"
+local confirmed
+show_subfix_update_confirm = function(payload, failure)
+    assert(payload == result and failure == nil)
+    confirmed = true
+    return "website"
+end
+run_subfix_update = function() error("full installer entered incremental install") end
+update_shared_status = function(_, message) last_status = message end
+''' + CHECK_HANDLER + r'''
+win.On.CheckUpdateBtn.Clicked({})
+assert(confirmed and last_status == "已打开完整安装包下载链接")
+''')
+
+
+@pytest.mark.parametrize("manual", [True, False])
 @pytest.mark.parametrize("browser_success", [True, False])
-def test_manual_download_button_opens_official_site_and_handles_failure(run_lua, browser_success):
+def test_manual_download_button_opens_official_site_and_handles_failure(run_lua, browser_success, manual):
     run_lua(QUOTE + UPDATE_FUNCTIONS + r'''
 SUBFIX_WINDOW_GEOMETRY = {centered_geometry = function(value) return value end}
 ui = setmetatable({}, {__index = function() return function(_, definition) return definition end end})
@@ -147,18 +171,26 @@ function dispatcher:AddWindow(_, layout)
     return dialog
 end
 function dispatcher:ExitLoop() end
-''' + f'browser_success = {str(browser_success).lower()}\n' + r'''
+''' + f'browser_success = {str(browser_success).lower()}\nmanual = {str(manual).lower()}\n' + r'''
+local url = manual and "https://example.invalid/installer.pkg" or "https://hooperh.github.io/SubFix/download/"
+local payload, failure
+if manual then
+    payload = {manual_update_required = true, version = "3.4.1", manual_download_url = url, error = "下载完整安装包"}
+else
+    failure = "connection failed"
+end
 os.execute = function(cmd) opened_command = cmd; return browser_success and 0 or 1 end
 function dispatcher:RunLoop()
     assert(items.SubFixUpdateInstall.Hidden == true)
-    assert(items.SubFixUpdateNotes.PlainText == "connection failed")
+    assert(items.SubFixUpdateNotes.PlainText == (manual and payload.error or failure))
+    assert(items.SubFixUpdateWebsite.Text == (manual and "下载完整安装包" or "官网下载"))
     dialog.On.SubFixUpdateWebsite.Clicked({})
     if not browser_success then
-        assert(items.SubFixUpdateNotes.PlainText:find("https://subfix-by-hooper.ysjf.chatgpt.site/", 1, true))
+        assert(items.SubFixUpdateNotes.PlainText:find(url, 1, true))
         dialog.On.SubFixUpdateCancel.Clicked({})
     end
 end
-local action = show_subfix_update_confirm(nil, "connection failed")
+local action = show_subfix_update_confirm(payload, failure)
 assert(action == (browser_success and "website" or "cancel"))
-assert(opened_command == "/usr/bin/open 'https://subfix-by-hooper.ysjf.chatgpt.site/' >/dev/null 2>&1")
+assert(opened_command == "/usr/bin/open '" .. url .. "' >/dev/null 2>&1")
 ''')

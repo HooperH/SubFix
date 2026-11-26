@@ -12,6 +12,7 @@ import re
 import statistics
 import wave
 from array import array
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -57,7 +58,7 @@ WORD_DICTIONARY = frozenset({
     "体验", "广告", "意思", "存在", "合理", "尺寸", "性价比", "扫地机", "拼多多", "迫不及待", "发展",
     "推出", "获得", "开始", "原谅", "顺到", "摇一摇", "破两百", "能够", "做出", "告诉", "成功", "感觉",
     "科技", "评论", "转发", "帮助", "环绕", "运镜", "自动", "逻辑", "神奇", "非常", "力气", "姿态",
-    "控制", "跳舞",
+    "控制", "跳舞", "摄影棚", "录音棚", "演播室", "摄影机", "摄像机",
 })
 _WORD_DICTIONARY_MAX_LENGTH = max((len(word) for word in WORD_DICTIONARY), default=1)
 
@@ -85,6 +86,35 @@ def _default_word_tokenizer(text: str) -> list[str]:
         tokens.append(matched)
         position += len(matched)
     return tokens
+
+
+def hotword_tokenizer(entries: list[dict[str, Any]]) -> Callable[[str], list[str]] | None:
+    """Protect configured names, including a spoken Chinese brand and its model."""
+    names = set()
+    for entry in entries:
+        for label in [entry["term"], *entry.get("aliases", [])]:
+            names.add(normalize_text(label))
+            names.update(re.findall(r"[\u4e00-\u9fff]{2,}", label))
+    terms = sorted((name for name in names if len(name) >= 2), key=lambda name: (-len(name), name))
+    if not terms:
+        return None
+    # Audio may contain just the Chinese part of a bilingual product name.
+    # Keep a following Latin model with that name when it is spoken together.
+    alternatives = [re.escape(term) + (r"(?:[a-z][a-z0-9]*)?" if re.search(r"[\u4e00-\u9fff]$", term) else "")
+                    for term in terms]
+    pattern = re.compile("|".join(alternatives), re.IGNORECASE)
+
+    def tokenize(text: str) -> list[str]:
+        tokens = []
+        cursor = 0
+        for match in pattern.finditer(text):
+            tokens.extend(_default_word_tokenizer(text[cursor:match.start()]))
+            tokens.append(match.group())
+            cursor = match.end()
+        tokens.extend(_default_word_tokenizer(text[cursor:]))
+        return tokens
+
+    return tokenize
 
 
 def _word_boundary_positions(
@@ -282,6 +312,31 @@ def _write_mono_pcm16(path: Path, sample_rate: int, samples: array) -> None:
         handle.writeframes(samples.tobytes())
 
 
+def merge_audio_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Union of the half-open timeline intervals containing source samples."""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def group_units_by_audio_span(units, spans):
+    """Clip alignment tails at the cut and exclude timestamps in timeline gaps."""
+    groups = [[] for _ in spans]
+    ends = [end for _, end in spans]
+    for unit in units:
+        onset = int(unit["start_frame"])
+        index = bisect_left(ends, onset + 1)
+        if index < len(spans) and onset >= spans[index][0]:
+            groups[index].append({**unit, "end_frame": min(int(unit["end_frame"]), ends[index])})
+    return groups
+
+
 def compose_track_audio(
     items: list[dict[str, Any]],
     output_path: Path,
@@ -333,7 +388,13 @@ def compose_track_audio(
     total_samples = max(1, int(math.ceil((timeline_end - timeline_start) / fps * sample_rate)))
     mixed = array("h", [0]) * total_samples
     overlap_sample_count = 0
-    for item, path, _sample_count in valid:
+    audio_spans = []
+    for item, path, sample_count in valid:
+        start = int(item.get("timeline_start_frame") or 0)
+        end = start + math.ceil(sample_count / sample_rate * fps)
+        if item.get("timeline_end_frame") is not None:
+            end = min(end, int(item["timeline_end_frame"]))
+        audio_spans.append((start, end))
         _rate, samples = _read_mono_pcm16(path)
         offset = int(round((int(item.get("timeline_start_frame") or 0) - timeline_start) / fps * sample_rate))
         for index, value in enumerate(samples):
@@ -351,6 +412,7 @@ def compose_track_audio(
         "item_count": len(valid),
         "overlap_sample_count": overlap_sample_count,
         "output_sample_count": len(mixed),
+        "audio_spans": merge_audio_spans(audio_spans),
         "source_audio_tail_truncated_count": source_audio_tail_truncated_count,
         "source_audio_tail_silence_seconds": source_audio_tail_silence_seconds,
     }
@@ -435,13 +497,13 @@ def prepare_track_context_windows(
         track_path = output_dir / f"track_{track_index:03d}.wav"
         composite = compose_track_audio(items, track_path)
         fps = float(items[0].get("fps") or items[0].get("batch_fps") or 30.0)
-        windows = build_context_windows(
-            int(composite["timeline_start_frame"]),
-            int(composite["timeline_end_frame"]),
-            fps,
-        )
+        windows = [
+            window for start, end in composite["audio_spans"]
+            for window in build_context_windows(start, end, fps)
+        ]
         prepared_windows: list[dict[str, Any]] = []
-        for window in windows:
+        for window_index, window in enumerate(windows, start=1):
+            window["window_index"] = window_index
             window_path = output_dir / f"track_{track_index:03d}_window_{int(window['window_index']):04d}.wav"
             write_context_window_audio(
                 track_path,
@@ -1022,11 +1084,11 @@ def choose_alignment_context_window(
     current = windows[local_index]
     current_text = str((payloads_by_window_index.get(int(current.get("window_index") or 0)) or {}).get("text") or "")
     choices: list[tuple[int, int, dict[str, Any]]] = []
-    if local_index > 0:
+    if local_index > 0 and windows[local_index - 1]["end_frame"] >= current["start_frame"]:
         previous = windows[local_index - 1]
         previous_text = str((payloads_by_window_index.get(int(previous.get("window_index") or 0)) or {}).get("text") or "")
         choices.append((_text_overlap_size(previous_text, current_text), 1, previous))
-    if local_index + 1 < len(windows):
+    if local_index + 1 < len(windows) and windows[local_index + 1]["start_frame"] <= current["end_frame"]:
         following = windows[local_index + 1]
         following_text = str((payloads_by_window_index.get(int(following.get("window_index") or 0)) or {}).get("text") or "")
         choices.append((_text_overlap_size(current_text, following_text), 0, following))
@@ -1121,6 +1183,205 @@ def _cross_mic_echo_midpoint(unit: dict[str, Any]) -> float:
     start = int(unit.get("start_frame") or 0)
     end = max(start + 1, int(unit.get("end_frame") or start + 1))
     return (start + end) / 2.0
+
+
+def restore_corroborated_short_flips(selected, candidates, fps):
+    """Recover a displaced unit when two mics agree on it and both neighbors."""
+    flips = [i for i in range(1, len(selected) - 1)
+             if selected[i].get("speaker_decision") == "smoothed_short_flip"]
+    if not flips:
+        return selected
+    runs = defaultdict(list)
+    for u in candidates:
+        runs[(u.get("track_index"), u.get("window_index"), u.get("candidate_kind"))].append(u)
+    by_neighbors = defaultdict(list)
+    tolerance = max(1, round(.15 * fps))
+    for run in runs.values():
+        run.sort(key=lambda u: (u["start_frame"], u["end_frame"]))
+        for before, mid, after in zip(run, run[1:], run[2:]):
+            if (0 <= mid["start_frame"] - before["end_frame"] <= tolerance
+                    and 0 <= after["start_frame"] - mid["end_frame"] <= tolerance):
+                by_neighbors[before["text"], after["text"]].append((before, mid, after))
+    output = list(selected)
+    for i in flips:
+        left, displaced, right = selected[i-1:i+2]
+        home = displaced["track_index"]
+        if left["track_index"] != home or right["track_index"] != home:
+            continue
+        votes = defaultdict(set)
+        local = {}
+        for before, mid, after in by_neighbors[left["text"], right["text"]]:
+            if (abs(before["start_frame"] - left["start_frame"]) > tolerance
+                    or abs(after["start_frame"] - right["start_frame"]) > tolerance
+                    or mid["end_frame"] <= displaced["start_frame"]
+                    or mid["start_frame"] >= displaced["end_frame"]):
+                continue
+            votes[mid["text"]].add(mid["track_index"])
+            if (mid["track_index"] == home and left["end_frame"] <= mid["start_frame"]
+                    and mid["end_frame"] <= right["start_frame"]):
+                local[mid["text"]] = mid
+        if len(votes) == 1:
+            word, tracks = next(iter(votes.items()))
+            if len(tracks) >= 2 and word != displaced["text"] and word in local:
+                output[i] = {**local[word], "speaker_decision": "cross_mic_phrase_agreement"}
+    return output
+
+
+def reconcile_short_speech_handoffs(
+    selected: list[dict[str, Any]], candidates: list[dict[str, Any]], fps: float,
+) -> list[dict[str, Any]]:
+    """Compare short gaps and borrowed syllables with uninterrupted microphone runs."""
+    runs = defaultdict(list)
+    for u in candidates:
+        runs[(u["track_index"], u.get("window_index"), u.get("candidate_kind"))].append(u)
+    at_onset = defaultdict(list)
+    for run in runs.values():
+        run.sort(key=lambda u: (u["start_frame"], u["end_frame"]))
+        for pos, u in enumerate(run):
+            at_onset[u["start_frame"], u["text"]].append((run, pos))
+    tolerance = max(1, round(.15 * fps))
+
+    def anchored(u):
+        for frame in range(u["start_frame"] - tolerance, u["start_frame"] + tolerance + 1):
+            yield from at_onset.get((frame, u["text"]), ())
+
+    def matches(u, other):
+        return u["text"] == other["text"] and abs(u["start_frame"] - other["start_frame"]) <= tolerance
+
+    def energy(u):
+        return float(u.get("speaker_score_db") or 0)
+
+    def split_vocalization(i, previous, first, second):
+        # A single sustained hesitation can get a one-frame initial token
+        # and a second sentence stop. Require a separate mic to transcribe
+        # one sound between matching words before discarding a repetition.
+        if (first["text"] != second["text"] or first["text"] not in {"嗯", "呃", "哦"}
+                or first["track_index"] != second["track_index"]
+                or not 0 < first["end_frame"] - first["start_frame"] <= max(1, round(.04 * fps))
+                or not 0 <= second["start_frame"] - first["end_frame"] <= round(.04 * fps)
+                or second["end_frame"] - first["start_frame"] > round(.22 * fps)
+                or not all(u.get("asr_punctuation_strength") == 1 for u in (first, second))):
+            return False
+        following = selected[i + 1:i + 4]
+        witnessed = False
+        for run, pos in anchored(previous):
+            if run[pos]["track_index"] == first["track_index"]:
+                continue
+            tail = run[pos + 1:pos + 5]
+            if not tail or not matches(tail[0], first):
+                continue
+            if any(matches(u, second) for u in tail[1:]):
+                return False
+            if (energy(tail[0]) >= 6 and not tail[0].get("alignment_repaired")
+                    and any(matches(u, v) for u in tail[1:] for v in following
+                            if v["text"] not in SHORT_INTERJECTIONS
+                            and v["start_frame"] - second["end_frame"] <= round(.5 * fps))):
+                witnessed = True
+        # A mic can start recording at the reaction and miss the preceding word.
+        return witnessed and not any(
+            run[pos]["track_index"] != first["track_index"] and pos + 1 < len(run)
+            and matches(run[pos + 1], second) for run, pos in anchored(first)
+        )
+
+    def missing_tail(previous, left, current, following):
+        gap = current["start_frame"] - left["end_frame"]
+        count = (len(left["text"]) == 1 and left["text"] in "一二两三四五六七八九十0123456789"
+                 and not left.get("asr_punctuation_strength"))
+        reply = (current["text"] in ("对", "是", "嗯", "好") and left.get("asr_punctuation_strength") == 1
+                 and bool(current.get("asr_punctuation_strength")))
+        if not 0 <= gap <= round(.75 * fps) or not (count or reply):
+            return []
+        if reply and not any(run[pos]["track_index"] == current["track_index"]
+                             and following is not None and pos + 1 < len(run)
+                             and matches(run[pos + 1], following)
+                             for run, pos in anchored(current)):
+            return []
+        alternatives = defaultdict(dict)
+        for run, pos in anchored(left):
+            if pos == 0 or not matches(run[pos - 1], previous) or run[pos].get("asr_punctuation_strength"):
+                continue
+            tail = run[pos + 1:pos + (2 if count else 3)]
+            spelling = "".join(u["text"] for u in tail)
+            if count and (spelling == current["text"] or spelling not in {
+                "遍", "次", "个", "件", "条", "张", "回", "份", "天", "年"
+            }):
+                continue
+            if reply:
+                if spelling not in {"对吧", "是吧", "对吗", "是吗"} or run[pos]["track_index"] == current["track_index"]:
+                    continue
+                # A distant mic can hallucinate a tag in bleed. Require usable energy
+                # on its own two syllables, comparable to its adjacent phrase ending.
+                lead_db = min(energy(u) for u in run[pos - 1:pos + 1])
+                if min(energy(u) for u in tail) < max(6, lead_db - 8):
+                    continue
+                distinct_onset = current["start_frame"] - tail[0]["end_frame"]
+                if tail[0]["text"] == current["text"] and distinct_onset < max(1, round(.06 * fps)):
+                    continue
+            if (not tail or tail[-1].get("asr_punctuation_strength") != 1
+                    or not left["start_frame"] < tail[0]["start_frame"] <= left["end_frame"] + tolerance
+                    or tail[-1]["end_frame"] > current["start_frame"]
+                    or any(not 0 <= b["start_frame"] - a["end_frame"] <= tolerance
+                           for a, b in zip([run[pos], *tail], tail))):
+                continue
+            alternatives[spelling][run[pos]["track_index"]] = tail
+        if len(alternatives) != 1:
+            return []
+        witnesses = next(iter(alternatives.values()))
+        if count and (len(witnesses) < 2 or left["track_index"] not in witnesses):
+            return []
+        return witnesses.get(left["track_index"]) or max(witnesses.values(), key=lambda seq: min(map(energy, seq)))
+
+    output = []
+    for i, current in enumerate(selected):
+        if output and i + 1 < len(selected) and current.get("speaker_decision") == "smoothed_short_flip":
+            left, right = output[-1], selected[i + 1]
+            # Did a quieter microphone splice one syllable into a continuous
+            # phrase on the main mic? Keep genuine replies and interruptions.
+            tracks = {run[pos]["track_index"] for run, pos in anchored(left)
+                      if pos + 1 < len(run) and matches(run[pos + 1], right)}
+            weak = min(energy(left), energy(right)) - energy(current)
+            home = left["track_index"]
+            repeated = (current["text"] in [u["text"] for u in output[-2:]]
+                        and current.get("asr_punctuation_strength") == 1)
+            gap = right["start_frame"] - left["end_frame"]
+            # A weak microphone may transcribe a Latin word phonetically,
+            # leaving its final Chinese syllable stranded after the Latin token.
+            latin_bleed = (weak >= 20 and gap <= round(fps) and len(output) >= 2
+                           and all(u["text"].isascii() and u["text"].isalpha() for u in output[-2:])
+                           and any(pos > 0 and run[pos]["track_index"] != home
+                                   and not run[pos - 1]["text"].isascii()
+                                   and run[pos - 1]["start_frame"] < left["end_frame"]
+                                   and run[pos - 1]["end_frame"] >= left["start_frame"]
+                                   for run, pos in anchored(current)))
+            if (home == right["track_index"] and home in tracks and weak >= 12
+                    and current["text"] not in SHORT_INTERJECTIONS
+                    and current["text"] not in {"不", "没", "有", "能", "会", "要", "行", "可"}
+                    and (latin_bleed or (len(tracks) >= 2 and gap <= round(.4 * fps)))):
+                if repeated:
+                    # A speaker can restart the last word before the answer.
+                    # Preserve their syllable and its final punctuation when
+                    # the recording with that syllable also contains its lead-in.
+                    if any(pos > 0 and matches(run[pos - 1], left)
+                           and run[pos - 1].get("asr_punctuation_strength", 0) == 0
+                           for run, pos in anchored(current)):
+                        output[-1] = dict(left, asr_punctuation_strength=0)
+                    output.append(current)
+                continue
+
+        if len(output) >= 2:
+            left = output[-1]
+            if split_vocalization(i, output[-2], left, current):
+                output[-1] = dict(left, end_frame=current["end_frame"],
+                                  speaker_decision="corroborated_single_vocalization")
+                continue
+            tail = missing_tail(output[-2], left, current, selected[i + 1] if i + 1 < len(selected) else None)
+            if tail:
+                output[-1] = dict(left, end_frame=min(left["end_frame"], tail[0]["start_frame"]),
+                                  asr_punctuation_strength=0)
+                output.extend(dict(u, track_index=left["track_index"], speaker_decision="aligned_phrase_tail")
+                              for u in tail)
+        output.append(current)
+    return output
 
 
 def _cross_mic_echo_offsets(
@@ -1875,10 +2136,25 @@ def suppress_near_duplicate_units(
                 or decision == "smoothed_short_flip"
                 or low_score_punctuated_tail
             )
+            # Two separately aligned syllables in the same recording can be a
+            # complete laugh after a sentence. A short gap is normal here.
+            recorded_laugh = (
+                text == previous_text == "哈"
+                and not changed_track and unit.get("track_index")
+                and unit.get("window_index") == previous.get("window_index")
+                and all(item.get("candidate_kind") == "primary" and not item.get("alignment_repaired")
+                        for item in (previous, unit))
+                and 0 <= gap <= round(.12 * fps)
+                and len(output) >= 2 and output[-2].get("asr_punctuation_strength", 0) >= 1
+                and not previous.get("asr_punctuation_strength")
+                and unit.get("asr_punctuation_strength", 0) >= 1
+                and not low_score_punctuated_tail and decision != "smoothed_short_flip"
+            )
             if (
                 0 <= gap <= maximum_gap_frames
                 and previous_text.endswith(text)
                 and has_ghost_evidence
+                and not recorded_laugh
             ):
                 suppressed += 1
                 continue
@@ -2300,6 +2576,9 @@ def _editorial_pause_boundary(units: list[dict[str, Any]], fps: float) -> int | 
     # Ignore uniform alignment spacing; a short pause needs local prominence.
     minimum_gap = max(math.ceil(0.08 * fps), statistics.median(gaps) + math.ceil(0.06 * fps))
     word_bounds = _unit_word_boundary_positions(units)
+    text = "".join(normalize_text(unit.get("text")) for unit in units)
+    reporting = re.match(r"^(?:那|其实|当时)?(?:我|你|他|她)们?(?:本来|原本|一直|还)?"
+                         r"(?:以为|觉得|发现)(?=(?:我|你|他|她)们?.{7})", text)
     candidates: list[tuple[float, int, int, int]] = []
     offset = 0
     for position, gap in enumerate(gaps, start=1):
@@ -2307,6 +2586,10 @@ def _editorial_pause_boundary(units: list[dict[str, Any]], fps: float) -> int | 
         if offset < 4 or total - offset < 4 or offset not in word_bounds:
             continue
         punctuation = float(units[position - 1].get("asr_punctuation_strength") or 0.0)
+        # A reported thought has a natural break before its embedded subject.
+        # Rank it below a real comma but above a sub-word alignment gap.
+        if reporting and offset == reporting.end():
+            candidates.append((0.25, gap, -abs(total - 2 * offset), position))
         if punctuation <= 0.0 and gap < minimum_gap:
             continue
         # Micro-pauses help long rows; do not recursively fragment a readable
@@ -2650,6 +2933,752 @@ def reclaim_overlong_unit_tails(
     return output, reclaimed_count
 
 
+_LINKING_PREFIXES = ("但是", "而且", "所以", "不过", "因为", "然后")
+_SUBJECT_PREFIXES = ("我们", "你们", "他们", "她们", "我", "你", "他", "她")
+
+
+def _continuation_prefix(left: str, right: str, same_track: bool) -> str:
+    if same_track and re.fullmatch(r"在[\u4e00-\u9fff]{1,4}(?:上|中|里|方面)", left):
+        return left if right.startswith(("我", "你", "他", "她", "它")) else ""
+    if left in ("这也", "那也") and right.startswith(("太", "很", "真")):
+        return left
+    for subject in _SUBJECT_PREFIXES + ("它们", "它"):
+        if left.endswith("但" + subject):
+            return "但" + subject
+    for linker in _LINKING_PREFIXES:
+        if left.endswith(linker[0]) and right.startswith(linker[1:]):
+            return linker[0]
+    for prefix in _LINKING_PREFIXES + _SUBJECT_PREFIXES:
+        if left.endswith(prefix) and (left != prefix or prefix in _LINKING_PREFIXES):
+            return prefix
+    return ""
+
+
+def _aligned_phrase_witnesses(candidates, fps):
+    # Keep competing microphones and ASR windows separate. A witness must
+    # actually contain the clause opening and its continuation in one take.
+    runs = defaultdict(list)
+    for u in candidates:
+        runs[(u.get("track_index"), u.get("window_index"), u.get("candidate_kind"))].append(u)
+    by_onset = defaultdict(list)
+    for run in runs.values():
+        run.sort(key=lambda u: (u["start_frame"], u["end_frame"]))
+        for i, u in enumerate(run):
+            by_onset[(u["start_frame"], u["text"])].append((run, i))
+
+    tolerance = max(1, round(0.35 * fps))
+
+    def corroborated(span, seam_index, *, other_than_track=None, required_track=None, witness_gap_limit=None,
+                     seam_punctuation_limit=0):
+        first = span[0]
+        for frame in range(first["start_frame"] - tolerance, first["start_frame"] + tolerance + 1):
+            for run, start in by_onset.get((frame, first["text"]), ()):
+                sample = run[start:start + len(span)]
+                if len(sample) != len(span) or sample[0].get("track_index") == other_than_track:
+                    continue
+                if required_track is not None and sample[0].get("track_index") != required_track:
+                    continue
+                if witness_gap_limit is not None:
+                    pause = sample[seam_index]["start_frame"] - sample[seam_index - 1]["end_frame"]
+                    if not 0 <= pause <= witness_gap_limit:
+                        continue
+                if (all(a["text"] == b["text"] and abs(a["start_frame"] - b["start_frame"]) <= tolerance
+                        for a, b in zip(sample, span))
+                        and all((u.get("asr_punctuation_strength") or 0)
+                                <= (seam_punctuation_limit if n == seam_index - 1 else 0)
+                                for n, u in enumerate(sample[:-1]))):
+                    return True
+        return False
+
+    return corroborated
+
+
+def repair_clause_continuations(
+    rows: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    fps: float,
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Reconsider short clause openings at row boundaries, using aligned speech."""
+    ordered = sorted(units, key=lambda u: (u["start_frame"], u["end_frame"]))
+    if len(rows) < 2 or "".join(u["text"] for u in ordered) != "".join(r["text"] for r in rows):
+        return rows, 0
+
+    corroborated = _aligned_phrase_witnesses(candidates, fps)
+
+    # Map character offsets to real unit boundaries. Never interpolate the
+    # start time of a prefix that is embedded inside one alignment unit.
+    at_offset = {0: 0}
+    offset = 0
+    for i, u in enumerate(ordered, 1):
+        offset += len(u["text"])
+        at_offset[offset] = i
+
+    output = []
+    offset = 0
+    repairs = 0
+    for original in rows:
+        left = output[-1] if output else None
+        right = dict(original)
+        output.append(right)
+        seam_offset = offset
+        offset += len(right["text"])
+        if left is None:
+            continue
+        same_track = left["speaker_track_index"] == right["speaker_track_index"]
+        prefix = _continuation_prefix(left["text"], right["text"], same_track)
+        seam = at_offset.get(seam_offset)
+        if not prefix and seam is not None and right["text"] in ("是一个", "是其中一个"):
+            # A short subject after the last comma can be stranded on the
+            # previous microphone. Require a real clause start and the same
+            # timing/witness checks as for other cross-track continuations.
+            for length in range(2, min(4, len(left["text"]) - 1) + 1):
+                subject_start = at_offset.get(seam_offset - length)
+                if subject_start and ordered[subject_start - 1].get("asr_punctuation_strength"):
+                    suffix = left["text"][-length:]
+                    if re.fullmatch(r"[\u4e00-\u9fff]+", suffix):
+                        prefix = suffix
+                    break
+        if not prefix or len(prefix) + len(right["text"]) > max_chars:
+            continue
+        start = at_offset.get(seam_offset - len(prefix))
+        end = at_offset.get(offset)
+        if start is None or seam is None or end is None or not start < seam < end:
+            continue
+        whole_left = left["text"] == prefix
+        if any(u.get("asr_punctuation_strength") for u in ordered[start:seam - 1]):
+            continue
+        if not whole_left and not ordered[start - 1].get("asr_punctuation_strength"):
+            continue
+        gap = ordered[seam]["start_frame"] - ordered[seam - 1]["end_frame"]
+        if gap < 0:
+            continue
+        punctuation = float(ordered[seam - 1].get("asr_punctuation_strength") or 0)
+        direct_join = (same_track and gap <= round(0.20 * fps)
+                       and punctuation < 1 and (whole_left or not punctuation))
+        if not direct_join:
+            linker = prefix in _LINKING_PREFIXES
+            if same_track and not linker:
+                continue
+            # Microphones can align the same hesitation a few frames apart.
+            # Allow a small margin on the selected timestamps, but the witness
+            # itself must hear a continuous conjunction within one second.
+            if gap > round((1.20 if linker else 0.45) * fps) or end - seam < 2:
+                continue
+            if not corroborated(
+                ordered[start:min(end, seam + 3)], seam - start,
+                other_than_track=right["speaker_track_index"] if same_track else None,
+                witness_gap_limit=round(fps) if linker else None,
+            ):
+                continue
+
+        new_start = left["start_frame"] if whole_left else ordered[start]["start_frame"]
+        if new_start >= right["end_frame"]:
+            continue
+        if whole_left:
+            output.pop(-2)
+        else:
+            new_end = min(new_start, ordered[start - 1]["end_frame"], left["end_frame"])
+            if new_end <= left["start_frame"]:
+                continue
+            left["text"] = left["text"][:-len(prefix)]
+            left["end_frame"] = new_end
+        right["start_frame"] = new_start
+        right["text"] = prefix + right["text"]
+        right["segmentation_decision"] = "clause_continuation"
+        repairs += 1
+    for i, row in enumerate(output, 1):
+        row["index"] = i
+    return output, repairs
+
+
+# The literal separator marks the candidate cue break. Match the grammar
+# on both sides without changing any ASR characters.
+_DEPENDENT_PHRASE_SEAMS = tuple(re.compile(pattern) for pattern in (
+    r"\|的(?:流程|方式|结果|东西)",
+    r"(?:什么样|怎样|怎么样)\|的",
+    r"(?:这样|那样|这么|那么)一个\|",
+    r"(?:做|交|留|送|递)给\|[你我他她]",
+    r"(?:把|将)[你我他她它]们?\|的[\u4e00-\u9fff]",
+    r"(?:会|要|能)在\|",
+    r"(?:彻底|完全|真正|认真)[地的]\|",
+    r"(?:为|替|跟)[你我他她]们?\|",
+    r"会\|(?:想|觉得|选择)",
+    r"(?:太|特别|非常)\|.{1,5}$",
+    r"哪.{1,6}是\|.+[呀呢吗]$",
+    r"(?:问|提)(?:出)?一个\|(?:就|让|大家|所有人).+的问题",
+    r"(?:不想|不愿|打算)\|去",
+    r"(?:这|那)几\|[种件套名位项类]",
+    r"^(?:我|你|他|她)(?:们)?(?:相信|觉得|认为)\|(?:我|你|他|她|它|这|那)",
+    r"(?:因为|由于)(?:觉得|认为)\|(?:这|那)[样么]",
+))
+
+_DURATION = r"[一二三四五六七八九十两半\d]+(?:个(?:月|小时)|分钟|小时|天|周|年)"
+
+
+def _hesitant_complement(left: str, right: str) -> bool:
+    """A same-speaker hesitation inside a quantified answer or verb/object."""
+    return bool(
+        (re.search(r"(?:比较|更|最)[快慢长短久]的$", left)
+         and re.fullmatch(_DURATION + r"(?:都|也)(?:有|要|行|可以)[呢啊了]?", right))
+        or (re.search(r"(?:没有|缺少)任何(?:尊重|珍惜|欣赏|爱护|重视)$", left)
+            and re.fullmatch(r"[这那](?:个|份|件|种).{1,6}的(?:感觉|意思|意识)", right))
+    )
+
+
+def _internal_clause_break(left: str, right: str, previous: str) -> bool:
+    # The same name can be the object of one clause and the next subject.
+    for size in range(2, min(4, len(left) - 1, len(right) - 1) + 1):
+        subject = left[-size:]
+        if (re.fullmatch(r"[\u4e00-\u9fff]+", subject)
+                and right.startswith(subject) and right[size:].startswith(("就", "也", "会", "再", "负责"))):
+            return True
+    count = re.search(r"[一二三四五六七八九十两\d]+([遍次轮])$", left)
+    if count and right.startswith(("就是", "比如", "也就是")) and count[1] in right:
+        return True
+    return bool(previous == left and re.fullmatch(_DURATION, left)
+                and re.search(r"(?:比较|更|最)[快慢长短久]的$", right))
+
+
+def _split_punctuated_clauses(rows, ordered, offsets, word_bounds):
+    """Split an internal clause only at a punctuated, aligned word boundary."""
+    output = []
+    cursor = 0
+    for row in rows:
+        text = row["text"]
+        start = cursor
+        cursor += len(text)
+        previous = output[-1]["text"] if output else ""
+        for pos in range(2, len(text) - 1):
+            edge = offsets.get(start + pos)
+            if edge is None or start + pos not in word_bounds:
+                continue
+            before, after = ordered[edge - 1], ordered[edge]
+            if (not before.get("asr_punctuation_strength")
+                    or before["track_index"] != after["track_index"]
+                    or not _internal_clause_break(text[:pos], text[pos:], previous)):
+                continue
+            onset = after["start_frame"]
+            end = min(onset, before["end_frame"])
+            if row["start_frame"] < end <= onset < row["end_frame"]:
+                output.extend((
+                    {**row, "text": text[:pos], "end_frame": end, "segmentation_decision": "phrase_reflow"},
+                    {**row, "text": text[pos:], "start_frame": onset, "segmentation_decision": "phrase_reflow"},
+                ))
+                break
+        else:
+            output.append(row)
+    return output
+
+
+def _carried_hesitation_onset(left, right, ordered, starts, fps, max_chars) -> int | None:
+    """Find the aligned onset of a hesitation introducing the next topic."""
+    following = right["text"]
+    if (not left["text"].endswith("嗯") or "\n" in left["text"]
+            or not re.fullmatch(r"对[\u4e00-\u9fff]{1,12}(?:这|那)方面", following)
+            or len(following) + 2 > max_chars or left["end_frame"] != right["start_frame"]):
+        return None
+    cut = bisect_left(starts, right["start_frame"])
+    if cut < 2 or cut >= len(ordered):
+        return None
+    before, filler, topic = ordered[cut - 2:cut + 1]
+    track = left.get("speaker_track_index")
+    if (
+        track and track == right.get("speaker_track_index")
+        and all(u.get("track_index") == track and u.get("candidate_kind") == "primary"
+                and u.get("speaker_decision") in (None, "viterbi_exclusive")
+                and not u.get("alignment_repaired") for u in (before, filler, topic))
+        and filler.get("window_index") is not None
+        and before.get("window_index") == filler["window_index"] == topic.get("window_index")
+        and before["start_frame"] >= left["start_frame"]
+        and left["text"].endswith(before["text"] + "嗯") and filler["text"] == "嗯"
+        and topic["text"] == "对" and not topic.get("asr_punctuation_strength")
+        and all(0 < (u.get("asr_punctuation_strength") or 0) < 1 for u in (before, filler))
+        and before["end_frame"] <= filler["start_frame"] < filler["end_frame"] <= topic["start_frame"]
+        and topic["start_frame"] == right["start_frame"]
+        and filler["start_frame"] - left["start_frame"] >= round(1.5 * fps)
+        and topic["start_frame"] - filler["start_frame"] <= round(.25 * fps)
+    ):
+        return filler["start_frame"]
+    return None
+
+
+def _split_unfinished_connector(left, response, ordered, starts, cuts, fps):
+    """Reveal a trailing 然后 at its onset when a silence and lone filler follow."""
+    lead = re.fullmatch(r"([^\n]+)，然后(?:……)?", left["text"])
+    if not lead or response["text"] not in ("嗯", "呃"):
+        return None
+    edge = bisect_left(starts, response["start_frame"])
+    if not 3 <= edge < len(ordered):
+        return None
+    before, ran, hou, filler = ordered[edge - 3:edge + 1]
+    onset = ran["start_frame"]
+    end = max(left["end_frame"], onset + math.ceil(.8 * fps))
+    track = left.get("speaker_track_index")
+    if (not track or response.get("speaker_track_index") != track
+            or any(u.get("track_index") != track or u.get("alignment_repaired")
+                   or u.get("candidate_kind") == "local_retry" for u in (before, ran, hou, filler))
+            or (ran["text"], hou["text"], filler["text"]) != ("然", "后", response["text"])
+            or not lead[1].endswith(before["text"]) or before["start_frame"] < left["start_frame"]
+            or not .5 <= (before.get("asr_punctuation_strength") or 0) < 1
+            or (hou.get("asr_punctuation_strength") or 0) < 1
+            or (filler.get("asr_punctuation_strength") or 0) < 1
+            or not before["end_frame"] <= onset < ran["end_frame"] <= hou["start_frame"] < hou["end_frame"] <= left["end_frame"]
+            or onset - left["start_frame"] < math.ceil(.5 * fps)
+            or filler["start_frame"] != response["start_frame"]
+            or filler["start_frame"] - hou["end_frame"] < round(.8 * fps)
+            or end > filler["start_frame"] or any(f in cuts for f in range(onset + 1, end))):
+        return None
+    return [
+        {**left, "text": lead[1], "end_frame": onset, "original_end_frame": before["end_frame"],
+         "segmentation_decision": "delayed_ending"},
+        {**left, "text": "然后", "start_frame": onset, "end_frame": end, "original_start_frame": onset,
+         "original_end_frame": hou["end_frame"], "segmentation_decision": "delayed_ending"},
+    ]
+
+
+def split_delayed_endings(rows, units, fps, picture_cuts, max_chars=25):
+    """Keep delayed answers, topics and independent reactions close to their onset."""
+    ordered = sorted(units, key=lambda unit: unit["start_frame"])
+    starts = [unit["start_frame"] for unit in ordered]
+    cuts = set(picture_cuts)
+    floor = max(1, math.ceil(fps / 2))
+    output = []
+    for row in rows:
+        if output:
+            previous = output[-1]
+            connector = _split_unfinished_connector(previous, row, ordered, starts, cuts, fps)
+            if connector:
+                output[-1:] = connector
+            onset = _carried_hesitation_onset(previous, row, ordered, starts, fps, max_chars)
+            if onset is not None:
+                output[-1] = {**previous, "text": previous["text"][:-1], "end_frame": onset,
+                              "timing_decision": "spoken_leadin_handoff"}
+                # This same-speaker filler leads its topic by at most a quarter
+                # second. Preserve its onset without creating a standalone flash.
+                row = {**row, "text": "嗯 " + row["text"], "start_frame": onset,
+                       "timing_decision": "spoken_leadin_handoff", "segmentation_decision": "delayed_ending"}
+        text = row["text"]
+        laugh = re.search(r"(?<=[^哈])(哈{2,})$", text)
+        reveal = re.search(r"的(?:部分|环节|主题|领域)([\u4e00-\u9fff]{2,4})$", text)
+        answer = re.search(r"(?:还是|就是|答案是|结果是)(还没有|还没定|不知道|没想好)$", text)
+        ending = laugh or reveal or answer
+        if not ending or "\n" in text:
+            output.append(row)
+            continue
+        suffix = ending[1]
+        split_pos = ending.start(1)
+        start, end = row["start_frame"], row["end_frame"]
+        # Work backwards from the actual final words. Display normalization or
+        # a line borrowed from another speaker must not create a false match.
+        last = bisect_left(starts, end)
+        first = last
+        spoken = ""
+        while first and starts[first - 1] >= start and len(spoken) < len(suffix):
+            first -= 1
+            spoken = normalize_text(ordered[first]["text"]) + spoken
+        if not first or first == last or spoken != suffix:
+            output.append(row)
+            continue
+        before, after = ordered[first - 1], ordered[first]
+        onset = after["start_frame"]
+        track = after.get("track_index")
+        punct = before.get("asr_punctuation_strength", 0)
+        timing_matches = (
+            start <= before["start_frame"] and before["end_frame"] <= onset
+            and text[:split_pos].endswith(normalize_text(before["text"]))
+            and track and all(unit.get("track_index") == track for unit in ordered[first - 1:last])
+            and min(onset - start, end - onset) >= floor
+        )
+        if reveal:
+            near_cut = any(frame in cuts for frame in range(onset - round(.1 * fps), onset + 1))
+            separate = punct >= .5 and onset - before["end_frame"] >= round(.2 * fps) and near_cut
+        elif answer:
+            # Wait for an elicited answer when delivery includes a marked hesitation.
+            prompted = output and re.search(r"哪|什么|谁|多少|[吗呢？?]$", output[-1]["text"])
+            held = any(v["start_frame"] - u["end_frame"] >= round(.3 * fps)
+                       for u, v in zip(ordered[first - 1:last - 1], ordered[first:last]))
+            separate = (prompted and 0 <= start - output[-1]["end_frame"] <= round(.5 * fps)
+                        and held and onset - start >= round(fps)
+                        and ordered[last - 1].get("asr_punctuation_strength", 0) >= 1)
+        else:
+            separate = punct >= 1 and ordered[last - 1].get("asr_punctuation_strength", 0) >= 1
+        if timing_matches and separate:
+            output.extend((
+                {**row, "text": text[:split_pos], "end_frame": onset,
+                 "original_end_frame": before["end_frame"], "segmentation_decision": "delayed_ending"},
+                {**row, "text": suffix, "start_frame": onset, "original_start_frame": onset,
+                 "speaker_track_index": track, "segmentation_decision": "delayed_ending"},
+            ))
+        else:
+            output.append(row)
+    return output
+
+
+def display_comma_clauses(text: str) -> list[str]:
+    # Drop grouping separators in 1,234,567; commas outside these groups
+    # delimit clauses. Spaces inside each clause carry pauses and brand names.
+    ungrouped = re.sub(r"(?<![0-9])[0-9]{1,3}(?:[,，][0-9]{3})+(?![0-9])",
+                       lambda m: re.sub(r"[,，]", "", m[0]), text)
+    return [part.strip() for part in re.split(r"[,，]", ungrouped) if part.strip()]
+
+
+def _display_word_frames(
+    text: str, spoken: list[dict[str, Any]],
+) -> list[tuple[int, int, int | None] | None]:
+    """Map displayed characters to aligned source frames, allowing spelling and number normalization."""
+    raw, spans = [], []
+    for word in spoken:
+        chars = normalize_text(word["text"])
+        start, end = word["start_frame"], word["end_frame"]
+        for k, char in enumerate(chars):
+            raw.append(char)
+            spans.append((start + round(k * (end - start) / len(chars)),
+                          start + round((k + 1) * (end - start) / len(chars)), word.get("track_index")))
+    source = "".join(raw)
+    if source == text:
+        return spans
+    mapped = [None] * len(text)
+    matcher = difflib.SequenceMatcher(None, text, source, autojunk=False)
+    for tag, i, j, k, l in matcher.get_opcodes():
+        if tag == "equal":
+            mapped[i:j] = spans[k:l]
+        elif tag == "replace" and (i or j < len(text)) and l > k:
+            # A replaced name or numeral between matching words begins at the
+            # beginning of the corresponding spoken span.
+            mapped[i] = spans[k]
+            if j - i > 1:
+                mapped[j - 1] = spans[l - 1]
+    return mapped
+
+
+def split_display_commas(rows: list[dict[str, Any]], units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Turn each displayed clause into a cue, using its first word's actual onset."""
+    ordered = sorted(units, key=lambda u: u["start_frame"])
+    onsets = [u["start_frame"] for u in ordered]
+    output = []
+    for row in rows:
+        text = row["text"]
+        if "," not in text and "，" not in text:
+            output.append(row)
+            continue
+        parts = display_comma_clauses(text)
+        start, end = row["start_frame"], row["end_frame"]
+        while len(parts) > max(1, end - start):
+            # Each cue needs at least one frame. Keep brief repetitions together
+            # first when the source row has fewer frames than phrases.
+            k = min(range(len(parts) - 1), key=lambda n: (
+                parts[n] != parts[n + 1] and parts[n] not in SHORT_INTERJECTIONS,
+                len(parts[n]) + len(parts[n + 1])))
+            parts[k:k + 2] = [" ".join(parts[k:k + 2])]
+        if len(parts) < 2:
+            if parts:
+                output.append({**row, "text": parts[0]})
+            continue
+        first = bisect_left(onsets, min(start, row.get("original_start_frame", start)))
+        stop = bisect_left(onsets, max(end, row.get("original_end_frame", end)))
+        normalized = [normalize_text(part) or "\ufffd" for part in parts]
+        mapped = _display_word_frames("".join(normalized), ordered[first:stop])
+        offsets = [0, *itertools.accumulate(map(len, normalized))]
+        frames = [start] + [None] * (len(parts) - 1) + [end]
+        # Interpolate only unaligned boundaries, between the nearest known
+        # onsets. Reserve one frame per remaining part even on poor alignments.
+        previous = 0
+        for n in range(1, len(frames)):
+            if n < len(parts):
+                span = mapped[offsets[n]]
+                if not span:
+                    continue
+                frames[n] = max(frames[previous] + n - previous,
+                                min(end - (len(parts) - n), span[0]))
+            for k in range(previous + 1, n):
+                fraction = (offsets[k] - offsets[previous]) / (offsets[n] - offsets[previous])
+                value = frames[previous] + round((frames[n] - frames[previous]) * fraction)
+                frames[k] = max(frames[k - 1] + 1, min(frames[n] - (n - k), value))
+            previous = n
+        for n, part in enumerate(parts):
+            head, tail = mapped[offsets[n]], mapped[offsets[n + 1] - 1]
+            child = {**row, "text": part, "start_frame": frames[n], "end_frame": frames[n + 1],
+                     "original_start_frame": head[0] if head else frames[n],
+                     "original_end_frame": tail[1] if tail else frames[n + 1],
+                     "segmentation_decision": "display_comma_split"}
+            if n:
+                child["timing_decision"] = ("aligned_comma_handoff" if head and frames[n] == head[0]
+                                            else "estimated_comma_handoff")
+            if head and head[2]:
+                child["speaker_track_index"] = head[2]
+            output.append(child)
+    return output
+
+
+def _quantity_seam(left: str, right: str) -> bool:
+    return bool(re.search(r"(?:有|要|剩|差)[个约近]$", left)
+                and re.match(r"[一二三四五六七八九十百千万两0-9]+", right))
+
+
+_SPOKEN_RESTARTS = (
+    (re.compile(r"(?:以为|觉得|认为)[^，。！？…\n]+是\Z"), re.compile(r"就是"), "，"),
+    (re.compile(r"(?:就会|已经|本来|原来)已\Z"), re.compile(r"[他她它我你](?:们)?已经"), "……"),
+)
+
+
+def punctuate_spoken_restarts(text: str) -> str:
+    """Show a false start without removing spoken words or creating another cue."""
+    for ending, opening, separator in _SPOKEN_RESTARTS:
+        text = opening.sub(lambda m: (separator if ending.search(text, 0, m.start()) else "") + m[0], text)
+    return text
+
+
+def _resumed_clause(left: str, right: str) -> bool:
+    # Preserve the speaker's stutter or false start within the clause it introduces.
+    return bool(
+        any(ending.search(left) and opening.match(right) for ending, opening, _ in _SPOKEN_RESTARTS)
+        or (re.fullmatch(r"(?:就|那个)[嗯呃]+", left) and right.startswith(("然后", "接着", "其实")))
+        or (re.fullmatch(r"(?:因为|由于)[这那](?:一)?[条件个部次款]", left)
+            and re.match(r"(?:它|这|那)(?:其实|本来|已经|也|还|是)", right))
+        or (re.fullmatch(r"(?:就是|然后|那就|我们就|咱们就)先", left)
+            and re.match(r"(?:得到|拿到|找到|做好|准备|确定|尝试|记录|把|将|打开|完成|处理)", right))
+        or (re.fullmatch(r"(?:但是|不过|可是|但)(?:当时|那时(?:候)?|当初|那会儿)", left)
+            and re.match(r"(?:其实|确实|实际上|毕竟)(?:[我你他她它]|大家)", right))
+    )
+
+
+def _phrase_cut(left: str, right: str, commas: set[int], stop: bool, max_chars: int) -> int | None:
+    """Select a better unit boundary in adjacent cues. Zero joins the pair."""
+    seam = len(left)
+    if re.match(r"^[吧吗呢](?:对|是的|没错)", right) and seam + 1 in commas:
+        return seam + 1
+    if _quantity_seam(left, right):
+        return 0
+    if left.endswith("工作") and re.fullmatch(r"(?:步骤|流程|方式)[呢吗呀]?", right):
+        return 0
+    if stop:
+        # A false ASR period after a stranded subject needs another mic
+        # hearing the same uninterrupted phrase (checked by the caller).
+        if len(left) <= 4 and left.endswith(("我", "你", "他", "她")) and len(left) > 1:
+            return 0
+        return None
+    # A movement or action is part of the temporal modifier that precedes it.
+    if (re.search(r"(?:能够|可以|需要)在.{1,8}(?:之后|之前|以后|以前)$", left)
+            and right.startswith(("重新", "再次", "继续", "直接"))):
+        conditional = re.search(r"(?:如果|只要|假如)(?:把|将)", left)
+        return conditional.start() if conditional else 0
+    # Coordinate lists and comparisons have stronger outer boundaries than
+    # the commas between their items.
+    if seam in commas:
+        obj = left.rfind("把")
+        if obj >= 3 and seam - obj <= 6 and any(seam < p <= seam + 5 for p in commas):
+            return obj
+        change = re.match(r".{1,5}?(?=变成|变为|成为)", right)
+        if change and re.search(r"从.{1,5}$", left):
+            return seam + change.end()
+
+    # Move a complete modifier, example, or attribution to the clause it opens.
+    inside = sorted(p for p in commas if 2 <= p < seam)
+    if inside:
+        last_break = inside[-1]
+        tail = left[last_break:]
+        if tail in ("来", "走") and seam in commas and right.startswith(("然后", "接着", "随后")):
+            return None
+        if (tail in ("哇", "诶", "哎", "走", "来", "最多", "至少", "其实")
+                or (len(tail) <= 7 and tail.endswith(("就说", "会说", "告诉我")))
+                or (re.search(r"一旦|只要|如果", left[:last_break]) and right.startswith(("就", "也就")))):
+            return last_break
+    for p in inside:
+        if left[p:].startswith(("比如说", "举个例子")) and len(right) <= 10:
+            return p
+    repeat = re.search(r"([\u4e00-\u9fff]{2,4})\1$", left)
+    if repeat and right.startswith(("其实", "就是", "也", "才")):
+        return repeat.start(1) + len(repeat[1])
+
+    # Keep mixed-script names and equipment designations with their head.
+    if re.match(r"[a-z]+", right, re.I):
+        brand = re.search(r"(?:的|名为|叫作)([\u4e00-\u9fff]{2,4})$", left)
+        if brand:
+            return brand.start(1)
+        model = re.search(r"(?:[几两一二三四五六七八九十0-9]+[款台种套])?[a-z]+$", left, re.I)
+        if model and re.match(r"[a-z]+(?:相机|摄像机|设备|系统|镜头)", right, re.I):
+            # Include the qualifier with the counted model. A completed verb
+            # before a short brand provides a clean start for the whole object.
+            stem = left[:model.start()]
+            modifier = re.search(r"(?:最[新大小早]|全新|升级)的$", stem)
+            if modifier:
+                brand = re.search(r"了([\u4e00-\u9fff]{1,6})$", stem[:modifier.start()])
+                if brand and not any(brand.start(1) < pos <= modifier.start() for pos in commas):
+                    return brand.start(1)
+                return modifier.start()
+            return model.start()
+    if left[-1:].isascii() and re.match(r"技术|芯片|系统|镜头|相机", right):
+        return 0
+    if right.startswith(("自动化", "智能化", "数字化")):
+        obj = re.search(r"(?:发布|公布|采用|使用|推出)了?(.{1,5})$", left)
+        if obj:
+            return obj.start(1)
+
+    # Determiners/complements, prepositions and short predicates cannot
+    # finish the phrase alone. Prefer one readable cue when it fits.
+    if left.endswith(("那个", "这个")) and "一样" in right:
+        return seam + right.index("一样") + 2
+    if re.search(r"离.{1,5}$", left) and right.startswith(("最近", "最远", "更近", "更远")):
+        location = left.rfind("离")
+        placement = re.search(r"(?:要|会|得)?(?:放|摆|留|坐|站|装|设)在$", left[:location])
+        if placement:
+            return 0 if len(left) + len(right) <= max_chars else placement.start()
+        return location
+    seam_context = left + "|" + right
+    if any(pattern.search(seam_context) for pattern in _DEPENDENT_PHRASE_SEAMS):
+        return 0
+    if len(left) <= 5:
+        if len(right) <= 4 and left[-1:] == right[:1]:
+            return 0
+        if re.fullmatch(r"(?:这些|那些|这类|那类|这种|那种).{1,3}", left):
+            return 0
+        if left.startswith(("我们", "你们", "他们")) and right.startswith(("就是", "也是", "主要")):
+            return 0
+        if left.startswith("而") and right.startswith(("自动", "智能", "实时")):
+            return 0
+    return None
+
+
+def _attach_brief_echo(output, preceding_unit, first_unit, fps, max_chars):
+    """After splitting a repeated noun, keep a brief first mention with its lead-in."""
+    if len(output) < 3 or preceding_unit is None:
+        return
+    previous, brief, following = output[-3:]
+    noun = re.fullmatch(r"(?:这个|那个|这种|那种)([\u4e00-\u9fff]{2,4})", brief["text"])
+    if not noun or not following["text"].startswith(noun[1]):
+        return
+    if brief["end_frame"] - brief["start_frame"] > round(.5 * fps):
+        return
+    gap = first_unit["start_frame"] - preceding_unit["end_frame"]
+    if (previous["speaker_track_index"] != brief["speaker_track_index"]
+            or (preceding_unit.get("asr_punctuation_strength") or 0) >= 1
+            or not 0 <= gap <= round(.25 * fps)
+            or len(previous["text"]) + len(brief["text"]) > max_chars
+            or brief["end_frame"] - previous["start_frame"] > round(6 * fps)):
+        return
+    previous["text"] += brief["text"]
+    previous["end_frame"] = brief["end_frame"]
+    previous["segmentation_decision"] = "phrase_reflow"
+    del output[-2]
+
+
+def reflow_phrase_boundaries(
+    rows: list[dict[str, Any]], units: list[dict[str, Any]], candidates: list[dict[str, Any]],
+    fps: float, max_chars: int, tokenizer: Callable[[str], list[str]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Reconsider grammatical breaks using real onsets and corroborated microphone seams."""
+    ordered = sorted(units, key=lambda u: (u["start_frame"], u["end_frame"]))
+    text = "".join(u["text"] for u in ordered)
+    if not rows or text != "".join(r["text"] for r in rows):
+        return rows, 0
+    offsets = {0: 0}
+    cursor = 0
+    for i, unit in enumerate(ordered, 1):
+        cursor += len(unit["text"])
+        offsets[cursor] = i
+    word_bounds = _unit_word_boundary_positions(ordered, tokenizer)
+    corroborated = _aligned_phrase_witnesses(candidates, fps)
+    output = []
+    end = 0
+    split_rows = _split_punctuated_clauses(rows, ordered, offsets, word_bounds)
+    changed = len(split_rows) - len(rows)
+    for index, row in enumerate(split_rows):
+        seam = end
+        right = dict(row)
+        end += len(right["text"])
+        left = output[-1] if output else None
+        output.append(right)
+        if left is None or seam not in offsets or end not in offsets:
+            continue
+        start = seam - len(left["text"])
+        if start not in offsets:
+            continue
+        i, j, k = offsets[start], offsets[seam], offsets[end]
+        if not i < j < k:
+            continue
+        gap = ordered[j]["start_frame"] - ordered[j - 1]["end_frame"]
+        same_track = left["speaker_track_index"] == right["speaker_track_index"]
+        hesitation = same_track and _hesitant_complement(left["text"], right["text"])
+        if not 0 <= gap <= round((.85 if hesitation else .5) * fps):
+            continue
+        punct = ordered[j - 1].get("asr_punctuation_strength") or 0
+        commas = set()
+        pos = 0
+        for unit in ordered[i:k]:
+            pos += len(unit["text"])
+            if unit.get("asr_punctuation_strength"):
+                commas.add(pos)
+        resumed = same_track and punct < 1 and _resumed_clause(left["text"], right["text"])
+        cut = 0 if hesitation or resumed else _phrase_cut(left["text"], right["text"], commas, punct >= 1, max_chars)
+        # A mic can drop out after the first word of a hesitant restart.
+        # The new mic must hear that word run into the hesitation itself.
+        # A weak comma on the continuing mic is also plausible when the
+        # hesitation immediately leads into that same mic's resumed clause.
+        following = split_rows[index + 1] if index + 1 < len(split_rows) else None
+        resumes_after_filler = (right["text"] in ("嗯", "呃") and following
+                                and following["speaker_track_index"] == right["speaker_track_index"]
+                                and _resumed_clause("就" + right["text"], following["text"])
+                                and (ordered[k - 1].get("asr_punctuation_strength") or 0) < 1
+                                and 0 <= following["start_frame"] - ordered[k - 1]["end_frame"] <= round(.3 * fps))
+        restart = (j - i >= 2 and ordered[j - 1]["text"] == "就"
+                   and right["text"] in ("嗯", "呃")
+                   and (ordered[j - 2].get("asr_punctuation_strength") or 0) >= 1
+                   and corroborated(ordered[j - 1:k], 1, other_than_track=left["speaker_track_index"],
+                                    required_track=None if same_track else right["speaker_track_index"],
+                                    witness_gap_limit=round(.3 * fps),
+                                    seam_punctuation_limit=.55 if resumes_after_filler else 0))
+        if restart:
+            cut = len(left["text"]) - 1
+        if cut is None or cut == seam - start or start + cut not in offsets:
+            continue
+        if cut and start + cut not in word_bounds:
+            continue
+        if max(cut, end - start - cut) > max_chars or (cut and end - start - cut < 2):
+            continue
+        if cut == 0 and right["end_frame"] - left["start_frame"] > round(6 * fps):
+            continue
+        stranded_subject = left["text"].endswith(_SUBJECT_PREFIXES)
+        if not restart and (not same_track or (not hesitation and punct >= 1
+                                               and (gap > round(.3 * fps) or stranded_subject))):
+            a, b = max(i, j - 2), min(k, j + 2)
+            # A brief hesitation before an estimate can get a spurious period
+            # even on the mic that transcribed both sides of the count.
+            quantity = _quantity_seam(left["text"], right["text"]) and gap <= round(.3 * fps)
+            # In a conditional, both the condition and its consequence can
+            # contain a comma. A weak comma before 就 does not end the turn.
+            conditional = (cut in commas and 0 < cut < len(left["text"]) and 0 < punct < 1
+                           and re.search(r"一旦|只要|如果", left["text"][:cut])
+                           and right["text"].startswith(("就", "也就")))
+            if not corroborated(ordered[a:b], j - a, witness_gap_limit=round((.3 if quantity else .5) * fps),
+                                seam_punctuation_limit=1 if quantity else (.55 if conditional else 0),
+                                other_than_track=left["speaker_track_index"] if same_track else None):
+                continue
+        if cut:
+            edge = offsets[start + cut]
+            onset = ordered[edge]["start_frame"]
+            if not left["start_frame"] < onset < right["end_frame"]:
+                continue
+            new_end = min(onset, ordered[edge - 1]["end_frame"])
+            if new_end <= left["start_frame"]:
+                continue
+            left["text"], right["text"] = text[start:start + cut], text[start + cut:end]
+            left["end_frame"] = new_end
+            right["start_frame"] = onset
+            right["segmentation_decision"] = "phrase_reflow"
+            _attach_brief_echo(output, ordered[i - 1] if i else None, ordered[i], fps, max_chars)
+        else:
+            left["text"] += right["text"]
+            left["end_frame"] = right["end_frame"]
+            output.pop()
+        left["segmentation_decision"] = "phrase_reflow"
+        changed += 1
+    for i, row in enumerate(output, 1):
+        row["index"] = i
+    return output, changed
+
+
 def protect_word_boundaries(
     rows: list[dict[str, Any]],
     units: list[dict[str, Any]],
@@ -2753,6 +3782,21 @@ def protect_word_boundaries(
             left = entries[index]
             right = entries[index + 1]
             word_end = min(bound for bound in word_bounds if bound > running)
+            word_start = max(bound for bound in word_bounds if bound < running)
+            word = full_text[word_start:word_end]
+            # At a Chinese brand / Latin model boundary, start the new cue
+            # at the brand rather than absorbing the model into the prior cue.
+            take = running - word_start
+            if (re.search(r"[\u4e00-\u9fff][a-zA-Z]", word) and take < len(left["units"])
+                    and left["start_frame"] < left["units"][-take]["start_frame"] < right["end_frame"]):
+                onset = left["units"][-take]["start_frame"]
+                right["units"] = left["units"][-take:] + right["units"]
+                right["text"] = left["text"][-take:] + right["text"]
+                left["units"] = left["units"][:-take]
+                left["text"] = left["text"][:-take]
+                left["end_frame"] = right["start_frame"] = onset
+                changed = True
+                break
             move_count = min(word_end - running, len(right["text"]))
             if move_count <= 0:
                 continue
@@ -2870,19 +3914,8 @@ def _hard_cut_boundaries(
                 ]
                 chosen = min(next_word_safe_candidates) if next_word_safe_candidates else None
                 if chosen is None:
-                    for index in range(1, unit_count):
-                        if prefix[index] <= forced_limit:
-                            chosen = index
-                        else:
-                            break
-                if chosen is None:
-                    # A single canonical unit's own text already exceeds
-                    # max_chars: there is no finer per-character time to
-                    # split on, so cut after it anyway rather than
-                    # fabricate a frame boundary inside it. This chunk will
-                    # still exceed max_chars, which is the unavoidable
-                    # floor set by the source alignment granularity.
-                    chosen = 1
+                    # Only the end of the row remains word-safe.
+                    break
         if chosen <= 0 or prefix[chosen] <= start_prefix:
             break
         boundaries.append(chosen)
@@ -3007,7 +4040,11 @@ def _unit_word_boundary_positions(
         cursor += len(left_text)
         left_char = left_text[-1:] if left_text else ""
         right_char = right_text[:1] if right_text else ""
+        # The dictionary sees unpunctuated text. A sentence end in the ASR
+        # separates homographs such as 实现。在 and 现在.
         if not (_is_ascii_word_char(left_char) and _is_ascii_word_char(right_char)):
+            if float(ordered[index - 1].get("asr_punctuation_strength") or 0) >= 1.0:
+                positions.add(cursor)
             continue
         if ordered[index].get("space_before") is True:
             positions.add(cursor)
@@ -3016,9 +4053,184 @@ def _unit_word_boundary_positions(
     return frozenset(positions)
 
 
+def _punctuate_spoken_actions(text: str, units: list[dict[str, Any]], fps: float) -> str:
+    """Separate a completed action or repeated short answer within one turn."""
+    action = re.search(
+        r"先(?:得到|拿到|找到|收到|做好|完成)(?:它|这件事|这个|那个)"
+        r"(?=先(?:放|存|收|留|摆|记|拿))", text
+    )
+    answer = re.match(r"(([我你他她]们?)(?:有|会|能|懂|知道|记得))\1(?=\2[\u4e00-\u9fff]{2,})", text)
+    if action:
+        boundaries = {action.end()}
+    elif answer:
+        boundaries = {answer.end(1), answer.end()}
+    else:
+        return text
+
+    # Add the separators together, only at measured pauses between units.
+    # A repeated syllable without these gaps can be a stutter instead.
+    if (len({u.get("track_index") for u in units}) != 1
+            or not units[0].get("track_index")
+            or "".join(u["text"] for u in units) != text):
+        return text
+    offset = 0
+    pauses = {}
+    for left, right in zip(units, units[1:]):
+        offset += len(left["text"])
+        gap = right["start_frame"] - left["end_frame"]
+        if max(1, round(.05 * fps)) <= gap <= round(.4 * fps):
+            pauses[offset] = right["start_frame"]
+    if boundaries <= pauses.keys():
+        # Quick repetitions form one answer. The next clause still gets a
+        # real boundary, even if each individual repetition would flash.
+        join_echo = (not action and answer
+                     and min(pauses[answer.end(1)] - units[0]["start_frame"],
+                             pauses[answer.end()] - pauses[answer.end(1)]) < math.ceil(.5 * fps))
+        for offset in sorted(boundaries, reverse=True):
+            separator = " " if join_echo and offset == answer.end(1) else "，"
+            text = text[:offset] + separator + text[offset:]
+    return text
+
+
+def _punctuate_leadin_pause(text: str, units: list[dict[str, Any]], fps: float) -> str:
+    # An experiential lead-in can introduce a second clause in the same cue.
+    # A short direct object (e.g. 试过才知道答案) does not warrant a comma.
+    lead = re.match(r"[\u4e00-\u9fff]{1,5}过才(?:知道|明白|发现|意识到)", text)
+    if not lead or not re.match(r"[\u4e00-\u9fff]{1,7}?(?:远没|并不|并非|比|不如|没有|确实|真的)",
+                                text[lead.end():]):
+        return text
+    pos = 0
+    for left, right in zip(units, units[1:]):
+        pos += len(left["text"])
+        if pos >= lead.end():
+            gap = right["start_frame"] - left["end_frame"]
+            if (pos == lead.end() and left.get("track_index") == right.get("track_index")
+                    and round(.17 * fps) <= gap <= round(.5 * fps)
+                    and (left.get("asr_punctuation_strength") or 0) < 1):
+                return text[:pos] + "，" + text[pos:]
+            break
+    return text
+
+
+def _spoken_clause_separator(left: str, right: str) -> str:
+    if left.endswith(("进行讨论", "一起讨论", "商量一下")) and re.match(
+            r"看(?:看)?[我你他她]们?(?:还|能|要|该|到底)", right):
+        return "，"
+    # Indirect speech can open with a subordinate clause of its own.
+    if (re.search(r"(?:告诉|提醒|叮嘱)[我你他她]们?$", left)
+            and right.startswith(("不管", "无论", "即使", "如果", "只要"))):
+        return "，"
+    # Repeat the same description with an intensifier, or restate the same
+    # negative predicate more emphatically. Match the repeated word itself.
+    emphasis = re.match(r"(?:很|非常|特别|更)([\u4e00-\u9fff]{1,4}?的)(?=[\u4e00-\u9fff])", right)
+    if emphasis and left.endswith(emphasis[1]):
+        return "，"
+    negative = re.search(r"(?:无法|不能)([\u4e00-\u9fff]{1,4})$", left)
+    if negative and re.match(r"根本(?:就)?"+negative[1]+r"不(?:了|成|到)", right):
+        return "，"
+    if left.endswith("着来") and re.fullmatch(r"[\u4e00-\u9fff]{1,3}着来", right):
+        return "，"
+
+    # An example may contrast two roles, or two opposing movement directions.
+    if (re.search(r"[他她我你](?:站|坐|靠|躺)在[\u4e00-\u9fff]{1,5}$", left)
+            and re.match(r"[我你他她](?:是|负责|扮演)", right)):
+        return "，"
+    direction = re.search(r"(?:往|向)([上下左右前后])(?:拉|推|移|走|挪|拍)$", left)
+    if direction:
+        opposite = str.maketrans("上下左右前后", "下上右左后前")
+        axis = direction[1]
+        if re.match(r"从" + axis + r"(?:往|向|到)" + axis.translate(opposite), right):
+            return "，"
+    if left in ("你好", "您好", "大家好") and re.match(r"(?:又|还|刚)(?:来|到|见|遇|碰)", right):
+        return "，"
+
+    # A lone subject or a time phrase is abandoned for a new one.
+    if (left in ("他", "她", "我", "你") and right[:1] != left
+            and re.match(r"[我你他她](?:设想|想象|打算|觉得|以为)", right)):
+        return "……"
+    time_subject = re.fullmatch(r"([这那])(时(?:候)?)([我你他她]们?)", left)
+    if time_subject:
+        other = "这" if time_subject[1] == "那" else "那"
+        if right.startswith(other + time_subject[2] + time_subject[3]):
+            return "……"
+
+    # An interrupted description restarts with a location and repeats its verb.
+    restart = re.search(r"(?:已经|开始|快要)([冒发变泛][\u4e00-\u9fff])$", left)
+    if restart and re.match(r"(?:眼睛|眼前|脑海|脑袋|脸上|心里|手上)", right) and restart[1] in right:
+        return "……"
+
+    # Parallel alternatives and a command followed by its negative consequence.
+    parallel = r"([\u4e00-\u9fff]{2,5})就\1"
+    if re.fullmatch(parallel, left) and re.fullmatch(parallel, right):
+        return "，"
+    command = re.search(r"(?:要|应该|可以|得)([\u4e00-\u9fff]{1,5})的$", left)
+    if command and right.startswith("不" + command[1]) and len(right) > len(command[1]) + 1:
+        return "，"
+
+    if re.search(r"是[\u4e00-\u9fff]{1,8}的$", left) and right.startswith("就是"):
+        return "，"
+    partner = re.search(r"(?:跟|和|向|对)([他她你我]们?)[\u4e00-\u9fff]{2,4}$", left)
+    if partner and re.match(partner[1] + r"(?:就|却|也|才)", right):
+        return "，"
+
+    # A completed predicate can become the topic of the next clause.
+    echo = re.match(r"([\u4e00-\u9fff]{2,5})[他她你我](?:们)?(?:就|也|才|便)", right)
+    if echo and left.endswith(echo[1]):
+        return "，"
+    return ""
+
+
+def _restore_spoken_clause_punctuation(
+    text: str, units: list[dict[str, Any]], fps: float, next_unit: dict[str, Any] | None = None,
+) -> str:
+    if text != "".join(unit["text"] for unit in units) or not re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]+", text):
+        return text
+    # A sentence-final connector, a long silence, then only a filler: the
+    # promised continuation never starts. Leave the filler at its own onset.
+    last = units[-1]
+    unfinished = (
+        text.endswith("然后") and (last.get("asr_punctuation_strength") or 0) >= 1 and next_unit
+        and last.get("track_index") == next_unit.get("track_index")
+        and next_unit["start_frame"] - last["end_frame"] >= round(.8 * fps)
+        and next_unit["text"] in ("嗯", "呃") and (next_unit.get("asr_punctuation_strength") or 0) >= 1
+    )
+    interrupted = (
+        text.endswith(("就已经", "都已经")) and (last.get("asr_punctuation_strength") or 0) >= 1
+        and next_unit and last.get("track_index") and next_unit.get("track_index")
+        and last["track_index"] != next_unit["track_index"] and next_unit["text"] in ("嗯", "呃")
+        and 0 <= next_unit["start_frame"] - last["end_frame"] <= round(.55 * fps)
+    )
+    parts = []
+    offset = 0
+    for prev, following in zip(units, units[1:]):
+        parts.append(prev["text"])
+        offset += len(prev["text"])
+        gap = following["start_frame"] - prev["end_frame"]
+        if not prev.get("track_index") or prev.get("track_index") != following.get("track_index") or not 0 <= gap <= round(.55 * fps):
+            continue
+        left, right = text[:offset], text[offset:]
+        if (gap > 0 and re.search(r"(?:几|数)十(?:多)?秒(?:钟)?$", left)
+                and re.fullmatch(r"(?:半|一两?|两三?)分钟(?:左右|上下)?", right)):
+            # These are two estimates, distinct from a compound like 一分三十秒.
+            parts.append(" ")
+        elif (.5 <= float(prev.get("asr_punctuation_strength") or 0) < 1 and gap <= round(.5 * fps)):
+            separator = "，" if unfinished and right == "然后" else _spoken_clause_separator(left, right)
+            parts.append(separator)
+        elif round(.3 * fps) <= gap:
+            if ((re.fullmatch(r"[你我他她]们?的", left) and right.startswith(left)
+                 and re.match(r"(?:意思|想法|意见|看法|问题)", right[len(left):]))
+                    or (left.endswith("甚至都") and re.match(r"一[\u4e00-\u9fff]{1,3}都.", right))):
+                parts.append("……")
+    parts.append(last["text"])
+    if unfinished or interrupted:
+        parts.append("……")
+    return "".join(parts)
+
+
 def restore_display_spacing(
     rows: list[dict[str, Any]],
     units: list[dict[str, Any]],
+    editorial_fps: float | None = None,
 ) -> list[dict[str, Any]]:
     ordered_units = sorted(
         [dict(unit) for unit in units or []],
@@ -3052,6 +4264,11 @@ def restore_display_spacing(
             previous_char = unit_text[-1:] if unit_text else previous_char
         if row_units:
             row["text"] = "".join(pieces)
+            if editorial_fps:
+                row["text"] = _punctuate_leadin_pause(row["text"], row_units, editorial_fps)
+                row["text"] = _punctuate_spoken_actions(row["text"], row_units, editorial_fps)
+                next_unit = ordered_units[cursor] if cursor < len(ordered_units) else None
+                row["text"] = _restore_spoken_clause_punctuation(row["text"], row_units, editorial_fps, next_unit)
         output.append(row)
     return output
 

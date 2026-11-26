@@ -6,20 +6,28 @@ import math
 import re
 import wave
 from array import array
+from bisect import bisect_left
+from itertools import accumulate
 from pathlib import Path
 from typing import Any
 
-try:
-    import subfix_generate_v4 as v4
-except ModuleNotFoundError as exc:
-    if exc.name != "subfix_generate_v4":
-        raise
-    _v4_path = Path(__file__).resolve().with_name("subfix_generate_v4.py")
-    _v4_spec = importlib.util.spec_from_file_location("subfix_generate_v4", _v4_path)
-    if _v4_spec is None or _v4_spec.loader is None:
-        raise RuntimeError("v4 生成模块无法加载")
-    v4 = importlib.util.module_from_spec(_v4_spec)
-    _v4_spec.loader.exec_module(v4)
+def _sibling_module(name):
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+    # Resolve can load this file by path without putting its directory on sys.path.
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + ".py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"生成模块无法加载: {name}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+v4 = _sibling_module("subfix_generate_v4")
+textnorm = _sibling_module("subfix_generate_textnorm")
 
 
 PROFILE_SCHEMA = "subfix_segmentation_profile_v4"
@@ -663,6 +671,515 @@ def preserve_refined_row_order(
             left["timing_decision"] = right["timing_decision"] = "original_handoff_preserved"
             conflicts += int(had_overlap)
     return output, conflicts
+
+
+def _affirmation_leads_clause(following: str, previous: str) -> bool:
+    if previous.endswith(("对吧", "是吧", "对不对", "是不是", "呢", "吗")):
+        return False
+    # A repeated statement, an explanation or an instruction can continue
+    # the affirmation. A question or a fresh reaction needs its own turn.
+    if len(following) < 3 or re.search(r"是不是|[吗呢]$", following):
+        return False
+    if following.startswith("把") and re.search(r"谁|哪(?:一|个|些|里|儿|位|种)", following):
+        return False
+    return following == previous or bool(re.match(r"我(?:觉得|认为)|[他她它](?:一定|确实)|把", following))
+
+
+def _paired_descriptions(text: str, following: str) -> bool:
+    return bool(re.fullmatch(r"(.{2})\1", text) and re.fullmatch(r"各.各.|形形色色", following))
+
+
+def _brief_continuation(text: str, following: str, previous: str, punct: float) -> bool:
+    if text == "对":
+        # "还没有 / 对 / 还没出现" confirms the preceding answer.
+        # A standalone response to another question should remain separate.
+        negative = re.match(r"还没|并没|并不|不是|没有", following)
+        return bool(negative and negative[0] in previous[-6:]) or (
+            0 < punct < 1 and _affirmation_leads_clause(following, previous)
+        )
+    if punct >= 1 or len(following) < 3:
+        return False
+    if 0 < punct < 1:
+        # A vocative opens the following remark. A repeated pronoun resumes
+        # an interrupted subject, e.g. “就是他，他…” .
+        if re.fullmatch(r"(?:就是|那|所以)?(?:各位|大家|朋友们|同学们)", text):
+            return True
+        if re.fullmatch(r"[啊呃嗯]?(?:就是|这个|那个)[我你他她它]", text) and following.startswith(text[-1]):
+            return True
+        if _paired_descriptions(text, following):
+            return True
+    if text in {"嗯", "啊", "呃"} or re.fullmatch(r"(?:而且|然后|不过|所以)呢", text):
+        return True
+    return bool(re.fullmatch(r"[那这]一(?:阵|次|天|年|段(?:时间|日子))", text)
+                and following in {"其实是", "其实就是", "就是", "其实也就是"})
+
+
+def _same_brief_clause(left, right, previous, ordered, cut, fps, corroborated) -> bool:
+    before, after = ordered[cut - 1:cut + 1]
+    text, following = left["text"], right["text"]
+    right_track = right["speaker_track_index"]
+    if (before.get("track_index") != left["speaker_track_index"] or after.get("track_index") != right_track
+            or not 0 <= after["start_frame"] - before["end_frame"] <= round(.3 * fps)
+            or not text.casefold().endswith(before["text"].casefold())
+            or not following.casefold().startswith(after["text"].casefold())):
+        return False
+    if left["speaker_track_index"] == right_track:
+        return _brief_continuation(text, following, previous, before.get("asr_punctuation_strength") or 0)
+    # A cross-mic “对” needs an uninterrupted recording on the destination
+    # mic through at least three following units; a shared boundary word
+    # alone cannot distinguish an instruction from another person's reply.
+    span = ordered[cut - 1:cut + 3]
+    return (text == "对" and _affirmation_leads_clause(following, previous) and len(span) == 4
+            and following.startswith("".join(u["text"] for u in span[1:]))
+            and corroborated(span, 1, required_track=right_track,
+                             witness_gap_limit=round(.2 * fps), seam_punctuation_limit=.55))
+
+
+def _spoken_leadin_edit(left, right, ordered, cut, cuts, fps, max_chars):
+    """Return left text, remaining right text (if any), and an optional aligned handoff."""
+    text, following = left["text"], right["text"]
+    track = left.get("speaker_track_index")
+    if (not track or track != right.get("speaker_track_index") or not 0 < cut < len(ordered)
+            or "\n" in text or "\n" in following):
+        return None
+    before, after = ordered[cut - 1:cut + 1]
+    gap = after["start_frame"] - before["end_frame"]
+    if (not 0 <= gap <= round(.55 * fps)
+            or before.get("track_index") != track or after.get("track_index") != track
+            or before["start_frame"] < left.get("original_start_frame", left["start_frame"])
+            or after["start_frame"] != right.get("original_start_frame", right["start_frame"])
+            or not text.endswith(before["text"]) or not following.startswith(after["text"])
+            or bisect_left(cuts, before["end_frame"]) != bisect_left(cuts, after["start_frame"] + 1)):
+        return None
+    punct = before.get("asr_punctuation_strength") or 0
+    # A stopped 把-construction followed by a negative predicate has no object.
+    # With an explicit subject, the restarted predicate can follow that
+    # subject directly. Drop only a confirmed abandoned 会把, not its subject.
+    if (punct >= 1 and re.search(r"(?:会|想|要|打算|准备)把$", text)
+            and re.match(r"(?:都|也|其实)(?:不要|不用|不想|不需要)[^的，。！？…]{1,8}(?:就|直接|了$)", following)
+            and len(text) + 2 <= max_chars):
+        subject = re.fullmatch(r"((?:然后|接着|后来)?[你我他她]们?)会把", text)
+        if subject and cut >= 2:
+            modal = ordered[cut - 2]
+            if ((modal["text"], before["text"]) == ("会", "把") and modal.get("track_index") == track
+                    and left["start_frame"] <= modal["start_frame"] < modal["end_frame"] <= before["start_frame"]
+                    and all(not u.get("alignment_repaired") and u.get("candidate_kind") != "local_retry"
+                            for u in (modal, before, after))):
+                return subject[1], following, None
+        return text + "……", following, None
+    if (punct >= 1 or right["end_frame"] - left["start_frame"] > round(5 * fps)
+            or left["end_frame"] - left["start_frame"] > round(1.5 * fps)):
+        return None
+    if (not punct and gap <= round(.12 * fps)
+            and re.fullmatch(r"(?:就)?(?:那时候|那时|当时|原来|以前|现在)?[你我他她]们(?:俩|两个|两个人)", text)
+            and re.match(r"(?:其实|当时|原来)?(?:都|也都)", following)):
+        joined = text + following
+    elif (0 < punct < 1 and round(.2 * fps) <= gap
+            and re.fullmatch(r"(?:但是|不过|可是|但)就是", text)
+            and re.fullmatch(r"[嗯呃][^，。！？…]+的话", following)
+            and after["text"] in ("嗯", "呃") and 0 < (after.get("asr_punctuation_strength") or 0) < 1):
+        # Keep the hesitation visible through its pause, then bring in the
+        # condition with the spoken filler instead of revealing it ahead of time.
+        onset = after["start_frame"]
+        # A short hesitation belongs to the following topic. If it lasts
+        # long enough to read on its own, leave a clause boundary for display.
+        next_word = ordered[cut + 1] if cut + 1 < len(ordered) else None
+        short_filler = (next_word and next_word.get("track_index") == track
+                        and following[1:].startswith(next_word["text"])
+                        and 0 < next_word["start_frame"] - onset < math.ceil(.5 * fps))
+        remainder = following[0] + (" " if short_filler else "，") + following[1:]
+        if (max(len(text) + 2, len(remainder)) <= max_chars
+                and min(onset - left["start_frame"], right["end_frame"] - onset) >= round(.5 * fps)):
+            return text + "……", remainder, onset
+        return None
+    else:
+        return None
+    return (joined, None, None) if len(joined) <= max_chars else None
+
+
+def _brief_borrowed_stop(left, right, ordered, cut, fps, corroborated, shots):
+    # A mic switch can insert a single other-mic particle, including its
+    # full stop, inside a continuous utterance. Preserve the selected words
+    # while keeping the two fragments readable as one caption.
+    track = left["speaker_track_index"]
+    onset = left.get("original_start_frame", left["start_frame"])
+    end = right.get("original_end_frame", right["end_frame"])
+    if (track != right["speaker_track_index"] or cut < 3 or cut + 2 > len(ordered)
+            or right["end_frame"] - right["start_frame"] >= round(.5 * fps)
+            or bisect_left(shots, onset + 1) != bisect_left(shots, end)):
+        return False
+    a, b, particle, c, d = ordered[cut - 3:cut + 2]
+    if (particle.get("speaker_decision") != "smoothed_short_flip"
+            or particle["text"] not in {"了", "啊", "呢", "吧", "哦"}
+            or (particle.get("asr_punctuation_strength") or 0) < 1
+            or particle["end_frame"] - particle["start_frame"] > max(1, round(.05 * fps))
+            or a["start_frame"] < onset or d["end_frame"] > end
+            or not all(u.get("track_index") == track for u in (a, b, particle, c, d))
+            or not left["text"].endswith(a["text"] + b["text"] + particle["text"])
+            or not right["text"].startswith(c["text"] + d["text"])):
+        return False
+    return corroborated([a, b, c, d], 2, required_track=track, witness_gap_limit=round(.15 * fps))
+
+
+def _hold_short_command(reply, command, previous, next_row, last_word, shot, next_shot,
+                        starts, spoken_ends, fps):
+    # A command starts on the next shot. A few frames of the already
+    # displayed final syllable can give the reply a half-second without
+    # advancing it by more than a sixth of a second from its real onset.
+    new_start = reply["start_frame"]
+    if (previous and last_word and previous["end_frame"] == reply["start_frame"]
+            and last_word.get("track_index") == previous.get("speaker_track_index")
+            and previous["text"].endswith(last_word["text"])):
+        onset = reply.get("original_start_frame", reply["start_frame"])
+        min_start = max(onset - round(fps / 6), reply["start_frame"] - round(.1 * fps),
+                        previous["start_frame"] + round(.8 * fps),
+                        last_word["start_frame"] + max(1, round(.06 * fps)))
+        if last_word["end_frame"] <= onset:
+            new_start = min(new_start, max(min_start, shot - round(.5 * fps)))
+    if shot - new_start < round(.5 * fps):
+        return False
+    if new_start < reply["start_frame"]:
+        previous["end_frame"] = reply["start_frame"] = new_start
+        previous["timing_decision"] = "picture_cut_handoff"
+    if next_row:
+        end = command["end_frame"]
+        edge = bisect_left(starts, end)
+        limit = min(next_row["start_frame"], shot + round(.8 * fps))
+        if edge < len(starts):
+            limit = min(limit, starts[edge])
+        if next_shot is not None:
+            limit = min(limit, next_shot)
+        if edge and spoken_ends[edge - 1] <= end:
+            command["end_frame"] = max(end, limit)
+    return True
+
+
+def _settle_flash_transitions(rows, units, starts, spoken_ends, fps, max_chars, picture_cuts):
+    # At normal speed a subtitle change a few frames from a picture cut
+    # reads as a second edit. Only reconsider replies still short after the
+    # regular pause/reading-time pass.
+    cuts = sorted(set(picture_cuts or ()))
+    output = []
+    floor = round(.5 * fps)
+    tolerance = round(.15 * fps)
+    for index, right in enumerate(rows):
+        left = output[-1] if output else None
+        output.append(right)
+        if left is None:
+            continue
+        seam = right["start_frame"]
+        gap = seam - left["end_frame"]
+        duration = left["end_frame"] - left["start_frame"]
+        if (not 0 <= gap <= tolerance or (gap and duration > floor)
+                or (not gap and duration >= .45 * fps)):
+            continue
+        onset = left.get("original_start_frame", left["start_frame"])
+        next_onset = right.get("original_start_frame", seam)
+        boundary = bisect_left(starts, next_onset)
+        first = bisect_left(starts, onset)
+        spoken = units[first:boundary]
+        if (not spoken or boundary >= len(units) or starts[first] != onset
+                or starts[boundary] != next_onset or not left.get("speaker_track_index")
+                or not right.get("speaker_track_index") or "".join(u["text"] for u in spoken) != left["text"]
+                or not all(u.get("track_index") == left.get("speaker_track_index") for u in spoken)
+                or (spoken[-1].get("asr_punctuation_strength") or 0) < 1
+                or units[boundary].get("track_index") != right.get("speaker_track_index")
+                or not right["text"].casefold().startswith(units[boundary]["text"].casefold())):
+            continue
+
+        reaction = re.fullmatch(r"[嗯啊哦噢呃对好是]{1,2}", left["text"])
+        if gap:
+            # After padding a short reply, a few empty frames before the next
+            # onset can blink. Bridge only silent frames on the same shot.
+            if (reaction and next_onset == seam and spoken_ends[boundary - 1] <= left["end_frame"]
+                    and bisect_left(cuts, left["end_frame"]) == bisect_left(cuts, seam)):
+                left["end_frame"] = seam
+                left["timing_decision"] = "brief_display_handoff"
+            continue
+
+        # Quick confirmations can be read together without attributing the
+        # second turn to the first. Keep both lines, and keep a new question
+        # in its own cue. Never span a picture edit between them.
+        cut_index = bisect_left(cuts, seam - tolerance)
+        shot = cuts[cut_index] if cut_index < len(cuts) else None
+        if shot is not None and (shot > seam + tolerance or abs(shot - next_onset) > tolerance
+                                 or (cut_index + 1 < len(cuts) and cuts[cut_index + 1] <= seam + tolerance)):
+            shot = None
+        same_mic = left["speaker_track_index"] == right["speaker_track_index"]
+        repeated = (left["text"] in {"就是", "是啊", "是的", "对啊", "对的"}
+                    and re.fullmatch(r"([对是好嗯])\1+", right["text"])
+                    and right["end_frame"] - seam <= round(.8 * fps)
+                    and bisect_left(cuts, left["start_frame"] + 1) == bisect_left(cuts, right["end_frame"]))
+        if not repeated and (not reaction or shot is None or shot <= left["start_frame"]):
+            continue
+        # A short reaction straddling an edit can share the new shot with
+        # the following sentence, on separate lines. Both onsets must lie
+        # within a few frames of the edit.
+        previous = output[-3] if len(output) >= 3 else None
+        straddles = (reaction and shot is not None and shot < seam - round(.07 * fps)
+                     and abs(shot - onset) <= round(.07 * fps) and previous
+                     and previous["end_frame"] == left["start_frame"]
+                     and re.match(r"[啊哦噢嗯呃]", right["text"])
+                     and not re.search(r"[吗呢？?]$|是不是|对不对|怎么|为什么", right["text"])
+                     and right["end_frame"] - shot <= round(3 * fps))
+        if repeated or straddles:
+            if not same_mic or len(left["text"]) + len(right["text"]) > max_chars:
+                continue
+            display_start = shot if straddles else left["start_frame"]
+            if next_onset - display_start > tolerance:
+                # Showing both lines here would give away the answer. Allow a
+                # small handoff delay only while the first reply syllable is
+                # still audible and both captions have enough reading time.
+                handoff = max(next_onset, left["start_frame"] + floor)
+                if (handoff - next_onset <= round(.08 * fps)
+                        and handoff < units[boundary]["end_frame"]
+                        and right["end_frame"] - handoff >= floor):
+                    left["end_frame"] = right["start_frame"] = handoff
+                    left["timing_decision"] = right["timing_decision"] = "spoken_reply_handoff"
+                continue
+            if straddles:
+                left["start_frame"] = previous["end_frame"] = shot
+                previous["timing_decision"] = "picture_cut_handoff"
+            left.update(text=left["text"] + "\n" + right["text"], end_frame=right["end_frame"],
+                        timing_decision="picture_cut_handoff" if straddles else "grouped_turns",
+                        segmentation_decision="brief_dialogue_lines")
+            if "original_end_frame" in right:
+                left["original_end_frame"] = right["original_end_frame"]
+            output.pop()
+        elif shot >= seam or seam - shot <= round(.07 * fps):
+            # Keep a new sentence readable if its onset follows the edit;
+            # an earlier edit is only useful for an immediately adjacent command.
+            # For an initialism ASR may time each letter separately. Its
+            # first letter is not a complete spoken Chinese word.
+            first_gone = (shot > seam and shot >= units[boundary]["end_frame"]
+                          and not re.match(r"[a-zA-Z]{2}", right["text"]))
+            if (first_gone or right["end_frame"] - shot < floor
+                    or (shot < seam and right["end_frame"] - seam > round(.7 * fps))):
+                continue
+            if shot < seam:
+                next_cut = cut_index + 1
+                held = _hold_short_command(
+                    left, right, previous, rows[index + 1] if index + 1 < len(rows) else None,
+                    units[first - 1] if first else None, shot,
+                    cuts[next_cut] if next_cut < len(cuts) else None, starts, spoken_ends, fps)
+                if not held:
+                    continue
+            left["end_frame"] = right["start_frame"] = shot
+            left["timing_decision"] = right["timing_decision"] = "picture_cut_handoff"
+    return output
+
+
+def _audible_restart(prefix, suffix, gap, punct, fps):
+    if not 0 <= gap <= round(.55 * fps):
+        return False
+    # An unfinished 已 followed by a new subject, or a hanging 都 whose
+    # predicate restarts after a pause. Preserve the speaker's first attempt.
+    if prefix.endswith("已") and punct >= .5 and v4._resumed_clause(prefix, suffix):
+        return True
+    if (prefix.endswith("甚至都") and gap >= round(.3 * fps)
+            and re.match(r"一[\u4e00-\u9fff]{1,3}都.", suffix)):
+        return True
+    # A comparison with one's routine gives way to a fresh emphatic clause.
+    subject = re.search(r"(?:像|比如)([我你他她]们?)(?:平时|平常|平日|以前)$", prefix)
+    return bool(subject and re.match(subject[1] + r"(?:根本|压根|从来)(?:就)?[不没]", suffix))
+
+
+def _split_paused_clauses(rows, units, starts, cuts, fps, max_chars):
+    """Reveal a held answer on its first syllable and carry an unfinished subject through silence."""
+    floor = max(1, math.ceil(fps / 2))
+    output = []
+    for i, row in enumerate(rows):
+        output.append(row)
+        start, end, text = row["start_frame"], row["end_frame"], row["text"]
+        first, stop = bisect_left(starts, start), bisect_left(starts, end)
+        spoken = units[first:stop]
+        if ("\n" in text or len(spoken) < 2 or end - start < floor
+                or any(u.get("alignment_repaired") or u.get("candidate_kind") == "local_retry"
+                       for u in spoken)):
+            continue
+
+        prefix = ""
+        for j, (before, after) in enumerate(zip(spoken, spoken[1:]), 1):
+            prefix += before["text"]
+            if not text.startswith(prefix):
+                break
+            suffix = text[len(prefix):]
+            onset = after["start_frame"]
+            gap = onset - before["end_frame"]
+            punct = before.get("asr_punctuation_strength") or 0
+            restart_suffix = suffix.lstrip(" …")
+            restart = (before.get("track_index") == after.get("track_index")
+                       and _audible_restart(prefix, restart_suffix, gap, punct, fps))
+            if restart:
+                suffix = restart_suffix
+            if not suffix.startswith(after["text"]) or onset - start < floor:
+                continue
+            hold_to = end
+            left, right = prefix, suffix
+            long_stop = gap >= round(.6 * fps) and punct >= 1
+            contrast = long_stop and prefix in {"但是", "可是", "不过", "然而"}
+            duration = long_stop and re.match(v4._DURATION, suffix) and v4._hesitant_complement(prefix, suffix)
+            valuation = (gap >= round(.33 * fps) and punct >= .5 and re.match(
+                r"(?:就是|也就|只要|才|是)[零一二三四五六七八九十百千万两点\d.]+(?:块|元|角|毛|美元|欧元)", suffix))
+            if contrast:
+                left += "……"
+            elif (re.search(r"(?:的时候|那一年|那段时间)$", prefix)
+                    and re.fullmatch(r"(?:就)?是[我你他她](?:们)?", suffix) and i + 1 < len(rows)):
+                # The predicate follows after a silence. Keep its subject on
+                # screen during that silence, without exposing the predicate early.
+                next_row = rows[i + 1]
+                hold_to = next_row["start_frame"]
+                track = after.get("track_index")
+                if (not round(.6 * fps) <= hold_to - end <= round(1.8 * fps)
+                        or not re.match(r"最.{1,8}的(?:时候|日子|时光|时期|阶段)", next_row["text"])
+                        or gap < 0
+                        or not track or next_row.get("speaker_track_index") != track
+                        or stop >= len(units) or starts[stop] != hold_to
+                        or units[stop].get("track_index") != track
+                        or not next_row["text"].startswith(units[stop]["text"])
+                        or bisect_left(cuts, end) != bisect_left(cuts, hold_to)):
+                    continue
+                right += "……"
+            elif not (duration or valuation or restart):
+                continue
+            left_track, right_track = before.get("track_index"), after.get("track_index")
+            spoken_suffix = "".join(u["text"] for u in spoken[j:])
+            if (hold_to - onset < floor or suffix not in (spoken_suffix, textnorm.normalize_subtitle_text(spoken_suffix))
+                    or not left_track or not right_track or right_track != row.get("speaker_track_index")
+                    or max(len(left), len(right)) > max_chars
+                    or any(u.get("track_index") != left_track for u in spoken[:j])
+                    or any(u.get("track_index") != right_track for u in spoken[j:])):
+                continue
+            # A clipped word such as 已 cannot stand as the completed clause.
+            # Keep the false start visible while its speaker supplies the restart.
+            if restart and prefix.endswith("已"):
+                right = prefix + " " + suffix
+                if len(right) > max_chars:
+                    continue
+            output[-1:] = [
+                {**row, "text": left, "end_frame": onset, "original_end_frame": before["end_frame"],
+                 "speaker_track_index": left_track, "segmentation_decision": "paused_clause_handoff"},
+                {**row, "text": right, "start_frame": onset, "original_start_frame": onset,
+                 "end_frame": hold_to, "segmentation_decision": "paused_clause_handoff"},
+            ]
+            break
+    return output
+
+
+def stabilize_brief_cues(
+    rows: list[dict[str, Any]], units: list[dict[str, Any]], fps: float, max_chars: int,
+    candidates: list[dict[str, Any]] | None = None, *, timeline_end_frame: int | None = None,
+    picture_cuts: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep brief replies readable and attach short lead-ins to the same voice."""
+    output = []
+    ordered = sorted(units, key=lambda u: (u["start_frame"], u["end_frame"]))
+    starts = [u["start_frame"] for u in ordered]
+    corroborated = v4._aligned_phrase_witnesses(candidates or [], fps)
+    shots = sorted(set(picture_cuts or ()))
+    for original in rows:
+        right = dict(original)
+        if not output:
+            output.append(right)
+            continue
+        left = output[-1]
+        text, following = left["text"], right["text"]
+        duration = left["end_frame"] - left["start_frame"]
+        gap = right["start_frame"] - left["end_frame"]
+        track = left.get("speaker_track_index")
+        cut = bisect_left(starts, right.get("original_start_frame", right["start_frame"]))
+        right_track = right.get("speaker_track_index")
+        edit = _spoken_leadin_edit(left, right, ordered, cut, shots, fps, max_chars)
+        joined = None
+        if edit:
+            edited_text, remainder, handoff = edit
+            if remainder is not None:
+                left["text"], right["text"] = edited_text, remainder
+                if handoff is not None:
+                    left["end_frame"] = right["start_frame"] = handoff
+                    left["timing_decision"] = right["timing_decision"] = "spoken_leadin_handoff"
+                output.append(right)
+                continue
+            joined = edited_text
+        paired_modifiers = (_paired_descriptions(text, following) and duration <= round(fps)
+                            and right["end_frame"] - right["start_frame"] <= round(.5 * fps))
+        if (joined is None and track and right_track and 0 <= gap <= round(.2 * fps)
+                and (duration <= round(.7 * fps) or paired_modifiers) and len(text + following) <= max_chars
+                and right["end_frame"] - left["start_frame"] <= round(6 * fps)
+                and 0 < cut < len(ordered)):
+            nearby = len(output) >= 2 and left["start_frame"] - output[-2]["end_frame"] <= round(.3 * fps)
+            previous = output[-2]["text"] if nearby else ""
+            separator = ""
+            if (len(text + following) < max_chars
+                    and _brief_borrowed_stop(left, right, ordered, cut, fps, corroborated, shots)):
+                separator = "，"
+            if separator or _same_brief_clause(left, right, previous, ordered, cut, fps, corroborated):
+                joined = text + separator + following
+        if joined is not None:
+            left["speaker_track_index"] = right_track
+            left["text"] = joined
+            left["end_frame"] = right["end_frame"]
+            if "original_end_frame" in right:
+                left["original_end_frame"] = right["original_end_frame"]
+            left["segmentation_decision"] = "brief_clause_join"
+            continue
+        output.append(right)
+
+    # Fit brief captions after joins, when all neighboring display limits are known.
+    targets = [round(fps * min(.8, max(.5, len(v4.normalize_text(r["text"])) / 10)))
+               for r in output]
+    spoken_ends = list(accumulate((u["end_frame"] for u in ordered), max))
+    for i, row in enumerate(output):
+        start, end = row["start_frame"], row["end_frame"]
+        missing = targets[i] - (end - start)
+        if missing <= 0:
+            continue
+        limit = output[i + 1]["start_frame"] if i + 1 < len(output) else timeline_end_frame
+        if limit is not None:
+            # Leave the next onset intact, even for words absent from the captions.
+            cut = bisect_left(starts, end)
+            if cut < len(starts):
+                limit = min(limit, starts[cut])
+            if cut and spoken_ends[cut - 1] <= end:
+                extra = min(missing, max(0, limit - end))
+                if extra:
+                    row["end_frame"] += extra
+                    row["timing_decision"] = "brief_display_extension"
+                    missing -= extra
+        if not missing or not i:
+            continue
+
+        # A preceding caption sometimes displays past its last syllable. Use
+        # at most a sixth of a second of confirmed air before this onset.
+        onset = row.get("original_start_frame", start)
+        cut = bisect_left(starts, onset)
+        if not 0 < cut < len(ordered):
+            continue
+        previous = output[i - 1]
+        last, first = ordered[cut - 1], ordered[cut]
+        if (first["start_frame"] != onset or not first.get("track_index")
+                or first["track_index"] != row.get("speaker_track_index")
+                or last.get("track_index") != previous.get("speaker_track_index")
+                or last["start_frame"] < previous.get("original_start_frame", previous["start_frame"])
+                or last["end_frame"] > previous["end_frame"]
+                or not row["text"].casefold().startswith(first["text"].casefold())
+                or not previous["text"].casefold().endswith(last["text"].casefold())):
+            continue
+        # Preserve both aligned speech and the preceding caption's own reading time.
+        earliest = max(spoken_ends[cut - 1], onset - round(fps / 6),
+                       previous["start_frame"] + targets[i - 1])
+        if (previous.get("timing_decision") == "audio_refined"
+                and previous["end_frame"] > previous.get("original_end_frame", previous["end_frame"])):
+            earliest = max(earliest, previous["end_frame"])
+        new_start = max(earliest, start - missing)
+        if new_start < start:
+            if previous["end_frame"] > new_start:
+                previous["end_frame"] = new_start
+                previous["timing_decision"] = "brief_display_handoff"
+            row["start_frame"] = new_start
+            row["timing_decision"] = "brief_display_extension"
+    settled = _settle_flash_transitions(output, ordered, starts, spoken_ends, fps, max_chars, shots)
+    return _split_paused_clauses(settled, ordered, starts, shots, fps, max_chars)
 
 
 def shadow_refine_subtitle_boundaries(
