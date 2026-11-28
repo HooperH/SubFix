@@ -24,12 +24,13 @@ v2.0.0 - 2026-03-18
 -- 顶部加载 utf8 库（达芬奇内置，安全容错）
 pcall(require, "utf8")
 
-SUBFIX_VERSION = "3.4.2"
+SUBFIX_VERSION = "3.4.4"
 
 -- 全程启动计时基准（用全局，避免主 chunk local 数量再次逼近 200 上限）
-_subfix_script_started_at = os.clock()
+_subfix_clock = bmd.gettime or os.clock
+_subfix_script_started_at = _subfix_clock()
 function startup_elapsed_ms()
-    return math.floor(((os.clock() - (_subfix_script_started_at or os.clock())) * 1000) + 0.5)
+    return math.floor((_subfix_clock() - _subfix_script_started_at) * 1000 + 0.5)
 end
 
 -- ========== UI 初始化 ==========
@@ -41,7 +42,7 @@ print(string.format("[Hooper AI 2.0] [STARTUP] Lua 主 chunk 起步: +%d ms", st
 -- 使用全局命名空间以避开主 chunk 的 Lua 5.1 local 槽位上限。
 SUBFIX_WINDOW_GEOMETRY = SUBFIX_WINDOW_GEOMETRY or {}
 
-function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
+function SUBFIX_WINDOW_GEOMETRY.start_screen_probe()
     if not (io and io.popen) then return nil end
 
     -- JXA 的返回值写入 stdout；console.log 写入 stderr，会被下面的重定向丢弃。
@@ -87,7 +88,15 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     return [visible.x, visible.y, visible.width, visible.height].join(",");
 })();]]
     local escaped = jxa:gsub("'", "'\\\"'\\\"'")
-    local pipe = io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
+    return io.popen("/usr/bin/osascript -l JavaScript -e '" .. escaped .. "' 2>/dev/null", "r")
+end
+
+function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
+    local pipe = SUBFIX_WINDOW_GEOMETRY.start_screen_probe()
+    return SUBFIX_WINDOW_GEOMETRY.read_screen_probe(pipe)
+end
+
+function SUBFIX_WINDOW_GEOMETRY.read_screen_probe(pipe)
     if not pipe then return nil end
     local output = pipe:read("*a") or ""
     pipe:close()
@@ -97,14 +106,13 @@ function SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     return {x = x, y = y, width = width, height = height}
 end
 
-function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
+function SUBFIX_WINDOW_GEOMETRY.center_in_bounds(fallback_geometry, screen)
     local fallback_x = tonumber(fallback_geometry and fallback_geometry[1])
     local fallback_y = tonumber(fallback_geometry and fallback_geometry[2])
     local width = tonumber(fallback_geometry and fallback_geometry[3])
     local height = tonumber(fallback_geometry and fallback_geometry[4])
     if not fallback_x or not fallback_y or not width or not height then return fallback_geometry end
 
-    local screen = SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds()
     if not screen then return fallback_geometry end
 
     local x = screen.x
@@ -112,6 +120,22 @@ function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
     if width <= screen.width then x = math.floor(screen.x + (screen.width - width) / 2) end
     if height <= screen.height then y = math.floor(screen.y + (screen.height - height) / 2) end
     return {x, y, width, height}
+end
+
+function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)
+    return SUBFIX_WINDOW_GEOMETRY.center_in_bounds(fallback_geometry, SUBFIX_WINDOW_GEOMETRY.resolve_screen_bounds())
+end
+
+function SUBFIX_WINDOW_GEOMETRY.finish_mini_placement(window, initial, screen)
+    if not window or not initial or not screen then return end
+    local geometry = window.Geometry
+    for i = 1, 4 do
+        if geometry[i] ~= initial[i] then return end -- respect a drag or resize
+    end
+    local target = SUBFIX_WINDOW_GEOMETRY.center_in_bounds(geometry, screen)
+    if math.abs(target[1] - geometry[1]) > 1 or math.abs(target[2] - geometry[2]) > 1 then
+        window.Geometry = target
+    end
 end
 
 -- ========== 全局状态 ==========
@@ -5674,14 +5698,26 @@ render_rows_to_window = function(target_window, rows_override)
     end
     apply_preview_tree_layout(tree)
 
-    local function populate_tree()
+    local function populate_tree(use_bulk)
+        count, next_map, next_row_id_map, selected_node = 0, {}, {}, nil
         pcall(function() tree:Clear() end)
-
+        local new_item = tree.NewItem
+        local add_items = use_bulk and tree.AddTopLevelItems
+        local batch = {}
+        local set_text
         for _, row in ipairs(rows) do
-            local ok_item, item = pcall(function() return tree:NewItem() end)
+            local ok_item, item = pcall(new_item, tree)
+            if add_items then assert(ok_item and item, "无法创建字幕行") end
             if ok_item and item then
-                set_preview_tree_node_display_text(item, row.display_text or "")
-                if pcall(function() tree:AddTopLevelItem(item) end) then
+                if add_items then
+                    set_text = set_text or item.SetText
+                    set_text(item, 0, "  ✎")
+                    set_text(item, 1, row.display_text or "")
+                    batch[#batch + 1] = item
+                else
+                    set_preview_tree_node_display_text(item, row.display_text or "")
+                end
+                if add_items or pcall(function() tree:AddTopLevelItem(item) end) then
                     next_map[item] = row
                     local row_id = trim_text(row.id)
                     if row_id ~= "" then
@@ -5694,20 +5730,23 @@ render_rows_to_window = function(target_window, rows_override)
                 end
             end
         end
-
+        if add_items and #batch > 0 then
+            add_items(tree, batch)
+            assert(tree:TopLevelItemCount() == #batch and batch[#batch].Text[1] == (rows[#rows].display_text or ""), "未完整加载字幕列表")
+        end
         if selected_node then
             pcall(function() tree:SetSelectedNode(selected_node) end)
         end
     end
 
-    local ok_render, render_err = with_tree_updates_suspended(tree, window, populate_tree)
+    local ok_render, render_err = with_tree_updates_suspended(tree, window, function() populate_tree(true) end)
     if not ok_render then
         local warning_msg = "[Warning] 全量刷新字幕树失败，已回退普通重建: " .. tostring(render_err)
         print(warning_msg)
         if type(LogMsg) == "function" then
             pcall(function() LogMsg(warning_msg) end)
         end
-        populate_tree()
+        populate_tree(false)
     end
 
     set_preview_tree_maps_for_window(window, next_map, next_row_id_map)
@@ -12838,8 +12877,10 @@ end
 -- SRT 不保存 Resolve 21 的片段淡入淡出；重建前另存，重建后恢复。
 SUBFIX_SUBTITLE_FADES = {}
 
-function SUBFIX_SUBTITLE_FADES.item_id(item)
-    local ok, id = pcall(function() return item:GetUniqueId() end)
+function SUBFIX_SUBTITLE_FADES.item_id(item, get_id)
+    local ok, id
+    if get_id then ok, id = pcall(get_id, item)
+    else ok, id = pcall(function() return item:GetUniqueId() end) end
     return ok and type(id) == "string" and id ~= "" and id or nil
 end
 
@@ -13071,36 +13112,41 @@ local function refresh_subtitles(target_window, options)
     local rows = {}
     local normalize_started_at = os.clock()
 
+    -- Looking up a Resolve method on every item incurs a separate host round trip.
+    -- Verify that this host's method accepts a different receiver before sharing it.
+    local get_start, get_end, get_name, get_id
+    local first, second = items[1], items[2]
+    if type(first) == "userdata" and second then
+        local second_id = SUBFIX_SUBTITLE_FADES.item_id(second)
+        local reader = second_id and first.GetUniqueId
+        if reader and second_id and SUBFIX_SUBTITLE_FADES.item_id(second, reader) == second_id
+            and SUBFIX_SUBTITLE_FADES.item_id(first, reader) ~= second_id then
+            get_start, get_end, get_name, get_id = first.GetStart, first.GetEnd, first.GetName, reader
+        end
+    end
+
     -- 遍历字幕
     for i, item in ipairs(items) do
-        local start_frame = item:GetStart() or 0
-        local end_frame = item:GetEnd() or 0
+        local start_frame = (get_start or item.GetStart)(item) or 0
+        local end_frame = (get_end or item.GetEnd)(item) or 0
 
         if current_work_scope.mode ~= WORK_SCOPE_MODE_SELECTION or range_intersects_selection(start_frame, end_frame, current_work_scope) then
-            local name = item:GetName() or ""
+            local name = (get_name or item.GetName)(item) or ""
 
             -- 计算绝对帧（中心帧）
             -- 这里的 start_frame/end_frame 视为"绝对帧"，不要再叠加 tl_start_frame
             local target_abs_frame = math.floor(((tonumber(start_frame) or 0) + (tonumber(end_frame) or 0)) / 2)
 
-            -- 计算时间码字符串
-            local tc_start = frames_to_timecode(start_frame, current_fps)
-            local tc_end = frames_to_timecode(end_frame, current_fps)
-
-            -- 存储数据
-            local row_data = {
-                id = build_row_id(current_track, i, start_frame, end_frame),
-                source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item),
+            -- The list rebuild assigns final indices, IDs and timecodes after sorting.
+            rows[#rows + 1] = {
+                source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item, get_id),
                 index = i,
                 target_abs_frame = target_abs_frame,
                 fps = current_fps,
                 start_frame = start_frame,
                 end_frame = end_frame,
-                text = name,
-                timecode = tc_start .. " --> " .. tc_end  -- 存储原始时间码字符串
+                text = name
             }
-            row_data.display_text = build_tree_display_text(i, tostring(tc_start), tostring(tc_end), name)
-            table.insert(rows, row_data)
         end
     end
 
@@ -18464,11 +18510,13 @@ return ui:VGroup({
 end
 
 local function create_mini_window()
-    return dispatcher:AddWindow({
+    local window = dispatcher:AddWindow({
         ID = WINDOW_META.mini_window_id,
-        WindowTitle = WINDOW_META.mini_window_title,
-        Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 435, 382})
+        WindowTitle = WINDOW_META.mini_window_title
     }, mini_content)
+    -- Supplying just the size lets Qt place the first frame on the active display.
+    window:Resize({435, 382})
+    return window
 end
 
 local function create_full_window()
@@ -18481,6 +18529,14 @@ end
 
 -- 创建窗口
 mini_win = create_mini_window()
+active_window = mini_win
+set_mini_subtitle_area_state(mini_win, false, "正在自动加载字幕…")
+update_shared_status(mini_win, "正在自动加载字幕...")
+set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在自动加载</font>", mini_win)
+mini_win:Show()
+print(string.format("[Hooper AI 2.0] [STARTUP] 极简窗口已显示: +%d ms", startup_elapsed_ms()))
+SUBFIX_WINDOW_GEOMETRY.initial_mini_geometry = mini_win.Geometry
+SUBFIX_WINDOW_GEOMETRY.startup_probe = SUBFIX_WINDOW_GEOMETRY.start_screen_probe()
 
 ensure_ai_config_window = function()
     if AIConfigPopWin then
@@ -18720,10 +18776,14 @@ register_ui_timer(startup_refresh_timer, function()
         return
     end
 
-    set_mini_subtitle_area_state(mini_win, false, "正在自动加载字幕…")
-    update_shared_status(mini_win, "正在自动加载字幕...")
-    set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在自动加载</font>", mini_win)
     refresh_subtitles(mini_win, {skip_backup = true, show_loading_placeholder = true})
+    -- Qt normally centers the window on the correct screen. Check once after loading,
+    -- and respect a drag, resize, or switch to the full window in the meantime.
+    local screen = SUBFIX_WINDOW_GEOMETRY.read_screen_probe(SUBFIX_WINDOW_GEOMETRY.startup_probe)
+    SUBFIX_WINDOW_GEOMETRY.startup_probe = nil
+    SUBFIX_WINDOW_GEOMETRY.finish_mini_placement(active_window == mini_win and mini_win,
+        SUBFIX_WINDOW_GEOMETRY.initial_mini_geometry, screen)
+    SUBFIX_WINDOW_GEOMETRY.initial_mini_geometry = nil
     print("[Hooper AI 2.0] 极简版窗口已显示，并已尝试自动加载字幕。")
 end)
 
@@ -18809,6 +18869,7 @@ function detect_ai_task_direction(task_type, rows, execute_request)
 end
 
 local function open_full_window()
+    local already_created = win ~= nil
     local full_window = ensure_full_window_initialized()
     if not full_window then
         update_shared_status(mini_win, "无法打开完整版窗口")
@@ -18844,11 +18905,9 @@ local function open_full_window()
 
     active_window = win
     activate_preview_tree_maps_for_window(win)
-    pcall(function()
-        if win.SetAttrs then
-            win:SetAttrs({Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})})
-        end
-    end)
+    if already_created then
+        win.Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})
+    end
 
     local switch_started_at = os.clock()
 
@@ -18896,7 +18955,9 @@ function mini_win.On.MiniTrackSpin.TextChanged(ev)
         sync_track_control(mini_win)
         return
     end
-    current_track = math.max(1, math.min(10, math.floor(tonumber(text) or current_track or 1)))
+    local track = math.max(1, math.min(10, tonumber(text)))
+    if track == current_track then return end
+    current_track = track
     set_target_track_value(current_track, false)
     print("[Hooper AI 2.0] 极简版轨道切换: " .. current_track)
     refresh_subtitles(mini_win)
@@ -18967,7 +19028,9 @@ function win.On.TrackSpin.TextChanged(ev)
         sync_track_control(win)
         return
     end
-    current_track = math.max(1, math.min(10, math.floor(tonumber(text) or current_track or 1)))
+    local track = math.max(1, math.min(10, tonumber(text)))
+    if track == current_track then return end
+    current_track = track
     set_target_track_value(current_track, false)
     print("[Hooper AI 2.0] 轨道切换: " .. current_track)
     refresh_subtitles(win)
@@ -22967,6 +23030,7 @@ ensure_full_window_initialized = function()
         switch_stack_page_index_only(win, "TabStack", 0)
     end
 
+    current_ai_provider_id = LoadActiveProviderId()
     apply_provider_config_to_ui(current_ai_provider_id, LoadConfig(current_ai_provider_id))
     apply_shared_config_to_ui(LoadSharedConfig())
 
@@ -23023,22 +23087,6 @@ print(string.format("[Hooper AI 2.0] [STARTUP] 备份系统初始化完成: +%d 
 
 -- ========== 启动 ==========
 
-current_ai_provider_id = LoadActiveProviderId()
-
-active_window = mini_win
-sync_track_control(mini_win)
-sync_search_control(mini_win)
-set_subtitle_loaded_state(false, nil, mini_win)
-update_target_track_hint()
-update_shared_status(mini_win, shared_status_text)
-
-print(string.format("[Hooper AI 2.0] [STARTUP] 即将 Show 极简版窗口: +%d ms", startup_elapsed_ms()))
-_subfix_show_started_at = os.clock()  -- 用全局，避免触发 200 local 上限
-mini_win:Show()
-print(string.format("[Hooper AI 2.0] [STARTUP] mini_win:Show() 用时: %d ms", math.floor(((os.clock() - _subfix_show_started_at) * 1000) + 0.5)))
-set_mini_subtitle_area_state(mini_win, false, "正在自动加载字幕…")
-update_shared_status(mini_win, "正在自动加载字幕...")
-set_load_status_label(false, "<font color='#FA8C16'>⏳ 正在自动加载</font>", mini_win)
 restart_ui_timer(startup_refresh_timer)
 print(string.format("[Hooper AI 2.0] 极简版窗口已显示，自动加载字幕已排队 (距脚本启动: +%d ms)。", startup_elapsed_ms()))
 

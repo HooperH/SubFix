@@ -26,7 +26,12 @@ def test_main_script_uses_resolve_display_geometry_for_every_window():
     assert "function SUBFIX_WINDOW_GEOMETRY.centered_geometry(fallback_geometry)" in source
     assert "return fallback_geometry" in source
     assert source.count("Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry(") >= 20
-    assert "win:SetAttrs({Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})})" in source
+    assert "win.Geometry = SUBFIX_WINDOW_GEOMETRY.centered_geometry({500, 120, 500, 700})" in source
+    mini_create = source.split("local function create_mini_window()", 1)[1].split("local function create_full_window()", 1)[0]
+    assert "window:Resize({435, 382})" in mini_create
+    assert "Geometry =" not in mini_create
+    assert source.index("mini_win:Show()") < source.index("SUBFIX_WINDOW_GEOMETRY.startup_probe = SUBFIX_WINDOW_GEOMETRY.start_screen_probe()")
+    assert "window.Geometry = target" in source
 
 
 def test_generate_core_uses_resolve_display_geometry_for_every_window():

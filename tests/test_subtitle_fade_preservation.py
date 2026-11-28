@@ -139,7 +139,7 @@ def test_writeback_captures_and_saves_fades_before_deleting_then_restores():
 def test_refresh_and_selection_composite_keep_original_clip_identity():
     refresh = SOURCE[SOURCE.index("local function refresh_subtitles("):SOURCE.index("function load_generate_selection_core_for_subfix(")]
     composite = SOURCE[SOURCE.index("function build_selection_composite_rows("):SOURCE.index("function write_rows_to_update_srt(")]
-    assert "source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item)" in refresh
+    assert "source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item, get_id)" in refresh
     assert "source_subtitle_id = SUBFIX_SUBTITLE_FADES.item_id(item)" in composite
     assert "row.source_subtitle_id = full_row.source_subtitle_id" in composite
 

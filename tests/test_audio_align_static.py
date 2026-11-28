@@ -1600,14 +1600,14 @@ def test_refresh_selection_scope_filters_before_reading_subtitle_text():
         "-- ========== 全局刷新函数",
     )
     item_loop_body = body_between(
-        "    for i, item in ipairs(items) do\n        local start_frame = item:GetStart() or 0",
+        "    for i, item in ipairs(items) do\n        local start_frame = (get_start or item.GetStart)(item) or 0",
         "sort_rows_by_timing(rows)",
     )
 
     assert "read_timeline_work_scope(timeline" in refresh_body
     assert "current_work_scope = work_scope" in refresh_body
     assert "range_intersects_selection(start_frame, end_frame, current_work_scope)" in item_loop_body
-    assert item_loop_body.index("range_intersects_selection(start_frame, end_frame, current_work_scope)") < item_loop_body.index("item:GetName()")
+    assert item_loop_body.index("range_intersects_selection(start_frame, end_frame, current_work_scope)") < item_loop_body.index("(get_name or item.GetName)(item)")
     assert "sync_work_scope_ui(window)" in refresh_body
     assert "reset_pending_review_session()" in refresh_body
 
